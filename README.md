@@ -1,6 +1,6 @@
 # MediaFlow
 
-**MediaFlow** is a premium desktop utility designed to organize and rename your video, image, and audio libraries using dynamic, custom-defined naming templates. It provides real-time previews, instant directory scanning with an optimized metadata cache, a native player, and advanced multithreaded operations.
+**MediaFlow** is a desktop utility designed to organize and rename your video, image, and audio libraries using dynamic, custom-defined naming templates. It provides real-time previews, instant directory scanning with an optimized metadata cache, a native player, and advanced multithreaded operations.
 
 ## Features
 - **Dynamic Naming Templates:** Organize and rename files with ease.
