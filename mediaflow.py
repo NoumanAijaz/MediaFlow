@@ -5545,9 +5545,20 @@ class MediaFlowWindow(QMainWindow):
         self.btn_remove_video_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_remove_video_folder.clicked.connect(self._remove_video_folder)
         self.btn_remove_video_folder.setIconSize(QSize(16, 16))
+        self.videos_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         videos_sec_layout.addWidget(self.videos_list_widget)
-        videos_sec_layout.addWidget(self.btn_add_video_folder)
-        videos_sec_layout.addWidget(self.btn_remove_video_folder)
+        
+        video_btn_layout = QHBoxLayout()
+        video_btn_layout.addWidget(self.btn_add_video_folder)
+        video_btn_layout.addWidget(self.btn_remove_video_folder)
+        
+        self.btn_clear_video_folders = QPushButton("Clear All")
+        self.btn_clear_video_folders.setObjectName("btnSettingsRemove")
+        self.btn_clear_video_folders.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_video_folders.clicked.connect(self._clear_video_folders)
+        video_btn_layout.addWidget(self.btn_clear_video_folders)
+        
+        videos_sec_layout.addLayout(video_btn_layout)
         settings_layout.addWidget(videos_sec)
         images_sec = QGroupBox("🖼️  Images Directories")
         images_sec_layout = QVBoxLayout(images_sec)
@@ -5562,9 +5573,20 @@ class MediaFlowWindow(QMainWindow):
         self.btn_remove_image_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_remove_image_folder.clicked.connect(self._remove_image_folder)
         self.btn_remove_image_folder.setIconSize(QSize(16, 16))
+        self.images_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         images_sec_layout.addWidget(self.images_list_widget)
-        images_sec_layout.addWidget(self.btn_add_image_folder)
-        images_sec_layout.addWidget(self.btn_remove_image_folder)
+        
+        image_btn_layout = QHBoxLayout()
+        image_btn_layout.addWidget(self.btn_add_image_folder)
+        image_btn_layout.addWidget(self.btn_remove_image_folder)
+        
+        self.btn_clear_image_folders = QPushButton("Clear All")
+        self.btn_clear_image_folders.setObjectName("btnSettingsRemove")
+        self.btn_clear_image_folders.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_image_folders.clicked.connect(self._clear_image_folders)
+        image_btn_layout.addWidget(self.btn_clear_image_folders)
+        
+        images_sec_layout.addLayout(image_btn_layout)
         settings_layout.addWidget(images_sec)
         audio_sec = QGroupBox("🎵  Audio Directories")
         audio_sec_layout = QVBoxLayout(audio_sec)
@@ -5579,9 +5601,20 @@ class MediaFlowWindow(QMainWindow):
         self.btn_remove_audio_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_remove_audio_folder.clicked.connect(self._remove_audio_folder)
         self.btn_remove_audio_folder.setIconSize(QSize(16, 16))
+        self.audio_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         audio_sec_layout.addWidget(self.audio_list_widget)
-        audio_sec_layout.addWidget(self.btn_add_audio_folder)
-        audio_sec_layout.addWidget(self.btn_remove_audio_folder)
+        
+        audio_btn_layout = QHBoxLayout()
+        audio_btn_layout.addWidget(self.btn_add_audio_folder)
+        audio_btn_layout.addWidget(self.btn_remove_audio_folder)
+        
+        self.btn_clear_audio_folders = QPushButton("Clear All")
+        self.btn_clear_audio_folders.setObjectName("btnSettingsRemove")
+        self.btn_clear_audio_folders.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_audio_folders.clicked.connect(self._clear_audio_folders)
+        audio_btn_layout.addWidget(self.btn_clear_audio_folders)
+        
+        audio_sec_layout.addLayout(audio_btn_layout)
         settings_layout.addWidget(audio_sec)
 
         pdf_sec = QGroupBox("📄  PDFs Directories")
@@ -5597,9 +5630,20 @@ class MediaFlowWindow(QMainWindow):
         self.btn_remove_pdf_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_remove_pdf_folder.clicked.connect(self._remove_pdf_folder)
         self.btn_remove_pdf_folder.setIconSize(QSize(16, 16))
+        self.pdf_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         pdf_sec_layout.addWidget(self.pdf_list_widget)
-        pdf_sec_layout.addWidget(self.btn_add_pdf_folder)
-        pdf_sec_layout.addWidget(self.btn_remove_pdf_folder)
+        
+        pdf_btn_layout = QHBoxLayout()
+        pdf_btn_layout.addWidget(self.btn_add_pdf_folder)
+        pdf_btn_layout.addWidget(self.btn_remove_pdf_folder)
+        
+        self.btn_clear_pdf_folders = QPushButton("Clear All")
+        self.btn_clear_pdf_folders.setObjectName("btnSettingsRemove")
+        self.btn_clear_pdf_folders.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_pdf_folders.clicked.connect(self._clear_pdf_folders)
+        pdf_btn_layout.addWidget(self.btn_clear_pdf_folders)
+        
+        pdf_sec_layout.addLayout(pdf_btn_layout)
         settings_layout.addWidget(pdf_sec)
 
         # 'Open With' Applications Section
@@ -6179,6 +6223,10 @@ class MediaFlowWindow(QMainWindow):
         for item in selected: self.videos_list_widget.takeItem(self.videos_list_widget.row(item))
         self._update_video_directories()
 
+    def _clear_video_folders(self):
+        self.videos_list_widget.clear()
+        self._update_video_directories()
+
     def _update_video_directories(self):
         folders = [self.videos_list_widget.item(i).text() for i in range(self.videos_list_widget.count())]
         self.video_tab.update_directories(folders)
@@ -6197,6 +6245,10 @@ class MediaFlowWindow(QMainWindow):
         selected = self.images_list_widget.selectedItems()
         if not selected: return
         for item in selected: self.images_list_widget.takeItem(self.images_list_widget.row(item))
+        self._update_image_directories()
+
+    def _clear_image_folders(self):
+        self.images_list_widget.clear()
         self._update_image_directories()
 
     def _update_image_directories(self):
@@ -6219,6 +6271,10 @@ class MediaFlowWindow(QMainWindow):
         for item in selected: self.audio_list_widget.takeItem(self.audio_list_widget.row(item))
         self._update_audio_directories()
 
+    def _clear_audio_folders(self):
+        self.audio_list_widget.clear()
+        self._update_audio_directories()
+
     def _update_audio_directories(self):
         folders = [self.audio_list_widget.item(i).text() for i in range(self.audio_list_widget.count())]
         self.audio_tab.update_directories(folders)
@@ -6237,6 +6293,10 @@ class MediaFlowWindow(QMainWindow):
         selected = self.pdf_list_widget.selectedItems()
         if not selected: return
         for item in selected: self.pdf_list_widget.takeItem(self.pdf_list_widget.row(item))
+        self._update_pdf_directories()
+
+    def _clear_pdf_folders(self):
+        self.pdf_list_widget.clear()
         self._update_pdf_directories()
 
     def _update_pdf_directories(self):
