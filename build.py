@@ -22,6 +22,9 @@ def main():
         "--name", "MediaFlow",
         "--add-data", "logo.png;.",
         "--icon", "logo.ico",
+        "--exclude-module", "PyQt6.QtWebEngineWidgets",
+        "--exclude-module", "PyQt6.QtWebEngineCore",
+        "--exclude-module", "PyQt6.QtWebEngine",
         os.path.join(script_dir, "mediaflow.py"),
     ]
 
