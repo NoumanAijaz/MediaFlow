@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['f:\\Dev\\MediaFlow\\mediaflow.py'],
+    ['F:\\Dev\\MediaFlow\\mediaflow.py'],
     pathex=[],
     binaries=[],
     datas=[('logo.png', '.')],
@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['PyQt6.QtWebEngineWidgets', 'PyQt6.QtWebEngineCore', 'PyQt6.QtWebEngine'],
     noarchive=False,
     optimize=0,
 )

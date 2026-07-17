@@ -106,35 +106,38 @@ def get_resource_path(relative_path):
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
+CACHE_LOCK = threading.Lock()
+
 def update_metadata_cache(entries_to_add: dict, paths_to_delete: list = None):
-    """Atomically update the metadata cache using os.replace()."""
-    cache_path = os.path.join(CONFIG_DIR, 'scan_cache.json')
-    try:
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        for _ in range(5):
-            try:
-                current_cache = {}
-                if os.path.exists(cache_path):
-                    with open(cache_path, 'r', encoding='utf-8') as f:
-                        current_cache = json.load(f)
-                if entries_to_add:
-                    current_cache.update(entries_to_add)
-                if paths_to_delete:
-                    for p in paths_to_delete:
-                        current_cache.pop(p, None)
-                temp_path = cache_path + '.tmp'
-                # Write + fsync for durability, then atomic replace
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(current_cache, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(temp_path, cache_path)  # atomic on both Windows and POSIX
-                break
-            except Exception as e:
-                logger.warning("Cache write attempt failed: %s", e)
-                time.sleep(0.05)
-    except Exception as e:
-        logger.warning("update_metadata_cache failed: %s", e)
+    """Atomically update the metadata cache using os.replace() safely across threads."""
+    with CACHE_LOCK:
+        cache_path = os.path.join(CONFIG_DIR, 'scan_cache.json')
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            for _ in range(5):
+                try:
+                    current_cache = {}
+                    if os.path.exists(cache_path):
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            current_cache = json.load(f)
+                    if entries_to_add:
+                        current_cache.update(entries_to_add)
+                    if paths_to_delete:
+                        for p in paths_to_delete:
+                            current_cache.pop(p, None)
+                    temp_path = cache_path + '.tmp'
+                    # Write + fsync for durability, then atomic replace
+                    with open(temp_path, 'w', encoding='utf-8') as f:
+                        json.dump(current_cache, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp_path, cache_path)  # atomic on both Windows and POSIX
+                    break
+                except Exception as e:
+                    logger.warning("Cache write attempt failed: %s", e)
+                    time.sleep(0.05)
+        except Exception as e:
+            logger.warning("update_metadata_cache failed: %s", e)
 
 def get_resolution_tag(width: int, height: int) -> str:
     if width <= 0 or height <= 0: return "K"
@@ -2503,11 +2506,8 @@ class HoverPreviewOverlay(QWidget):
         self.hide()
 
     def _check_mouse_position(self):
-        # Hide only if cursor left BOTH the target cell AND the overlay itself.
-        # The previous check (target rect only) caused the overlay to vanish as
-        # soon as the user moved toward it, making it unreachable.
-        if not (self.target_global_rect.contains(QCursor.pos()) or
-                self.geometry().contains(QCursor.pos())):
+        # Hide if cursor left the target thumbnail cell.
+        if not self.target_global_rect.contains(QCursor.pos()):
             self.hide_preview()
 
     def _get_random_position(self):
@@ -2676,6 +2676,7 @@ class NativeVideoPlayerWindow(QMainWindow):
         super().__init__(parent)
         self.parent_window = parent
         self.setWindowFlags(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle(f"MediaFlow Player — {os.path.basename(filepath)}")
         self.resize(854, 480)
         
@@ -3684,6 +3685,12 @@ class MediaTab(QWidget):
         if self.directories: self._start_scan(self.directories)
 
     def _start_scan(self, folders: list[str], force_full: bool = False):
+        if getattr(self, 'scanner_thread', None) is not None:
+            if self.scanner_thread.isRunning():
+                self.scanner_thread.requestInterruption()
+                self.scanner_thread.quit()
+                self.scanner_thread.wait(2000)
+                
         self._on_clear()
         self.directories = folders
         if self.directories: self.btn_load.setEnabled(True)
@@ -3849,7 +3856,6 @@ class MediaTab(QWidget):
             thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             thumb_label.setText("🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️")))
             thumb_label.setFixedSize(120, 68)
-            QTimer.singleShot(0, lambda r=row, i=info, l=thumb_label: self._generate_thumbnail_async(r, i, l))
             self.table.setCellWidget(row, self.COL_THUMB, thumb_label)
             if info.media_type == 'video':
                 thumb_label.setProperty("media_info", info)
@@ -4079,17 +4085,26 @@ class MediaTab(QWidget):
         info = self._get_row_info(row)
         if not info or not info.is_valid: return
         
+        if not hasattr(info, 'parsed_artist'):
+            info.parsed_artist, info.parsed_rating = parse_naming_format(info.filename)
+            
+        # Lazy Thumbnail Generation
+        if not getattr(info, 'thumb_queued', False):
+            info.thumb_queued = True
+            thumb_label = self.table.cellWidget(row, self.COL_THUMB)
+            if thumb_label and thumb_label.objectName() == "thumbnailLabel":
+                self._generate_thumbnail_async(row, info, thumb_label)
+                
+
         # Artist widget
         if not self.table.cellWidget(row, self.COL_ARTIST):
             artist_item = self.table.item(row, self.COL_ARTIST)
             val = artist_item.text().strip() if artist_item else ""
-            if not val:
-                val, _ = parse_naming_format(info.filename)
+            if not val: val = info.parsed_artist
             artist_input = QLineEdit()
             artist_input.setPlaceholderText("Enter name…")
             artist_input.setMaxLength(100)
             if val: artist_input.setText(val)
-            # Tag widget with row index for O(1) lookup (was O(rows) per keystroke)
             artist_input.setProperty("row_index", row)
             artist_input.textChanged.connect(self._on_input_changed_sender)
             artist_input.editingFinished.connect(self._on_artist_editing_finished)
@@ -4100,8 +4115,7 @@ class MediaTab(QWidget):
             rating_item = self.table.item(row, self.COL_RATING)
             val = rating_item.text().strip() if rating_item else "—"
             if val == "—" or not val:
-                _, parsed_rating = parse_naming_format(info.filename)
-                val = parsed_rating or "—"
+                val = info.parsed_rating or "—"
             rating_combo = QComboBox()
             rating_combo.addItems(["—"] + [str(i) for i in range(1, 11)])
             idx = rating_combo.findText(val)
@@ -4163,26 +4177,19 @@ class MediaTab(QWidget):
     def _on_input_changed_sender(self):
         sender = self.sender()
         if not sender: return
-        # O(1) lookup via row_index property (was O(rows) scan)
-        row = sender.property("row_index")
-        if row is None:
-            # Fallback to linear scan for widgets created before this fix
-            for r in range(self.table.rowCount()):
-                if (self.table.cellWidget(r, self.COL_ARTIST) is sender or self.table.cellWidget(r, self.COL_RATING) is sender):
-                    row = r
-                    break
+        # O(1) lookup via viewport mapping instead of O(N) scan
+        pos = self.table.viewport().mapFromGlobal(sender.mapToGlobal(QPoint(0, 0)))
+        index = self.table.indexAt(pos)
+        row = index.row() if index.isValid() else None
         if row is not None:
             if row in self.filtered_rows or not self.filtered_rows: self._update_row_preview(row)
 
     def _on_artist_editing_finished(self):
         sender = self.sender()
         if not sender: return
-        row = sender.property("row_index")
-        if row is None:
-            for r in range(self.table.rowCount()):
-                if self.table.cellWidget(r, self.COL_ARTIST) is sender:
-                    row = r
-                    break
+        pos = self.table.viewport().mapFromGlobal(sender.mapToGlobal(QPoint(0, 0)))
+        index = self.table.indexAt(pos)
+        row = index.row() if index.isValid() else None
         if row is not None:
             artist_item = self.table.item(row, self.COL_ARTIST)
             if artist_item:
@@ -4988,8 +4995,10 @@ class MediaTab(QWidget):
                         # Rollback failed — disk state is now different from
                         # table. Log loudly so the user knows.
                         logger.error("ROLLBACK FAILED for %s -> %s; filesystem and UI are out of sync", src, dst)
+                        QMessageBox.critical(self, "Fatal Desync", f"Filesystem and UI out of sync. Please reload folder.\n\nFailed to revert:\n{src}\nto\n{dst}")
+                        return
                     self._rename_history.append(last)
-                    raise te
+                    return
                 self.status_label.setText(f"↩️ Undone: {os.path.basename(dst)}")
                 self._update_stats()
                 self._redo_history.append(last)
