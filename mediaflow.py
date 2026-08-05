@@ -2549,9 +2549,11 @@ class DoubleClickVideoWidget(QVideoWidget):
 class NativeImagePlayerWindow(QMainWindow):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
+        self.filepath = filepath
         self.setWindowTitle(f"MediaFlow Image Viewer — {os.path.basename(filepath)}")
         self.resize(800, 600)
         self.setWindowFlags(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         
         is_dark = getattr(parent, 'current_theme', 'dark') == 'dark' if parent else True
         
@@ -2576,12 +2578,19 @@ class NativeImagePlayerWindow(QMainWindow):
         else:
             self.setStyleSheet("QMainWindow { background-color: #f1f5f9; } QLabel { color: #1e293b; }")
 
+    def closeEvent(self, event):
+        if hasattr(self, 'label') and self.label:
+            self.label.clear()
+        super().closeEvent(event)
+
 class NativeAudioPlayerWindow(QMainWindow):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
+        self.filepath = filepath
         self.setWindowTitle(f"MediaFlow Audio Player — {os.path.basename(filepath)}")
         self.resize(450, 160)
         self.setWindowFlags(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         
         is_dark = getattr(parent, 'current_theme', 'dark') == 'dark' if parent else True
         
@@ -3104,6 +3113,7 @@ class SplitVideoPlayerWindow(QMainWindow):
         super().__init__(parent)
         self.parent_window = parent
         self.setWindowFlags(Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("MediaFlow Player — Split View (4 Videos)")
         self.resize(1120, 630)
         
@@ -3716,6 +3726,7 @@ class MediaTab(QWidget):
         self.scanner_thread.start()
 
     def _on_clear(self):
+        self._release_file_locks()
         self.table.setSortingEnabled(False)
         self.table.setUpdatesEnabled(True)
         self.grid_view.setUpdatesEnabled(True)
@@ -4815,6 +4826,7 @@ class MediaTab(QWidget):
         self.table.setSortingEnabled(False)
         self._updating_table = True
         sorted_selected = sorted(list(selected_rows.items()), key=lambda x: x[0], reverse=True)
+        self._release_file_locks([info.filepath for _, info in sorted_selected])
         success_count = 0
         error_files = []
         for row, info in sorted_selected:
@@ -4865,6 +4877,7 @@ class MediaTab(QWidget):
                 counter += 1
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        self._release_file_locks([src])
         try:
             os.rename(src, dst)
             info.filepath = dst
@@ -4911,6 +4924,7 @@ class MediaTab(QWidget):
         errors = []
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
+        self._release_file_locks([info.filepath for _, info, _ in ready_rows])
         try:
             for row, info, target_display in ready_rows:
                 src = info.filepath
@@ -4969,6 +4983,7 @@ class MediaTab(QWidget):
         src = last['src']
         dst = last['dst']
         if os.path.exists(dst) and not os.path.exists(src):
+            self._release_file_locks([dst, src])
             try:
                 shutil.move(dst, src)
                 row = last['row']
@@ -5019,6 +5034,7 @@ class MediaTab(QWidget):
         src = last['src']
         dst = last['dst']
         if os.path.exists(src) and not os.path.exists(dst):
+            self._release_file_locks([src, dst])
             try:
                 shutil.move(src, dst)
                 row = last['row']
@@ -5292,16 +5308,41 @@ class MediaTab(QWidget):
         self.player.playbackStateChanged.connect(self._on_player_state_changed)
         self.seek_slider.valueChanged.connect(self._on_slider_moved)
 
+    def _stop_and_clear_media_player(self):
+        if hasattr(self, 'player') and self.player:
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.stop()
+            self.player.setSource(QUrl())
+        if hasattr(self, 'preview_image') and self.preview_image:
+            self.preview_image.clear()
+
+    def _release_file_locks(self, target_filepaths: list[str] = None):
+        self._stop_and_clear_media_player()
+        main_win = self.window()
+        if main_win:
+            if hasattr(main_win, 'hover_overlay') and main_win.hover_overlay:
+                if not target_filepaths or (main_win.hover_overlay.info and main_win.hover_overlay.info.filepath in target_filepaths):
+                    main_win.hover_overlay.hide_preview()
+            if hasattr(main_win, '_native_players') and main_win._native_players:
+                for player_win in main_win._native_players:
+                    try:
+                        if player_win.isVisible():
+                            p_path = getattr(player_win, 'filepath', None)
+                            if not target_filepaths or (p_path and p_path in target_filepaths):
+                                player_win.close()
+                    except Exception:
+                        pass
+
     def _update_preview_pane(self):
         if not self.btn_toggle_preview.isChecked():
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState: self.player.stop()
+            self._stop_and_clear_media_player()
             return
         selected_rows = []
         for rng in self.table.selectedRanges():
             for row in range(rng.topRow(), rng.bottomRow() + 1): selected_rows.append(row)
         selected_rows = list(set(selected_rows))
         if len(selected_rows) != 1:
-            self.player.stop()
+            self._stop_and_clear_media_player()
             self.preview_stack.setCurrentIndex(2)
             self.preview_controls.setVisible(False)
             if len(selected_rows) > 1: self.no_preview_label.setText("Multiple files selected\nSelect a single file to preview")
@@ -5311,7 +5352,7 @@ class MediaTab(QWidget):
         row = selected_rows[0]
         info = self._get_row_info(row)
         if not info or not info.is_valid:
-            self.player.stop()
+            self._stop_and_clear_media_player()
             self.preview_stack.setCurrentIndex(2)
             self.preview_controls.setVisible(False)
             self.no_preview_label.setText("No preview available\nfor invalid files")
@@ -5320,7 +5361,7 @@ class MediaTab(QWidget):
         self.preview_title.setText(info.filename)
         filepath = info.filepath
         if info.media_type == 'image':
-            self.player.stop()
+            self._stop_and_clear_media_player()
             self.preview_controls.setVisible(False)
             self.preview_stack.setCurrentIndex(0)
             pixmap = QPixmap(filepath)
@@ -5329,6 +5370,7 @@ class MediaTab(QWidget):
                 self.preview_image.setPixmap(scaled_pix)
             else: self.preview_image.setText("Failed to load image")
         elif info.media_type == 'video':
+            self.preview_image.clear()
             self.preview_stack.setCurrentIndex(1)
             self.preview_controls.setVisible(True)
             self.player.setSource(QUrl.fromLocalFile(filepath))
@@ -5359,7 +5401,7 @@ class MediaTab(QWidget):
             self.btn_mute.setText("")
             self.player.play()
         elif info.media_type == 'pdf':
-            self.player.stop()
+            self._stop_and_clear_media_player()
             self.preview_controls.setVisible(False)
             self.preview_stack.setCurrentIndex(2)
             self.no_preview_label.setText("No preview available\nDouble-click to open with system default")
