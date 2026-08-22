@@ -99,6 +99,12 @@ PDF_EXTENSIONS = {
     '.pdf'
 }
 
+IGNORED_EXTENSIONLESS_NAMES = {
+    'readme', 'license', 'licence', 'copying', 'notice', 'authors', 'changelog',
+    'makefile', 'dockerfile', 'vagrantfile', 'gemfile', 'procfile', 'cmakelists.txt',
+    '.gitignore', '.gitattributes', '.ds_store', 'thumbs.db', 'desktop.ini'
+}
+
 def get_extensions_for_type(media_type: str) -> set[str]:
     if media_type == 'video': return VIDEO_EXTENSIONS
     elif media_type == 'audio': return AUDIO_EXTENSIONS
@@ -433,28 +439,39 @@ def get_file_deep_metadata(filepath: str, ffprobe_path: str = None) -> dict | No
     except Exception: pass
     return None
 
+def _safe_int(val, default: int = 0) -> int:
+    try: return int(val)
+    except (ValueError, TypeError): return default
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try: return float(val)
+    except (ValueError, TypeError): return default
+
 def parse_ffprobe_json(data: dict) -> dict:
     parsed = {'format': '', 'size_bytes': 0, 'duration_seconds': 0.0, 'bitrate_kbps': 0, 'video': None, 'audio': None, 'hdr_type': 'SDR'}
     fmt = data.get('format', {})
     parsed['format'] = fmt.get('format_long_name', fmt.get('format_name', 'Unknown'))
-    try: parsed['size_bytes'] = int(fmt.get('size', 0))
-    except ValueError: pass
-    try: parsed['duration_seconds'] = float(fmt.get('duration', 0.0))
-    except ValueError: pass
-    try: parsed['bitrate_kbps'] = int(fmt.get('bit_rate', 0)) // 1000
-    except ValueError: pass
+    parsed['size_bytes'] = _safe_int(fmt.get('size', 0))
+    parsed['duration_seconds'] = _safe_float(fmt.get('duration', 0.0))
+    parsed['bitrate_kbps'] = _safe_int(fmt.get('bit_rate', 0)) // 1000
     for stream in data.get('streams', []):
         codec_type = stream.get('codec_type')
         if codec_type == 'video' and not parsed['video']:
-            v_info = {'codec': stream.get('codec_name', '').upper(), 'profile': stream.get('profile', ''), 'width': int(stream.get('width', 0)), 'height': int(stream.get('height', 0)), 'fps': 0.0, 'bitrate_kbps': 0, 'pix_fmt': stream.get('pix_fmt', '')}
-            fps_str = stream.get('r_frame_rate', '')
+            v_info = {
+                'codec': str(stream.get('codec_name', '')).upper(),
+                'profile': stream.get('profile', ''),
+                'width': _safe_int(stream.get('width', 0)),
+                'height': _safe_int(stream.get('height', 0)),
+                'fps': 0.0,
+                'bitrate_kbps': _safe_int(stream.get('bit_rate', 0)) // 1000,
+                'pix_fmt': stream.get('pix_fmt', '')
+            }
+            fps_str = str(stream.get('r_frame_rate', ''))
             if '/' in fps_str:
                 try:
                     num, den = map(float, fps_str.split('/'))
                     if den > 0: v_info['fps'] = round(num / den, 2)
                 except ValueError: pass
-            try: v_info['bitrate_kbps'] = int(stream.get('bit_rate', 0)) // 1000
-            except ValueError: pass
             parsed['video'] = v_info
             for sd in stream.get('side_data_list', []):
                 sd_type = sd.get('side_data_type', '')
@@ -467,9 +484,13 @@ def parse_ffprobe_json(data: dict) -> dict:
                     parsed['hdr_type'] = 'Dolby Vision' if codec_tag in ['dvh1', 'dvhe'] else 'HDR10'
                 elif color_transfer == 'arib-std-b67': parsed['hdr_type'] = 'HLG'
         elif codec_type == 'audio' and not parsed['audio']:
-            a_info = {'codec': stream.get('codec_name', '').upper(), 'sample_rate_hz': int(stream.get('sample_rate', 0)), 'channels': int(stream.get('channels', 0)), 'channel_layout': stream.get('channel_layout', ''), 'bitrate_kbps': 0}
-            try: a_info['bitrate_kbps'] = int(stream.get('bit_rate', 0)) // 1000
-            except ValueError: pass
+            a_info = {
+                'codec': str(stream.get('codec_name', '')).upper(),
+                'sample_rate_hz': _safe_int(stream.get('sample_rate', 0)),
+                'channels': _safe_int(stream.get('channels', 0)),
+                'channel_layout': stream.get('channel_layout', ''),
+                'bitrate_kbps': _safe_int(stream.get('bit_rate', 0)) // 1000
+            }
             ch = a_info['channels']
             if ch == 1: a_info['channel_layout'] = 'Mono'
             elif ch == 2: a_info['channel_layout'] = 'Stereo'
@@ -1882,8 +1903,12 @@ class ScannerThread(QThread):
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             ext = os.path.splitext(entry.name)[1].lower()
-                            # Include files without extensions as requested
-                            if ext in valid_exts or ext == '':
+                            is_valid = ext in valid_exts
+                            if not is_valid and ext == '':
+                                name_lower = entry.name.lower()
+                                if not name_lower.startswith('.') and name_lower not in IGNORED_EXTENSIONLESS_NAMES:
+                                    is_valid = True
+                            if is_valid:
                                 full_path = os.path.normpath(entry.path)
                                 if full_path not in seen_paths:
                                     if not self._should_exclude(full_path):
@@ -2233,19 +2258,19 @@ class BatchEditDialog(QDialog):
         return artist, rating
 
 class SmartRelocateDialog(QDialog):
-    def __init__(self, media_infos: list, selected_rows: set, parent=None):
+    def __init__(self, media_infos: list, selected_infos: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Smart Relocate Files")
         self.setMinimumSize(600, 450)
         self.media_infos = media_infos
-        self.selected_rows = selected_rows
+        self.selected_infos = selected_infos
         
         layout = QVBoxLayout(self)
         
         # 1. Source Selection
         source_group = QGroupBox("1. What to Move?")
         source_layout = QVBoxLayout(source_group)
-        self.radio_selected = QRadioButton(f"Move Selected Files ({len(selected_rows)} files)")
+        self.radio_selected = QRadioButton(f"Move Selected Files ({len(selected_infos)} files)")
         self.radio_query = QRadioButton("Move by Smart Query")
         self.radio_selected.setChecked(True)
         
@@ -2334,7 +2359,7 @@ class SmartRelocateDialog(QDialog):
 
     def _get_target_infos(self) -> list:
         if self.radio_selected.isChecked():
-            return [self.media_infos[r] for r in self.selected_rows if r < len(self.media_infos)]
+            return list(self.selected_infos)
         else:
             query = self.query_input.text().strip()
             return [info for info in self.media_infos if matches_query(info, query)]
@@ -2561,8 +2586,20 @@ class TrimExportWorker(QThread):
         self.out_sec = out_sec
         self.output_path = output_path
         self.custom_ffmpeg = custom_ffmpeg
+        self._proc = None
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
 
     def run(self):
+        if self._is_cancelled:
+            return
         ffmpeg_cmd = get_ffmpeg_command(self.custom_ffmpeg)
         if not ffmpeg_cmd:
             self.trim_finished.emit(False, "", "FFmpeg executable not found. Please ensure FFmpeg is installed.")
@@ -2585,14 +2622,28 @@ class TrimExportWorker(QThread):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', startupinfo=startupinfo, timeout=120)
-            if proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                startupinfo=startupinfo
+            )
+            stdout, stderr = self._proc.communicate(timeout=120)
+            if self._is_cancelled:
+                if os.path.exists(self.output_path):
+                    try: os.remove(self.output_path)
+                    except Exception: pass
+                return
+            if self._proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
                 self.trim_finished.emit(True, self.output_path, "")
             else:
-                err = proc.stderr or "FFmpeg failed with unknown error."
+                err = stderr or "FFmpeg failed with unknown error."
                 self.trim_finished.emit(False, "", err)
         except Exception as e:
-            self.trim_finished.emit(False, "", str(e))
+            if not self._is_cancelled:
+                self.trim_finished.emit(False, "", str(e))
 
 
 class QuickTrimDialog(QDialog):
@@ -2800,11 +2851,13 @@ class QuickTrimDialog(QDialog):
 
     def _on_duration_changed(self, dur: int):
         if dur > 0:
+            is_initial = (self.duration_ms == 0)
             self.duration_ms = dur
-            self.out_ms = dur
             self.range_slider.set_range(0, dur)
-            self.range_slider.set_out_pos(dur)
-            self.out_edit.setText(self._ms_to_str(dur))
+            if is_initial:
+                self.out_ms = dur
+                self.range_slider.set_out_pos(dur)
+                self.out_edit.setText(self._ms_to_str(dur))
             self._update_time_display(self.player.position())
             self._update_clip_duration_label()
 
@@ -2929,7 +2982,7 @@ class QuickTrimDialog(QDialog):
         self.btn_export.setEnabled(False)
         self.btn_export.setText("⏳ Trimming clip...")
 
-        self.worker = TrimExportWorker(self.filepath, in_sec, out_sec, output_path, parent=self)
+        self.worker = TrimExportWorker(self.filepath, in_sec, out_sec, output_path, parent=None)
         self.worker.trim_finished.connect(self._on_export_finished)
         self.worker.start()
 
@@ -2978,15 +3031,20 @@ class QuickTrimDialog(QDialog):
     def done(self, result):
         # accept()/reject() funnel through here; release before hiding
         self._release_player()
-        # If the export worker is still running when the dialog closes, drop its
-        # late result instead of popping dialogs/toasts on a hidden window.
         worker = getattr(self, 'worker', None)
         if worker is not None and worker.isRunning():
             self._suppress_export_result = True
+            worker.cancel()
+            worker.wait(1000)
         super().done(result)
 
     def closeEvent(self, event):
         self._release_player()
+        worker = getattr(self, 'worker', None)
+        if worker is not None and worker.isRunning():
+            self._suppress_export_result = True
+            worker.cancel()
+            worker.wait(1000)
         super().closeEvent(event)
 
 
@@ -3099,7 +3157,7 @@ class SmartFolderNavItem(QWidget):
 
 class DeepMetadataWorker(QThread):
     """Background worker for ffprobe — prevents UI freezes up to 10s."""
-    metadata_ready = pyqtSignal(dict or None)
+    metadata_ready = pyqtSignal(object)
 
     def __init__(self, filepath: str, ffprobe_path: str = None, parent=None):
         super().__init__(parent)
@@ -4435,7 +4493,7 @@ class _ComparisonPane(QWidget):
             slider_row = QHBoxLayout()
             self.seek_slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self)
             self.seek_slider.setRange(0, 1000)
-            self.seek_slider.sliderMoved.connect(self._on_seek)
+            self.seek_slider.valueChanged.connect(self._on_seek)
             slider_row.addWidget(self.seek_slider, 1)
 
             self.time_label = QLabel("00:00 / 00:00")
@@ -4607,7 +4665,9 @@ class _ComparisonPane(QWidget):
     def _on_position_changed(self, pos):
         dur = self.player.duration() if self.player else 0
         if dur > 0 and self.seek_slider and not self.seek_slider.isSliderDown():
+            self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(int((pos / dur) * 1000))
+            self.seek_slider.blockSignals(False)
         if self.time_label:
             self.time_label.setText(f"{self._format_ms(pos)} / {self._format_ms(dur)}")
 
@@ -5368,6 +5428,24 @@ class MediaTab(QWidget):
         # keeps resetting. Only when they pause for 250ms does _apply_filter run.
         self._filter_timer.start()
 
+    def _get_grid_item(self, info: MediaInfo | None) -> QListWidgetItem | None:
+        if not info: return None
+        if not hasattr(info, 'grid_items'):
+            info.grid_items = {}
+            if hasattr(info, 'grid_item') and info.grid_item:
+                info.grid_items[id(self)] = info.grid_item
+        return info.grid_items.get(id(self))
+
+    def _set_grid_item(self, info: MediaInfo | None, item: QListWidgetItem | None):
+        if not info: return
+        if not hasattr(info, 'grid_items'):
+            info.grid_items = {}
+        if item is not None:
+            info.grid_items[id(self)] = item
+        else:
+            info.grid_items.pop(id(self), None)
+        info.grid_item = item
+
     def _apply_filter(self):
         text = self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()
         search_lower = text.lower().strip()
@@ -5375,10 +5453,11 @@ class MediaTab(QWidget):
         for row in range(self.table.rowCount()):
             info = self._get_row_info(row)
             if not info: continue
+            grid = self._get_grid_item(info)
             if self.is_smart_folder:
                 if not matches_query(info, self.smart_query):
                     self.table.setRowHidden(row, True)
-                    if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+                    if grid: grid.setHidden(True)
                     continue
             filename = self.table.item(row, self.COL_FILENAME).text().lower()
             artist_item = self.table.item(row, self.COL_ARTIST)
@@ -5390,10 +5469,10 @@ class MediaTab(QWidget):
             if not search_lower or matches_query(info, search_lower, preview):
                 self.filtered_rows.add(row)
                 self.table.setRowHidden(row, False)
-                if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(False)
+                if grid: grid.setHidden(False)
             else:
                 self.table.setRowHidden(row, True)
-                if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+                if grid: grid.setHidden(True)
         self._apply_advanced_filters()
         self._update_stats()
         self._load_visible_widgets()
@@ -5439,16 +5518,21 @@ class MediaTab(QWidget):
             
             keep = True
             
-            # Resolution
-            if res_idx > 0 and info.height > 0:
-                h = info.height
-                if res_idx == 1 and h < 4320: keep = False # 8K+
-                elif res_idx == 2 and (h < 2160 or h >= 4320): keep = False # 4K
-                elif res_idx == 3 and (h < 1440 or h >= 2160): keep = False # 1440p
-                elif res_idx == 4 and (h < 1080 or h >= 1440): keep = False # 1080p
-                elif res_idx == 5 and (h < 720 or h >= 1080): keep = False # 720p
-                elif res_idx == 6 and (h < 480 or h >= 720): keep = False # 480p
-                elif res_idx == 7 and h >= 480: keep = False # Below 480p
+            # Resolution (uses min(w,h) to correctly classify portrait phone videos and photos)
+            if res_idx > 0:
+                w = getattr(info, 'width', 0)
+                h = getattr(info, 'height', 0)
+                lesser = min(w, h) if (w > 0 and h > 0) else (h or w)
+                if lesser > 0:
+                    if res_idx == 1 and lesser < 4320: keep = False # 8K+
+                    elif res_idx == 2 and (lesser < 2160 or lesser >= 4320): keep = False # 4K
+                    elif res_idx == 3 and (lesser < 1440 or lesser >= 2160): keep = False # 1440p
+                    elif res_idx == 4 and (lesser < 1080 or lesser >= 1440): keep = False # 1080p
+                    elif res_idx == 5 and (lesser < 720 or lesser >= 1080): keep = False # 720p
+                    elif res_idx == 6 and (lesser < 480 or lesser >= 720): keep = False # 480p
+                    elif res_idx == 7 and lesser >= 480: keep = False # Below 480p
+                else:
+                    keep = False
 
             # Duration
             if keep and dur_max > 0:
@@ -5495,7 +5579,8 @@ class MediaTab(QWidget):
             if not keep:
                 rows_to_remove.append(row)
                 self.table.setRowHidden(row, True)
-                if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+                grid = self._get_grid_item(info)
+                if grid: grid.setHidden(True)
 
         for row in rows_to_remove:
             self.filtered_rows.remove(row)
@@ -5560,6 +5645,11 @@ class MediaTab(QWidget):
                 if not hasattr(self, '_orphaned_scanners'):
                     self._orphaned_scanners = []
                 self._orphaned_scanners.append(old)
+                def _cleanup_old(target=old):
+                    if hasattr(self, '_orphaned_scanners') and target in self._orphaned_scanners:
+                        try: self._orphaned_scanners.remove(target)
+                        except ValueError: pass
+                old.finished.connect(_cleanup_old)
                 old.finished.connect(old.deleteLater)
                 
         was_watch = getattr(self, '_watch_enabled', False)
@@ -5629,10 +5719,12 @@ class MediaTab(QWidget):
                                 stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=False):
                                 ext = os.path.splitext(entry.name)[1].lower()
-                                # Match ScannerThread semantics: known extensions
-                                # plus extensionless files only ('all' already
-                                # unions every supported set).
-                                if ext == '' or ext in valid_exts:
+                                is_valid = ext in valid_exts
+                                if not is_valid and ext == '':
+                                    name_lower = entry.name.lower()
+                                    if not name_lower.startswith('.') and name_lower not in IGNORED_EXTENSIONLESS_NAMES:
+                                        is_valid = True
+                                if is_valid:
                                     full_path = os.path.normpath(entry.path)
                                     norm_case = os.path.normcase(full_path)
                                     if not self._should_exclude(full_path):
@@ -5867,7 +5959,7 @@ class MediaTab(QWidget):
             emoji = "🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️"))
             painter.drawText(QRect(0, 0, pw, ph), Qt.AlignmentFlag.AlignCenter, emoji)
         grid_item.setIcon(QIcon(placeholder_pix))
-        info.grid_item = grid_item
+        self._set_grid_item(info, grid_item)
         search_text = (self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()).lower().strip()
         is_hidden = False
         if self.is_smart_folder and not matches_query(info, self.smart_query): is_hidden = True
@@ -6029,7 +6121,8 @@ class MediaTab(QWidget):
                 cw, ch = self._thumb_dims()
                 label.setFixedSize(cw, ch)
                 label.setPixmap(pixmap.scaled(cw, ch, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setIcon(QIcon(pixmap))
+            grid = self._get_grid_item(info)
+            if grid: grid.setIcon(QIcon(pixmap))
 
     @property
     def progress_bar(self):
@@ -6366,7 +6459,11 @@ class MediaTab(QWidget):
                 continue
             if config_key == "name":
                 if artist:
-                    parts.append(artist)
+                    clean_artist = sanitize_folder_name(artist)
+                    if clean_artist and clean_artist != "Unknown":
+                        parts.append(clean_artist)
+                    elif artist.strip():
+                        parts.append(re.sub(r'[\\/*?:"<>|]', '', artist).strip())
             elif config_key == "duration":
                 if self.media_type != 'image' and info.duration_compact and info.duration_compact != "—":
                     parts.append(info.duration_compact)
@@ -6375,16 +6472,24 @@ class MediaTab(QWidget):
                     parts.append(info.resolution_tag)
             elif config_key == "rating":
                 if rating and rating != "—":
-                    parts.append(rating)
+                    clean_rating = re.sub(r'[\\/*?:"<>|]', '', rating).strip()
+                    if clean_rating:
+                        parts.append(clean_rating)
             elif config_key == "tags":
                 tags = getattr(info, 'tags', [])
                 if tags:
-                    parts.append(" ".join(tags))
+                    clean_tags = [re.sub(r'[\\/*?:"<>|]', '', t).strip() for t in tags if t.strip()]
+                    if clean_tags:
+                        parts.append(" ".join(clean_tags))
             elif config_key in ("date_taken", "ym"):
                 dt = get_media_datetime(info)
                 if dt is not None:
                     parts.append(dt.strftime("%Y-%m-%d") if config_key == "date_taken" else dt.strftime("%Y%m"))
-        return separator.join(parts)
+        result = separator.join(parts).strip()
+        result = re.sub(r'[\\/*?:"<>|]', '', result).strip()
+        if sys.platform == "win32":
+            result = result.rstrip(".")
+        return result
 
     def _is_naming_data_complete(self, artist: str, rating: str, info=None) -> bool:
         main_win = self.window()
@@ -6429,16 +6534,17 @@ class MediaTab(QWidget):
         target_display = new_name + (info.extension if keep_ext else "") if new_name else ""
         
         is_dark = getattr(self.window(), 'current_theme', 'dark') == 'dark'
+        grid = self._get_grid_item(info)
         if not is_complete or not new_name or target_display == current_display_name:
             preview_item.setText("—")
             preview_item.setFont(QFont(BASE_FONT_FAMILY, 10, QFont.Weight.Normal))
             preview_item.setForeground(QColor("#7c7c9a") if is_dark else QColor("#64748b"))
-            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setToolTip("")
+            if grid: grid.setToolTip("")
         else:
             preview_item.setText(f"➜  {target_display}")
             preview_item.setFont(QFont(BASE_FONT_FAMILY, 10, QFont.Weight.Bold))
             preview_item.setForeground(QColor("#34d399") if is_dark else QColor("#059669"))
-            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setToolTip(f"Rename to: {target_display}")
+            if grid: grid.setToolTip(f"Rename to: {target_display}")
         self._update_stats()
 
     def _on_selection_changed(self):
@@ -6452,7 +6558,8 @@ class MediaTab(QWidget):
             self.grid_view.clearSelection()
             for row in selected_rows:
                 info = self._get_row_info(row)
-                if info and hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setSelected(True)
+                grid = self._get_grid_item(info)
+                if grid: grid.setSelected(True)
             self.grid_view.blockSignals(False)
         finally:
             self._syncing_selection = False
@@ -6524,12 +6631,12 @@ class MediaTab(QWidget):
                     tags_item = self.table.item(row, self.COL_TAGS)
                     if tags_item:
                         tags_item.setText(tags_text)
-                    tags_widget = self.table.cellWidget(row, self.COL_TAGS)
                     if tags_widget and tags_widget.text() != tags_text:
                         tags_widget.setText(tags_text)
-                    if hasattr(info, 'grid_item') and info.grid_item:
+                    grid = self._get_grid_item(info)
+                    if grid:
                         tag_str = tags_text if new_tags else ""
-                        info.grid_item.setToolTip(f"{info.filename}\nTags: {tag_str}" if tag_str else info.filename)
+                        grid.setToolTip(f"{info.filename}\nTags: {tag_str}" if tag_str else info.filename)
             finally:
                 self._updating_table = False
                 self.table.setSortingEnabled(was_sorting)
@@ -6573,7 +6680,13 @@ class MediaTab(QWidget):
             for row in range(rng.topRow(), rng.bottomRow() + 1):
                 selected_rows.add(row)
 
-        dialog = SmartRelocateDialog(self.media_infos, selected_rows, self)
+        selected_infos = []
+        for r in sorted(selected_rows):
+            info = self._get_row_info(r)
+            if info and info.is_valid:
+                selected_infos.append(info)
+
+        dialog = SmartRelocateDialog(self.media_infos, selected_infos, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -6591,116 +6704,119 @@ class MediaTab(QWidget):
             return
 
         # Compute the allowed root (everything before the first {variable})
-        # so we can validate each resolved dest_dir stays inside it.
-        # NOTE: allowed_root stays None when the template starts with a
-        # {variable} or contains none — that's still safe because
-        # parse_destination_template strips all separators/'..' from every
-        # substituted value, so traversal can only come from template literals
-        # the user typed deliberately.
         first_var = template.find('{')
         allowed_root = os.path.normcase(os.path.abspath(template[:first_var])) if first_var > 0 else None
 
         success_count = 0
         error_count = 0
-        error_details = []  # capture for the completion dialog
+        error_details = []
 
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
         self._updating_table = True
 
-        # Build id(info) -> row map ONCE for O(1) lookup (was O(N·M))
-        id_to_row = {}
-        for r in range(self.table.rowCount()):
-            ri = self._get_row_info(r)
-            if ri is not None:
-                id_to_row[id(ri)] = r
+        # Disable buttons to prevent re-entrancy during processEvents()
+        buttons_to_toggle = [
+            getattr(self, 'btn_process', None), getattr(self, 'btn_relocate', None),
+            getattr(self, 'btn_batch_edit', None), getattr(self, 'btn_batch_tag', None),
+            getattr(self, 'btn_delete', None), getattr(self, 'btn_load', None),
+            getattr(self, 'btn_clear', None), getattr(self, 'btn_find_dupes', None),
+            getattr(self, 'btn_undo', None), getattr(self, 'btn_redo', None)
+        ]
+        btn_states = {btn: btn.isEnabled() for btn in buttons_to_toggle if btn is not None}
+        for btn in btn_states:
+            btn.setEnabled(False)
 
-        # Show a progress dialog so the user can see what's happening during
-        # long cross-filesystem moves (which can take seconds per GB).
-        progress = QProgressDialog("Moving files…", "Cancel", 0, len(target_infos), self)
-        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
+        try:
+            # Build id(info) -> row map ONCE for O(1) lookup
+            id_to_row = {}
+            for r in range(self.table.rowCount()):
+                ri = self._get_row_info(r)
+                if ri is not None:
+                    id_to_row[id(ri)] = r
 
-        for idx, info in enumerate(target_infos):
-            if progress.wasCanceled():
-                error_details.append(f"Cancelled by user after {success_count} files moved.")
-                break
-            src = info.filepath
-            tags = getattr(info, 'tags', [])
-            dest_dir = parse_destination_template(template, info, tags)
+            progress = QProgressDialog("Moving files…", "Cancel", 0, len(target_infos), self)
+            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
 
-            # Path-traversal safety: ensure resolved dest_dir stays under allowed_root
-            if allowed_root:
-                abs_dest = os.path.normcase(os.path.abspath(dest_dir))
-                try:
-                    if os.path.commonpath([allowed_root, abs_dest]) != allowed_root:
+            for idx, info in enumerate(target_infos):
+                if progress.wasCanceled():
+                    error_details.append(f"Cancelled by user after {success_count} files moved.")
+                    break
+                src = info.filepath
+                tags = getattr(info, 'tags', [])
+                dest_dir = parse_destination_template(template, info, tags)
+
+                if allowed_root:
+                    abs_dest = os.path.normcase(os.path.abspath(dest_dir))
+                    try:
+                        if os.path.commonpath([allowed_root, abs_dest]) != allowed_root:
+                            error_count += 1
+                            error_details.append(f"{info.filename}: destination escapes allowed root")
+                            continue
+                    except ValueError:
                         error_count += 1
-                        error_details.append(f"{info.filename}: destination escapes allowed root")
+                        error_details.append(f"{info.filename}: cannot validate destination path")
                         continue
-                except ValueError:
+
+                try:
+                    os.makedirs(dest_dir, exist_ok=True)
+
+                    dest_file = os.path.join(dest_dir, info.filename)
+                    same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
+                    if os.path.exists(dest_file) and not same_file:
+                        base, ext = os.path.splitext(info.filename)
+                        counter = 1
+                        while os.path.exists(dest_file):
+                            dest_file = os.path.join(dest_dir, f"{base}_{counter}{ext}")
+                            counter += 1
+
+                    shutil.move(src, dest_file)
+
+                    info.filepath = dest_file
+                    info.filename = os.path.basename(dest_file)
+
+                    row_idx = id_to_row.get(id(info), -1)
+
+                    moved_extra = self._move_sidecars(src, dest_file)
+                    self._refresh_row_dates(info)
+                    if row_idx >= 0:
+                        fname_item = self.table.item(row_idx, self.COL_FILENAME)
+                        if fname_item:
+                            fname_item.setText(info.filename)
+                            fname_item.setToolTip(dest_file)
+                        grid_item = self._get_grid_item(info)
+                        if grid_item:
+                            grid_item.setText(info.filename)
+                            grid_item.setToolTip(dest_file)
+                        self._update_date_items(row_idx, info)
+                    self._add_to_history(src, dest_file, row_idx, extra=moved_extra)
+
+                    success_count += 1
+
+                except Exception as e:
                     error_count += 1
-                    error_details.append(f"{info.filename}: cannot validate destination path")
-                    continue
+                    error_details.append(f"{info.filename}: {e}")
+                    logger.exception("Failed to move %s", info.filename)
 
-            try:
-                os.makedirs(dest_dir, exist_ok=True)
+                progress.setValue(idx + 1)
+                QApplication.processEvents()
 
-                dest_file = os.path.join(dest_dir, info.filename)
-                same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
-                if os.path.exists(dest_file) and not same_file:
-                    base, ext = os.path.splitext(info.filename)
-                    counter = 1
-                    while os.path.exists(dest_file):
-                        dest_file = os.path.join(dest_dir, f"{base}_{counter}{ext}")
-                        counter += 1
+            progress.close()
 
-                shutil.move(src, dest_file)
+        finally:
+            self._updating_table = False
+            self.table.setSortingEnabled(was_sorting)
+            if success_count > 0:
+                self._known_files_dirty = True
 
-                # Update info and matching table items
-                info.filepath = dest_file
-                info.filename = os.path.basename(dest_file)
+            for btn, state in btn_states.items():
+                btn.setEnabled(state)
 
-                row_idx = id_to_row.get(id(info), -1)
+            self.table.viewport().update()
+            self.btn_undo.setEnabled(len(self._rename_history) > 0)
 
-                # Sidecars + dates + history must happen even when row_idx==-1
-                # (cross-tab source, stale id_to_row) — disk state already moved
-                moved_extra = self._move_sidecars(src, dest_file)
-                self._refresh_row_dates(info)
-                if row_idx >= 0:
-                    fname_item = self.table.item(row_idx, self.COL_FILENAME)
-                    if fname_item:
-                        fname_item.setText(info.filename)
-                        fname_item.setToolTip(dest_file)
-                    # Keep the grid card in sync (was stale until next rescan)
-                    if hasattr(info, 'grid_item') and info.grid_item:
-                        info.grid_item.setText(info.filename)
-                        info.grid_item.setToolTip(dest_file)
-                    self._update_date_items(row_idx, info)
-                self._add_to_history(src, dest_file, row_idx, extra=moved_extra)
-
-                success_count += 1
-
-            except Exception as e:
-                error_count += 1
-                error_details.append(f"{info.filename}: {e}")
-                logger.exception("Failed to move %s", info.filename)
-
-            progress.setValue(idx + 1)
-            QApplication.processEvents()
-
-        progress.close()
-
-        self._updating_table = False
-        self.table.setSortingEnabled(was_sorting)
-        if success_count > 0:
-            self._known_files_dirty = True
-
-        self.table.viewport().update()
-        self.btn_undo.setEnabled(len(self._rename_history) > 0)
-
-        # Include error details in the completion dialog so users can diagnose
-        # why specific files failed (was: just a count via silent print()).
         msg = f"Relocation complete.\nSuccess: {success_count}\nFailed: {error_count}"
         if error_details:
             msg += "\n\nErrors (first 10):\n" + "\n".join(error_details[:10])
@@ -7122,9 +7238,11 @@ class MediaTab(QWidget):
         if info:
             self.media_infos = [v for v in self.media_infos if v.filepath != info.filepath]
             self.table.removeRow(row)
-            if hasattr(info, 'grid_item') and info.grid_item:
-                row_item = self.grid_view.row(info.grid_item)
+            grid = self._get_grid_item(info)
+            if grid:
+                row_item = self.grid_view.row(grid)
                 if row_item >= 0: self.grid_view.takeItem(row_item)
+                self._set_grid_item(info, None)
             # Keep filtered_rows consistent: every index above the removed row
             # shifts down by one (prevents later bulk ops targeting stale rows).
             self.filtered_rows.discard(row)
@@ -7237,9 +7355,10 @@ class MediaTab(QWidget):
             self._updating_table = True
             item.setText(info.filename)
             self._updating_table = False
-            if hasattr(info, 'grid_item') and info.grid_item:
-                info.grid_item.setText(info.filename)
-                info.grid_item.setToolTip(dst)
+            grid = self._get_grid_item(info)
+            if grid:
+                grid.setText(info.filename)
+                grid.setToolTip(dst)
             self._known_files_dirty = True
             moved_extra = self._move_sidecars(src, dst)
             self._refresh_row_dates(info)
@@ -7306,7 +7425,8 @@ class MediaTab(QWidget):
                     status_item.setText("✓ Renamed")
                     status_item.setForeground(QColor("#6dd5ed"))
                     self._updating_table = False
-                    if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+                    grid = self._get_grid_item(info)
+                    if grid: grid.setText(info.filename)
                     moved_extra = self._move_sidecars(src, dst)
                     self._refresh_row_dates(info)
                     self._update_date_items(row, info)
@@ -7381,7 +7501,8 @@ class MediaTab(QWidget):
                             self.table.item(row, self.COL_FILENAME).setToolTip(src)
                             self.table.item(row, self.COL_STATUS).setText("✓ Valid")
                             self.table.item(row, self.COL_STATUS).setForeground(QColor("#34d399"))
-                            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+                            grid = self._get_grid_item(info)
+                            if grid: grid.setText(info.filename)
                 except Exception as te:
                     # Table update failed after successful move — attempt to roll
                     # back the move so disk state and table state stay in sync.
@@ -7448,7 +7569,8 @@ class MediaTab(QWidget):
                             self.table.item(row, self.COL_FILENAME).setToolTip(dst)
                             self.table.item(row, self.COL_STATUS).setText("✓ Renamed")
                             self.table.item(row, self.COL_STATUS).setForeground(QColor("#6dd5ed"))
-                            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+                            grid = self._get_grid_item(info)
+                            if grid: grid.setText(info.filename)
                 except Exception as te:
                     # Table update failed after successful move — roll the move
                     # back so disk state and table state stay in sync (mirrors
@@ -7623,7 +7745,8 @@ class MediaTab(QWidget):
             for row in range(self.table.rowCount()):
                 self.table.setRowHidden(row, False)
                 info = self._get_row_info(row)
-                if info and hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(False)
+                grid = self._get_grid_item(info)
+                if grid: grid.setHidden(False)
             self._update_stats()
             return
         was_sorting = self.table.isSortingEnabled()
@@ -7632,7 +7755,8 @@ class MediaTab(QWidget):
         for row in range(self.table.rowCount()):
             self.table.setRowHidden(row, True)
             info = self._get_row_info(row)
-            if info and hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+            grid = self._get_grid_item(info)
+            if grid: grid.setHidden(True)
         total_dupes = 0
         for group_idx, grp in enumerate(groups):
             bg_color = QColor(239, 68, 68, 38) if group_idx % 2 == 0 else QColor(245, 158, 11, 38)
@@ -7643,7 +7767,8 @@ class MediaTab(QWidget):
                 self.filtered_rows.add(row)
                 self.table.setRowHidden(row, False)
                 info = self._get_row_info(row)
-                if info and hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(False)
+                grid = self._get_grid_item(info)
+                if grid: grid.setHidden(False)
                 status_item = self.table.item(row, self.COL_STATUS)
                 if status_item:
                     status_item.setText(f"⚠️ Dup Group {group_idx + 1}")
@@ -8021,7 +8146,8 @@ class MediaTab(QWidget):
             selected_items = self.grid_view.selectedItems()
             for row in range(self.table.rowCount()):
                 info = self._get_row_info(row)
-                if info and hasattr(info, 'grid_item') and info.grid_item in selected_items:
+                grid = self._get_grid_item(info)
+                if grid and grid in selected_items:
                     for col in range(self.table.columnCount()):
                         item = self.table.item(row, col)
                         if item: item.setSelected(True)
