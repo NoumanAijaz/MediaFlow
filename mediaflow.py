@@ -49,19 +49,21 @@ else:
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QComboBox, QLineEdit, QMessageBox, QProgressBar,
+    QHeaderView, QComboBox, QLineEdit, QMessageBox, QProgressBar, QProgressDialog,
     QFrame, QAbstractItemView, QMenu, QCheckBox, QDialog, QDialogButtonBox, QRadioButton,
     QFormLayout, QGroupBox, QStackedWidget, QListWidget, QListWidgetItem,
-    QStyledItemDelegate, QSlider, QScrollArea, QStyle
+    QStyledItemDelegate, QSlider, QScrollArea, QStyle, QSpinBox, QDoubleSpinBox,
+    QSplitter, QSizePolicy, QInputDialog, QTableWidgetSelectionRange
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve,
-    QTimer, QSize, QRect, QUrl, QPoint, QPointF, QRectF, QEvent
+    Qt, QThread, pyqtSignal, pyqtSlot, QPropertyAnimation, QEasingCurve,
+    QTimer, QSize, QRect, QUrl, QPoint, QPointF, QRectF, QEvent, QObject, QThreadPool, QRunnable,
+    QEventLoop
 )
 from PyQt6.QtGui import (
     QFont, QColor, QIcon, QPalette, QPainter,
     QAction, QPixmap, QKeySequence, QImage, QBrush, QGuiApplication,
-    QPen, QPainterPath, QCursor, QImageReader
+    QPen, QPainterPath, QCursor, QImageReader, QPolygon, QLinearGradient
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -94,6 +96,13 @@ AUDIO_EXTENSIONS = {
 PDF_EXTENSIONS = {
     '.pdf'
 }
+
+def get_extensions_for_type(media_type: str) -> set[str]:
+    if media_type == 'video': return VIDEO_EXTENSIONS
+    elif media_type == 'audio': return AUDIO_EXTENSIONS
+    elif media_type == 'image': return IMAGE_EXTENSIONS
+    elif media_type == 'pdf': return PDF_EXTENSIONS
+    else: return VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
 
 CONFIG_DIR = os.path.join(os.environ.get('APPDATA', '.'), 'MediaFlow')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
@@ -154,6 +163,26 @@ def format_duration_compact(total_seconds: float) -> str:
     seconds = total_seconds % 60
     if hours > 0: return f"{hours}{minutes:02d}{seconds:02d}"
     else: return f"{minutes}{seconds:02d}"
+
+def format_duration(total_seconds: float) -> str:
+    total_seconds = int(round(total_seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds:02d}s"
+    else:
+        return f"{seconds}s"
+
+def format_size(size_bytes: int) -> str:
+    if size_bytes <= 0: return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(size_bytes) < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.1f} PB"
 
 def parse_naming_format(filename: str) -> tuple[str | None, str | None]:
     # NOTE: removed redundant '|k' alternative (IGNORECASE already handles it)
@@ -297,8 +326,9 @@ def sanitize_folder_name(name: str) -> str:
     if not name: return "Unknown"
     # Remove Windows illegal characters: \ / : * ? " < > |
     clean = re.sub(r'[\\/*?:"<>|]', "", name)
-    # Remove leading/trailing spaces and dots
-    clean = clean.strip(" .")
+    clean = clean.strip()
+    if sys.platform == "win32":
+        clean = clean.rstrip(".")
     return clean or "Unknown"
 
 def _strip_path_traversal(value: str) -> str:
@@ -344,6 +374,17 @@ def get_ffprobe_command(custom_path=None) -> str | None:
     if custom_path and os.path.exists(custom_path): return custom_path
     sh_path = shutil.which("ffprobe")
     return sh_path
+
+def get_ffmpeg_command(custom_path=None) -> str | None:
+    if custom_path and os.path.exists(custom_path): return custom_path
+    sh_path = shutil.which("ffmpeg")
+    if sh_path: return sh_path
+    ffprobe_cmd = get_ffprobe_command()
+    if ffprobe_cmd:
+        ffmpeg_sibling = os.path.join(os.path.dirname(ffprobe_cmd), "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+        if os.path.exists(ffmpeg_sibling):
+            return ffmpeg_sibling
+    return None
 
 def get_file_deep_metadata(filepath: str, ffprobe_path: str = None) -> dict | None:
     ffprobe_cmd = get_ffprobe_command(ffprobe_path)
@@ -407,26 +448,32 @@ def parse_ffprobe_json(data: dict) -> dict:
             parsed['audio'] = a_info
     return parsed
 
-def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 120, height: int = 68) -> QPixmap | None:
+def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 120, height: int = 68) -> QImage | None:
+    """Build a thumbnail as a QImage.
+
+    Returns QImage (not QPixmap) because this runs on QThreadPool worker
+    threads — QPixmap may only be touched on the GUI thread. Callers on the
+    main thread convert via QPixmap.fromImage().
+    """
     try:
         if media_type == 'audio':
-            pixmap = QPixmap(width, height)
-            pixmap.fill(QColor("#1e1b4b"))
-            with QPainter(pixmap) as painter:
+            img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(QColor("#1e1b4b"))
+            with QPainter(img) as painter:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setFont(QFont(BASE_FONT_FAMILY, 24))
                 painter.setPen(QColor("#a78bfa"))
                 painter.drawText(QRect(0, 0, width, height), Qt.AlignmentFlag.AlignCenter, "🎵")
-            return pixmap
+            return img
         if media_type == 'pdf':
-            pixmap = QPixmap(width, height)
-            pixmap.fill(QColor("#1e1b4b"))
-            with QPainter(pixmap) as painter:
+            img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            img.fill(QColor("#1e1b4b"))
+            with QPainter(img) as painter:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 painter.setFont(QFont(BASE_FONT_FAMILY, 24))
                 painter.setPen(QColor("#f87171"))
                 painter.drawText(QRect(0, 0, width, height), Qt.AlignmentFlag.AlignCenter, "📄")
-            return pixmap
+            return img
         if media_type == 'video':
             cap = None
             try:
@@ -461,11 +508,11 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
             frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA).copy()
         bytes_per_line = new_w * 3
         qimg = QImage(frame.data, new_w, new_h, bytes_per_line, QImage.Format.Format_RGB888).copy()
-        pixmap = QPixmap(width, height)
-        pixmap.fill(QColor("#1e1b4b"))
-        with QPainter(pixmap) as painter:
+        canvas = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(QColor("#1e1b4b"))
+        with QPainter(canvas) as painter:
             painter.drawImage((width - new_w) // 2, (height - new_h) // 2, qimg)
-        return pixmap
+        return canvas
     except Exception as e:
         logger.warning("generate_thumbnail failed for %s: %s", filepath, e)
         return None
@@ -473,20 +520,32 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
 def send_to_recycle_bin(path: str) -> bool:
     if sys.platform == "win32":
         try:
-            from ctypes import windll, c_int, c_void_p, c_wchar_p, byref, create_unicode_buffer, cast
-            from ctypes.wintypes import HWND, UINT
-            # Use stdlib SHFILEOPSTRUCTW for safety
-            from ctypes.wintypes import SHFILEOPSTRUCTW
+            import ctypes
+            from ctypes import windll, c_int, c_wchar_p, byref, create_unicode_buffer, cast, Structure, POINTER
+            from ctypes.wintypes import HWND, UINT, BOOL, LPCWSTR
+
+            class SHFILEOPSTRUCTW(Structure):
+                _fields_ = [
+                    ("hwnd", HWND),
+                    ("wFunc", UINT),
+                    ("pFrom", LPCWSTR),
+                    ("pTo", LPCWSTR),
+                    ("fFlags", ctypes.c_ushort),
+                    ("fAnyOperationsAborted", BOOL),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", LPCWSTR),
+                ]
+
             path = os.path.abspath(path)
             # SHFileOperationW requires DOUBLE-null-terminated string
             p_from_buf = create_unicode_buffer(path + "\0\0")
             fileop = SHFILEOPSTRUCTW()
             fileop.hwnd = None
             fileop.wFunc = 3  # FO_DELETE
-            fileop.pFrom = cast(p_from_buf, c_wchar_p)
+            fileop.pFrom = cast(p_from_buf, LPCWSTR)
             fileop.pTo = None
             fileop.fFlags = 0x0040 | 0x0010 | 0x0004  # ALLOWUNDO | NOCONFIRMATION | SILENT
-            fileop.fAnyOperationsAborted = c_int(0)
+            fileop.fAnyOperationsAborted = 0
             fileop.hNameMappings = None
             fileop.lpszProgressTitle = None
             return windll.shell32.SHFileOperationW(byref(fileop)) == 0
@@ -964,6 +1023,7 @@ QWidget { color: #e0e0e0; font-family: 'Segoe UI', 'Inter', sans-serif; }
 #navButton[active="true"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6); color: #ffffff; border: 1px solid rgba(124, 58, 237, 0.3); font-weight: 700; }
 #controlPanel { background: rgba(30, 27, 75, 0.65); border: 1px solid rgba(167, 139, 250, 0.2); border-radius: 16px; padding: 16px 20px; }
 #filterPanel { background: rgba(30, 27, 75, 0.50); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
+#advancedFilterPanel { background: rgba(30, 27, 75, 0.50); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
 #statsPanel { background: rgba(30, 27, 75, 0.60); border: 1px solid rgba(167, 139, 250, 0.2); border-left: 4px solid #8b5cf6; border-radius: 8px; padding: 0px; }
 #statValue { font-size: 18px; font-weight: 800; color: #ffffff; }
 #statLabel { font-size: 9px; color: #a78bfa; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
@@ -980,6 +1040,8 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnClearAll:hover { background: rgba(239, 68, 68, 0.25); color: #ffffff; border: 1px solid #ef4444; }
 #btnClearAll:pressed { background: #b91c1c; }
 #btnClearAll:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
+#btnWatch { background: rgba(255, 255, 255, 0.05); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.2); }
+#btnWatch:checked { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
 #btnLoadFiles { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #60a5fa); color: white; min-width: 140px; }
 #btnLoadFiles:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #3b82f6); }
 #btnLoadFiles:pressed { background: #1d4ed8; }
@@ -996,11 +1058,11 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnFindDuplicates:hover { background: rgba(14, 165, 233, 0.25); color: #ffffff; border: 1px solid #0ea5e9; }
 #btnFindDuplicates:pressed { background: #0369a1; }
 #btnFindDuplicates:disabled { background: transparent; color: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.05); }
-#btnViewMode, #btnTogglePreview { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.3); min-width: 100px; padding: 6px 12px; font-size: 11px; border-radius: 6px; }
-#btnViewMode:hover, #btnTogglePreview:hover { background: rgba(167, 139, 250, 0.25); color: #ffffff; }
-#btnViewMode:pressed, #btnTogglePreview:pressed { background: rgba(139, 92, 246, 0.4); }
-#btnViewMode:checked, #btnTogglePreview:checked { background: rgba(99, 102, 241, 0.4); color: #ffffff; border: 1px solid rgba(99, 102, 241, 0.6); }
-#btnViewMode:disabled, #btnTogglePreview:disabled { background: transparent; color: rgba(255, 255, 255, 0.05); }
+#btnViewMode, #btnTogglePreview, #btnToggleStats { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.3); min-width: 100px; padding: 6px 12px; font-size: 11px; border-radius: 6px; }
+#btnViewMode:hover, #btnTogglePreview:hover, #btnToggleStats:hover { background: rgba(167, 139, 250, 0.25); color: #ffffff; }
+#btnViewMode:pressed, #btnTogglePreview:pressed, #btnToggleStats:pressed { background: rgba(139, 92, 246, 0.4); }
+#btnViewMode:checked, #btnTogglePreview:checked, #btnToggleStats:checked { background: rgba(99, 102, 241, 0.4); color: #ffffff; border: 1px solid rgba(99, 102, 241, 0.6); }
+#btnViewMode:disabled, #btnTogglePreview:disabled, #btnToggleStats:disabled { background: transparent; color: rgba(255, 255, 255, 0.05); }
 #previewPanel { background: rgba(15, 12, 41, 0.7); border: 1px solid rgba(167, 139, 250, 0.2); border-radius: 12px; }
 #btnUndo, #btnRedo { background: rgba(139, 92, 246, 0.2); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.4); min-width: 100px; }
 #btnUndo:hover, #btnRedo:hover { background: rgba(139, 92, 246, 0.3); color: #ffffff; border: 1px solid #8b5cf6; }
@@ -1020,6 +1082,8 @@ QScrollBar::handle:vertical:hover { background: rgba(167, 139, 250, 0.55); }
 QLineEdit { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #8b5cf6; background: rgba(55, 48, 110, 0.9); }
 QComboBox { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; min-width: 55px; }
+#searchComboBox { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; }
+#searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #e0e0e0; font-size: 12px; }
 QComboBox QAbstractItemView { background: #1e1b4b; border: 1px solid rgba(167, 139, 250, 0.3); border-radius: 6px; selection-background-color: rgba(99, 102, 241, 0.4); color: #e0e0e0; }
 QProgressBar { background: rgba(30, 27, 75, 0.6); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 8px; text-align: center; color: #a78bfa; font-size: 11px; font-weight: 600; height: 18px; }
 QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #a78bfa); border-radius: 7px; }
@@ -1052,6 +1116,9 @@ QScrollArea { background: transparent; border: none; }
 #btnCloseSettings, #btnClosePreview { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 6px; padding: 0px; font-weight: bold; font-size: 12px; }
 #btnCloseSettings:hover, #btnClosePreview:hover { background: rgba(239, 68, 68, 0.3); color: #ffffff; }
 #btnCloseSettings:pressed, #btnClosePreview:pressed { background: #b91c1c; }
+#btnAdvancedFilter { background: rgba(255, 255, 255, 0.05); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.2); padding: 6px 12px; font-size: 11px; }
+#btnAdvancedFilter:hover { background: rgba(167, 139, 250, 0.15); border: 1px solid rgba(167, 139, 250, 0.3); color: #ffffff; }
+#btnAdvancedFilter:checked { background: rgba(139, 92, 246, 0.2); border: 1px solid #8b5cf6; color: #ffffff; }
 #btnAddSmartFolder { background: rgba(99, 102, 241, 0.2); color: #a78bfa; border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 4px; padding: 0px; font-size: 14px; font-weight: bold; }
 #btnAddSmartFolder:hover { background: rgba(99, 102, 241, 0.4); color: #ffffff; }
 #btnAddSmartFolder:pressed { background: #4338ca; }
@@ -1080,6 +1147,7 @@ QWidget { color: #0f172a; font-family: 'Segoe UI', 'Inter', sans-serif; }
 #navButton[active="true"] { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; font-weight: 700; }
 #controlPanel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px 20px; }
 #filterPanel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
+#advancedFilterPanel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
 #statsPanel { background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #6366f1; border-radius: 8px; padding: 0px; }
 #statValue { font-size: 18px; font-weight: 800; color: #0f172a; }
 #statLabel { font-size: 9px; color: #6366f1; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
@@ -1112,10 +1180,10 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnFindDuplicates:hover { background: #bae6fd; color: #0369a1; border: 1px solid #7dd3fc; }
 #btnFindDuplicates:pressed { background: #0284c7; }
 #btnFindDuplicates:disabled { background: #f1f5f9; color: #94a3b8; border: 1px solid #cbd5e1; }
-#btnViewMode, #btnTogglePreview { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; min-width: 100px; padding: 6px 12px; font-size: 11px; border-radius: 6px; }
-#btnViewMode:hover, #btnTogglePreview:hover { background: #e2e8f0; color: #0f172a; }
-#btnViewMode:pressed, #btnTogglePreview:pressed { background: #cbd5e1; }
-#btnViewMode:checked, #btnTogglePreview:checked { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; }
+#btnViewMode, #btnTogglePreview, #btnToggleStats { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; min-width: 100px; padding: 6px 12px; font-size: 11px; border-radius: 6px; }
+#btnViewMode:hover, #btnTogglePreview:hover, #btnToggleStats:hover { background: #e2e8f0; color: #0f172a; }
+#btnViewMode:pressed, #btnTogglePreview:pressed, #btnToggleStats:pressed { background: #cbd5e1; }
+#btnViewMode:checked, #btnTogglePreview:checked, #btnToggleStats:checked { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; }
 #previewPanel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; }
 #btnUndo, #btnRedo { background: #f3e8ff; color: #7e22ce; border: 1px solid #e9d5ff; min-width: 100px; }
 #btnUndo:hover, #btnRedo:hover { background: #e9d5ff; color: #6b21a8; border: 1px solid #d8b4fe; }
@@ -1135,6 +1203,8 @@ QScrollBar::handle:vertical:hover { background: #94a3b8; }
 QLineEdit { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #6366f1; }
 QComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; min-width: 55px; }
+#searchComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; }
+#searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #0f172a; font-size: 12px; }
 QComboBox QAbstractItemView { background: #ffffff; border: 1px solid #cbd5e1; selection-background-color: #e0e7ff; color: #0f172a; }
 QProgressBar { background: #e2e8f0; border: none; border-radius: 8px; text-align: center; color: #4338ca; font-size: 11px; font-weight: 600; height: 18px; }
 QProgressBar::chunk { background: #6366f1; border-radius: 7px; }
@@ -1167,6 +1237,9 @@ QScrollArea { background: transparent; border: none; }
 #btnCloseSettings, #btnClosePreview { background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; border-radius: 6px; padding: 0px; font-weight: bold; font-size: 12px; }
 #btnCloseSettings:hover, #btnClosePreview:hover { background: #fca5a5; color: #b91c1c; }
 #btnCloseSettings:pressed, #btnClosePreview:pressed { background: #ef4444; }
+#btnAdvancedFilter { background: #f1f5f9; color: #64748b; border: 1px solid #cbd5e1; padding: 6px 12px; font-size: 11px; }
+#btnAdvancedFilter:hover { background: #e2e8f0; border: 1px solid #94a3b8; color: #334155; }
+#btnAdvancedFilter:checked { background: #e0e7ff; border: 1px solid #6366f1; color: #4338ca; }
 #btnAddSmartFolder { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; border-radius: 4px; padding: 0px; font-size: 14px; font-weight: bold; }
 #btnAddSmartFolder:hover { background: #c7d2fe; color: #3730a3; }
 #btnAddSmartFolder:pressed { background: #4338ca; }
@@ -1632,8 +1705,10 @@ class ScannerThread(QThread):
             for idx, future in enumerate(as_completed(futures)):
                 if self.isInterruptionRequested():
                     executor.shutdown(wait=False, cancel_futures=True)
+                    if new_entries:
+                        update_metadata_cache(new_entries)
                     # Emit count of files actually processed (idx + 1), not 0-based idx
-                    self.scan_complete.emit(idx)
+                    self.scan_complete.emit(idx + 1)
                     return
                 try:
                     info, entry_data = future.result()
@@ -2054,6 +2129,654 @@ class SmartRelocateDialog(QDialog):
     def get_config(self) -> tuple[list, str]:
         return self._get_target_infos(), self.template_input.text()
 
+class BatchTagDialog(QDialog):
+    def __init__(self, selected_infos: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Batch Tag Editor")
+        self.setMinimumWidth(500)
+        self.selected_infos = selected_infos
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        form_layout = QFormLayout()
+        
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Add Tags", "Remove Tags", "Replace All Tags"])
+        self.mode_combo.currentIndexChanged.connect(self._update_preview)
+        form_layout.addRow("Action:", self.mode_combo)
+
+        self.tag_input = QLineEdit()
+        self.tag_input.setPlaceholderText("Enter tags separated by commas...")
+        self.tag_input.textChanged.connect(self._update_preview)
+        form_layout.addRow("Tags:", self.tag_input)
+        
+        layout.addLayout(form_layout)
+
+        layout.addWidget(QLabel("Preview:"))
+        self.preview_list = QListWidget()
+        layout.addWidget(self.preview_list)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.btn_ok = QPushButton("Apply")
+        self.btn_ok.clicked.connect(self.accept)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_ok)
+        layout.addLayout(btn_layout)
+
+        self._update_preview()
+
+    def _update_preview(self):
+        self.preview_list.clear()
+        mode = self.mode_combo.currentText()
+        input_tags = [t.strip() for t in self.tag_input.text().split(',') if t.strip()]
+        
+        for info in self.selected_infos[:10]:
+            current_tags = getattr(info, 'tags', [])
+            new_tags = list(current_tags)
+            
+            if mode == "Add Tags":
+                for t in input_tags:
+                    if t not in new_tags:
+                        new_tags.append(t)
+            elif mode == "Remove Tags":
+                new_tags = [t for t in new_tags if t not in input_tags]
+            elif mode == "Replace All Tags":
+                new_tags = input_tags
+                
+            curr_str = ", ".join(current_tags) if current_tags else "(none)"
+            new_str = ", ".join(new_tags) if new_tags else "(none)"
+            self.preview_list.addItem(f"{info.filename}: [{curr_str}] → [{new_str}]")
+            
+        if len(self.selected_infos) > 10:
+            self.preview_list.addItem(f"... and {len(self.selected_infos) - 10} more files.")
+
+    def get_result(self) -> tuple[str, list]:
+        mode = self.mode_combo.currentText()
+        input_tags = [t.strip() for t in self.tag_input.text().split(',') if t.strip()]
+        return mode, input_tags
+
+
+class TrimRangeSlider(QWidget):
+    in_changed = pyqtSignal(int)
+    out_changed = pyqtSignal(int)
+    position_changed = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(44)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min = 0
+        self._max = 1000
+        self._in_pos = 0
+        self._out_pos = 1000
+        self._cur_pos = 0
+        self._dragging_handle = None
+        self.setMouseTracking(True)
+
+    def set_range(self, min_val: int, max_val: int):
+        self._min = min_val
+        self._max = max(max_val, min_val + 1)
+        self._in_pos = max(self._min, min(self._in_pos, self._max))
+        self._out_pos = max(self._in_pos, min(self._out_pos, self._max))
+        self._cur_pos = max(self._min, min(self._cur_pos, self._max))
+        self.update()
+
+    def set_in_pos(self, val: int):
+        self._in_pos = max(self._min, min(val, self._out_pos))
+        self.update()
+
+    def set_out_pos(self, val: int):
+        self._out_pos = max(self._in_pos, min(val, self._max))
+        self.update()
+
+    def set_cur_pos(self, val: int):
+        self._cur_pos = max(self._min, min(val, self._max))
+        self.update()
+
+    def _val_to_x(self, val: int) -> int:
+        track_w = self.width() - 32
+        if self._max <= self._min: return 16
+        ratio = (val - self._min) / (self._max - self._min)
+        return int(16 + ratio * track_w)
+
+    def _x_to_val(self, x: int) -> int:
+        track_w = self.width() - 32
+        if track_w <= 0: return self._min
+        ratio = max(0.0, min(1.0, (x - 16) / track_w))
+        return int(self._min + ratio * (self._max - self._min))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        h = self.height()
+        track_y = h // 2 - 4
+        track_h = 8
+
+        # Background track
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#1e1b4b"))
+        painter.drawRoundedRect(16, track_y, w - 32, track_h, 4, 4)
+
+        # Highlighted selected range
+        in_x = self._val_to_x(self._in_pos)
+        out_x = self._val_to_x(self._out_pos)
+        if out_x > in_x:
+            grad = QLinearGradient(in_x, 0, out_x, 0)
+            grad.setColorAt(0, QColor("#6366f1"))
+            grad.setColorAt(1, QColor("#a855f7"))
+            painter.setBrush(grad)
+            painter.drawRoundedRect(in_x, track_y, out_x - in_x, track_h, 4, 4)
+
+        # Current playback position marker
+        cur_x = self._val_to_x(self._cur_pos)
+        painter.setPen(QPen(QColor("#fbbf24"), 2))
+        painter.drawLine(cur_x, 4, cur_x, h - 4)
+
+        # IN handle (Left flag/knob)
+        painter.setPen(QPen(QColor("#ffffff"), 1.5))
+        painter.setBrush(QColor("#38bdf8"))
+        in_poly = QPolygon([
+            QPoint(in_x - 10, h // 2 - 12),
+            QPoint(in_x, h // 2 - 12),
+            QPoint(in_x, h // 2 + 12),
+            QPoint(in_x - 10, h // 2 + 12),
+            QPoint(in_x - 5, h // 2)
+        ])
+        painter.drawPolygon(in_poly)
+
+        # OUT handle (Right flag/knob)
+        painter.setPen(QPen(QColor("#ffffff"), 1.5))
+        painter.setBrush(QColor("#ec4899"))
+        out_poly = QPolygon([
+            QPoint(out_x, h // 2 - 12),
+            QPoint(out_x + 10, h // 2 - 12),
+            QPoint(out_x + 5, h // 2),
+            QPoint(out_x + 10, h // 2 + 12),
+            QPoint(out_x, h // 2 + 12)
+        ])
+        painter.drawPolygon(out_poly)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            x = event.pos().x()
+            in_x = self._val_to_x(self._in_pos)
+            out_x = self._val_to_x(self._out_pos)
+            if abs(x - in_x) <= 12:
+                self._dragging_handle = 'in'
+            elif abs(x - out_x) <= 12:
+                self._dragging_handle = 'out'
+            else:
+                self._dragging_handle = 'cur'
+                val = self._x_to_val(x)
+                self._cur_pos = val
+                self.position_changed.emit(val)
+                self.update()
+
+    def mouseMoveEvent(self, event):
+        x = event.pos().x()
+        if self._dragging_handle:
+            val = self._x_to_val(x)
+            if self._dragging_handle == 'in':
+                self._in_pos = max(self._min, min(val, self._out_pos))
+                self.in_changed.emit(self._in_pos)
+            elif self._dragging_handle == 'out':
+                self._out_pos = max(self._in_pos, min(val, self._max))
+                self.out_changed.emit(self._out_pos)
+            elif self._dragging_handle == 'cur':
+                self._cur_pos = val
+                self.position_changed.emit(val)
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_handle = None
+
+
+class TrimExportWorker(QThread):
+    # NOTE: renamed from 'finished' — that name shadows QThread.finished with
+    # an incompatible signature (fragile/undefined behavior in PyQt).
+    trim_finished = pyqtSignal(bool, str, str)  # success, output_path, error_msg
+
+    def __init__(self, filepath: str, in_sec: float, out_sec: float, output_path: str, custom_ffmpeg: str = None, parent=None):
+        super().__init__(parent)
+        self.filepath = filepath
+        self.in_sec = in_sec
+        self.out_sec = out_sec
+        self.output_path = output_path
+        self.custom_ffmpeg = custom_ffmpeg
+
+    def run(self):
+        ffmpeg_cmd = get_ffmpeg_command(self.custom_ffmpeg)
+        if not ffmpeg_cmd:
+            self.trim_finished.emit(False, "", "FFmpeg executable not found. Please ensure FFmpeg is installed.")
+            return
+
+        cmd = [
+            ffmpeg_cmd,
+            "-y",
+            "-ss", f"{self.in_sec:.3f}",
+            "-to", f"{self.out_sec:.3f}",
+            "-i", os.path.abspath(self.filepath),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            os.path.abspath(self.output_path)
+        ]
+
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', startupinfo=startupinfo, timeout=120)
+            if proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
+                self.trim_finished.emit(True, self.output_path, "")
+            else:
+                err = proc.stderr or "FFmpeg failed with unknown error."
+                self.trim_finished.emit(False, "", err)
+        except Exception as e:
+            self.trim_finished.emit(False, "", str(e))
+
+
+class QuickTrimDialog(QDialog):
+    def __init__(self, filepath: str, parent_tab=None, parent=None):
+        super().__init__(parent)
+        self.filepath = filepath
+        self.parent_tab = parent_tab
+        self.duration_ms = 0
+        self.in_ms = 0
+        self.out_ms = 0
+        self._playing_selection = False
+        
+        self.setWindowTitle(f"✂️ Quick Trim — {os.path.basename(filepath)}")
+        self.resize(780, 580)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        # Video preview widget
+        self.video_widget = DoubleClickVideoWidget(self)
+        self.video_widget.setMinimumHeight(240)
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_widget.setStyleSheet("background: #000000; border-radius: 8px;")
+        layout.addWidget(self.video_widget, 1)
+
+        # Media player backend
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setVideoOutput(self.video_widget)
+        self.audio_output.setVolume(0.7)
+
+        # Playback control bar
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(8)
+        
+        self.btn_play = QPushButton("▶")
+        self.btn_play.setFixedSize(32, 32)
+        self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play.clicked.connect(self._toggle_playback)
+        controls_layout.addWidget(self.btn_play)
+
+        self.time_label = QLabel("00:00.000 / 00:00.000")
+        self.time_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #a78bfa;")
+        controls_layout.addWidget(self.time_label)
+
+        controls_layout.addStretch()
+
+        self.btn_play_selection = QPushButton("▶️ Play Selection")
+        self.btn_play_selection.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play_selection.clicked.connect(self._play_selection)
+        controls_layout.addWidget(self.btn_play_selection)
+
+        self.btn_mute = QPushButton("🔊")
+        self.btn_mute.setFixedSize(32, 32)
+        self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        controls_layout.addWidget(self.btn_mute)
+
+        layout.addLayout(controls_layout)
+
+        # Dual-handle range slider
+        self.range_slider = TrimRangeSlider(self)
+        self.range_slider.in_changed.connect(self._on_slider_in_changed)
+        self.range_slider.out_changed.connect(self._on_slider_out_changed)
+        self.range_slider.position_changed.connect(self._on_slider_pos_changed)
+        layout.addWidget(self.range_slider)
+
+        # IN / OUT point controls
+        points_group = QGroupBox("Trim Points")
+        points_layout = QGridLayout(points_group)
+        points_layout.setContentsMargins(12, 12, 12, 12)
+        points_layout.setSpacing(8)
+
+        # Start (IN) row
+        lbl_in = QLabel("Start (IN):")
+        lbl_in.setStyleSheet("color: #38bdf8; font-weight: bold;")
+        points_layout.addWidget(lbl_in, 0, 0)
+        
+        self.in_edit = QLineEdit("00:00:00.000")
+        self.in_edit.setFixedWidth(110)
+        self.in_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.in_edit.editingFinished.connect(self._on_in_text_edited)
+        points_layout.addWidget(self.in_edit, 0, 1)
+
+        btn_in_minus1 = QPushButton("-1s")
+        btn_in_minus1.clicked.connect(lambda: self._nudge_in(-1000))
+        btn_in_plus1 = QPushButton("+1s")
+        btn_in_plus1.clicked.connect(lambda: self._nudge_in(1000))
+        btn_in_minus5 = QPushButton("-5s")
+        btn_in_minus5.clicked.connect(lambda: self._nudge_in(-5000))
+        btn_in_plus5 = QPushButton("+5s")
+        btn_in_plus5.clicked.connect(lambda: self._nudge_in(5000))
+        btn_set_in_cur = QPushButton("📌 Set to Current")
+        btn_set_in_cur.clicked.connect(self._set_in_to_current)
+
+        points_layout.addWidget(btn_in_minus5, 0, 2)
+        points_layout.addWidget(btn_in_minus1, 0, 3)
+        points_layout.addWidget(btn_in_plus1, 0, 4)
+        points_layout.addWidget(btn_in_plus5, 0, 5)
+        points_layout.addWidget(btn_set_in_cur, 0, 6)
+
+        # End (OUT) row
+        lbl_out = QLabel("End (OUT):")
+        lbl_out.setStyleSheet("color: #ec4899; font-weight: bold;")
+        points_layout.addWidget(lbl_out, 1, 0)
+        
+        self.out_edit = QLineEdit("00:00:00.000")
+        self.out_edit.setFixedWidth(110)
+        self.out_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.out_edit.editingFinished.connect(self._on_out_text_edited)
+        points_layout.addWidget(self.out_edit, 1, 1)
+
+        btn_out_minus1 = QPushButton("-1s")
+        btn_out_minus1.clicked.connect(lambda: self._nudge_out(-1000))
+        btn_out_plus1 = QPushButton("+1s")
+        btn_out_plus1.clicked.connect(lambda: self._nudge_out(1000))
+        btn_out_minus5 = QPushButton("-5s")
+        btn_out_minus5.clicked.connect(lambda: self._nudge_out(-5000))
+        btn_out_plus5 = QPushButton("+5s")
+        btn_out_plus5.clicked.connect(lambda: self._nudge_out(5000))
+        btn_set_out_cur = QPushButton("📌 Set to Current")
+        btn_set_out_cur.clicked.connect(self._set_out_to_current)
+
+        points_layout.addWidget(btn_out_minus5, 1, 2)
+        points_layout.addWidget(btn_out_minus1, 1, 3)
+        points_layout.addWidget(btn_out_plus1, 1, 4)
+        points_layout.addWidget(btn_out_plus5, 1, 5)
+        points_layout.addWidget(btn_set_out_cur, 1, 6)
+
+        # Trimmed duration label
+        self.trim_dur_label = QLabel("⏱ Clip Duration: 00:00.000")
+        self.trim_dur_label.setStyleSheet("font-weight: bold; color: #a78bfa; font-size: 12px;")
+        points_layout.addWidget(self.trim_dur_label, 2, 0, 1, 7)
+
+        layout.addWidget(points_group)
+
+        # Output destination
+        out_layout = QHBoxLayout()
+        out_layout.addWidget(QLabel("Output File:"))
+        
+        base, ext = os.path.splitext(self.filepath)
+        default_out = f"{base}_trimmed{ext}"
+        self.output_edit = QLineEdit(default_out)
+        out_layout.addWidget(self.output_edit, 1)
+        
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_output)
+        out_layout.addWidget(btn_browse)
+        layout.addLayout(out_layout)
+
+        # Action buttons
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_box.addWidget(self.btn_cancel)
+
+        self.btn_export = QPushButton("✂️ Export Trimmed Clip")
+        self.btn_export.setObjectName("btnProcessAll")
+        self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_export.clicked.connect(self._start_export)
+        btn_box.addWidget(self.btn_export)
+        layout.addLayout(btn_box)
+
+        # Connect media player events
+        self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.positionChanged.connect(self._on_position_changed)
+        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
+
+        # Load video
+        self.player.setSource(QUrl.fromLocalFile(self.filepath))
+        self.player.pause()
+
+    def _ms_to_str(self, ms: int) -> str:
+        ms = max(0, ms)
+        total_sec = ms // 1000
+        rem_ms = ms % 1000
+        hrs = total_sec // 3600
+        mins = (total_sec % 3600) // 60
+        secs = total_sec % 60
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}.{rem_ms:03d}"
+
+    def _str_to_ms(self, s: str) -> int | None:
+        try:
+            s = s.strip()
+            parts = s.split(':')
+            if len(parts) == 3:
+                hrs = int(parts[0])
+                mins = int(parts[1])
+                secs_parts = parts[2].split('.')
+                secs = int(secs_parts[0])
+                ms = int(secs_parts[1].ljust(3, '0')[:3]) if len(secs_parts) > 1 else 0
+                return (hrs * 3600 + mins * 60 + secs) * 1000 + ms
+            elif len(parts) == 2:
+                mins = int(parts[0])
+                secs_parts = parts[1].split('.')
+                secs = int(secs_parts[0])
+                ms = int(secs_parts[1].ljust(3, '0')[:3]) if len(secs_parts) > 1 else 0
+                return (mins * 60 + secs) * 1000 + ms
+        except Exception:
+            pass
+        return None
+
+    def _on_duration_changed(self, dur: int):
+        if dur > 0:
+            self.duration_ms = dur
+            self.out_ms = dur
+            self.range_slider.set_range(0, dur)
+            self.range_slider.set_out_pos(dur)
+            self.out_edit.setText(self._ms_to_str(dur))
+            self._update_time_display(self.player.position())
+            self._update_clip_duration_label()
+
+    def _on_position_changed(self, pos: int):
+        self.range_slider.set_cur_pos(pos)
+        self._update_time_display(pos)
+        if self._playing_selection and pos >= self.out_ms:
+            self.player.pause()
+            self._playing_selection = False
+
+    def _update_time_display(self, pos: int):
+        self.time_label.setText(f"{self._ms_to_str(pos)} / {self._ms_to_str(self.duration_ms)}")
+
+    def _update_clip_duration_label(self):
+        clip_ms = max(0, self.out_ms - self.in_ms)
+        self.trim_dur_label.setText(f"⏱ Clip Duration: {self._ms_to_str(clip_ms)}")
+
+    def _toggle_playback(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self._playing_selection = False
+        else:
+            self.player.play()
+
+    def _on_playback_state_changed(self, state):
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.btn_play.setText("⏸")
+        else:
+            self.btn_play.setText("▶")
+
+    def _play_selection(self):
+        self._playing_selection = True
+        self.player.setPosition(self.in_ms)
+        self.player.play()
+
+    def _toggle_mute(self):
+        is_muted = self.audio_output.isMuted()
+        self.audio_output.setMuted(not is_muted)
+        self.btn_mute.setText("🔇" if not is_muted else "🔊")
+
+    def _on_slider_in_changed(self, val: int):
+        self.in_ms = val
+        self.in_edit.setText(self._ms_to_str(val))
+        self.player.setPosition(val)
+        self._update_clip_duration_label()
+
+    def _on_slider_out_changed(self, val: int):
+        self.out_ms = val
+        self.out_edit.setText(self._ms_to_str(val))
+        self.player.setPosition(val)
+        self._update_clip_duration_label()
+
+    def _on_slider_pos_changed(self, val: int):
+        self.player.setPosition(val)
+
+    def _on_in_text_edited(self):
+        val = self._str_to_ms(self.in_edit.text())
+        if val is not None:
+            val = max(0, min(val, self.out_ms))
+            self.in_ms = val
+            self.range_slider.set_in_pos(val)
+            self.in_edit.setText(self._ms_to_str(val))
+            self._update_clip_duration_label()
+        else:
+            self.in_edit.setText(self._ms_to_str(self.in_ms))
+
+    def _on_out_text_edited(self):
+        val = self._str_to_ms(self.out_edit.text())
+        if val is not None:
+            val = max(self.in_ms, min(val, self.duration_ms))
+            self.out_ms = val
+            self.range_slider.set_out_pos(val)
+            self.out_edit.setText(self._ms_to_str(val))
+            self._update_clip_duration_label()
+        else:
+            self.out_edit.setText(self._ms_to_str(self.out_ms))
+
+    def _nudge_in(self, delta_ms: int):
+        val = max(0, min(self.in_ms + delta_ms, self.out_ms))
+        self.in_ms = val
+        self.range_slider.set_in_pos(val)
+        self.in_edit.setText(self._ms_to_str(val))
+        self.player.setPosition(val)
+        self._update_clip_duration_label()
+
+    def _nudge_out(self, delta_ms: int):
+        val = max(self.in_ms, min(self.out_ms + delta_ms, self.duration_ms))
+        self.out_ms = val
+        self.range_slider.set_out_pos(val)
+        self.out_edit.setText(self._ms_to_str(val))
+        self.player.setPosition(val)
+        self._update_clip_duration_label()
+
+    def _set_in_to_current(self):
+        self._nudge_in(self.player.position() - self.in_ms)
+
+    def _set_out_to_current(self):
+        self._nudge_out(self.player.position() - self.out_ms)
+
+    def _browse_output(self):
+        current_path = self.output_edit.text().strip() or self.filepath
+        new_path, _ = QFileDialog.getSaveFileName(self, "Select Output File", current_path, "Video Files (*.mp4 *.mkv *.avi *.mov *.webm);;All Files (*.*)")
+        if new_path:
+            self.output_edit.setText(new_path)
+
+    def _start_export(self):
+        output_path = self.output_edit.text().strip()
+        if not output_path:
+            QMessageBox.warning(self, "Invalid Output", "Please specify an output file path.")
+            return
+
+        if os.path.abspath(output_path) == os.path.abspath(self.filepath):
+            QMessageBox.warning(self, "Invalid Output", "Output file cannot be the same as the original input file.")
+            return
+
+        in_sec = self.in_ms / 1000.0
+        out_sec = self.out_ms / 1000.0
+        if out_sec <= in_sec:
+            QMessageBox.warning(self, "Invalid Range", "End point (OUT) must be greater than Start point (IN).")
+            return
+
+        self.btn_export.setEnabled(False)
+        self.btn_export.setText("⏳ Trimming clip...")
+
+        self.worker = TrimExportWorker(self.filepath, in_sec, out_sec, output_path, parent=self)
+        self.worker.trim_finished.connect(self._on_export_finished)
+        self.worker.start()
+
+    def _on_export_finished(self, success: bool, output_path: str, err: str):
+        if getattr(self, '_suppress_export_result', False):
+            self._suppress_export_result = False
+            return
+        self.btn_export.setEnabled(True)
+        self.btn_export.setText("✂️ Export Trimmed Clip")
+        
+        if success:
+            if self.parent_tab and hasattr(self.parent_tab, '_show_toast'):
+                self.parent_tab._show_toast(f"Trimmed clip saved: {os.path.basename(output_path)}", 'success')
+            
+            # Check if output is in one of the loaded directories, auto-add if so
+            if self.parent_tab and hasattr(self.parent_tab, 'directories'):
+                out_dir = os.path.normcase(os.path.dirname(os.path.abspath(output_path)))
+                for d in self.parent_tab.directories:
+                    d_norm = os.path.normcase(os.path.abspath(d))
+                    try:
+                        is_inside = os.path.commonpath([d_norm, out_dir]) == d_norm
+                    except ValueError:
+                        # Different drives (e.g. C:\ vs F:\) — commonpath raises
+                        continue
+                    if is_inside:
+                        new_info = MediaInfo(output_path, 'video')
+                        if new_info.is_valid:
+                            self.parent_tab._on_file_found(new_info)
+                        break
+
+            self._release_player()
+            self.accept()
+        else:
+            QMessageBox.critical(self, "Export Failed", f"Failed to trim video:\n\n{err}")
+
+    def _release_player(self):
+        """Release media sources so the file handle isn't locked after close.
+
+        done() (accept/reject) does NOT trigger closeEvent on QDialog, so both
+        paths must clean up — otherwise QMediaPlayer keeps the source open.
+        """
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.player.setVideoOutput(None)
+
+    def done(self, result):
+        # accept()/reject() funnel through here; release before hiding
+        self._release_player()
+        # If the export worker is still running when the dialog closes, drop its
+        # late result instead of popping dialogs/toasts on a hidden window.
+        worker = getattr(self, 'worker', None)
+        if worker is not None and worker.isRunning():
+            self._suppress_export_result = True
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._release_player()
+        super().closeEvent(event)
+
+
 class CreateSmartFolderDialog(QDialog):
     def __init__(self, media_type: str = "all", query: str = "", parent=None):
         super().__init__(parent)
@@ -2384,8 +3107,6 @@ class HoverPreviewOverlay(QWidget):
         
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         
-        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
-        
         self._duration = 0.0
         self.has_started = False
         self.info = None
@@ -2527,6 +3248,86 @@ class HoverPreviewOverlay(QWidget):
             return
         self.player.setPosition(self._get_random_position())
         self.player.play()
+
+class ToastNotification(QWidget):
+    def __init__(self, message: str, toast_type: str = 'info', parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        
+        self.toast_type = toast_type
+        self.message = message
+        self.parent_window = parent
+
+        is_dark = getattr(parent, 'current_theme', 'dark') == 'dark'
+        if toast_type == 'success':
+            icon = "✅"
+            bg_color = "#34d399" if is_dark else "#059669"
+        elif toast_type == 'warning':
+            icon = "⚠️"
+            bg_color = "#fbbf24" if is_dark else "#d97706"
+        elif toast_type == 'error':
+            icon = "❌"
+            bg_color = "#f87171" if is_dark else "#dc2626"
+        else: # info
+            icon = "ℹ️"
+            bg_color = "#60a5fa" if is_dark else "#3b82f6"
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(15, 10, 15, 10)
+        layout.setSpacing(10)
+
+        icon_label = QLabel(icon)
+        icon_label.setStyleSheet("font-size: 16px; background: transparent;")
+        
+        msg_label = QLabel(message)
+        msg_label.setWordWrap(True)
+        msg_label.setStyleSheet("color: white; font-weight: bold; background: transparent;")
+
+        layout.addWidget(icon_label)
+        layout.addWidget(msg_label, 1)
+
+        self.setFixedWidth(320)
+        self.setStyleSheet(f"""
+            ToastNotification {{
+                background-color: {bg_color};
+                border-radius: 10px;
+                border: 1px solid rgba(255, 255, 255, 0.2);
+            }}
+        """)
+        
+        self.pos_anim = QPropertyAnimation(self, b"pos")
+        self.pos_anim.setDuration(300)
+        self.pos_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self.opacity_anim = QPropertyAnimation(self, b"windowOpacity")
+        self.opacity_anim.setDuration(300)
+        
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.hide_toast)
+
+    def show_toast(self, target_pos):
+        self.setWindowOpacity(0.0)
+        self.move(target_pos.x(), target_pos.y() + 20)
+        self.show()
+
+        self.pos_anim.setStartValue(self.pos())
+        self.pos_anim.setEndValue(target_pos)
+        self.opacity_anim.setStartValue(0.0)
+        self.opacity_anim.setEndValue(0.9)
+        
+        self.pos_anim.start()
+        self.opacity_anim.start()
+        
+        self.timer.start(3000)
+
+    def hide_toast(self):
+        self.opacity_anim.setStartValue(self.windowOpacity())
+        self.opacity_anim.setEndValue(0.0)
+        self.opacity_anim.finished.connect(self.close)
+        self.opacity_anim.start()
 
 class DoubleClickVideoWidget(QVideoWidget):
     double_clicked = pyqtSignal()
@@ -3269,6 +4070,405 @@ class SplitVideoPlayerWindow(QMainWindow):
         super().closeEvent(event)
 
 
+class _ComparisonPane(QWidget):
+    delete_requested = pyqtSignal(object)  # emits MediaInfo
+
+    def __init__(self, info: MediaInfo, title_text: str, is_left: bool, parent_window=None):
+        super().__init__(parent_window)
+        self.info = info
+        self.title_text = title_text
+        self.is_left = is_left
+        self.parent_window = parent_window
+
+        self.player = None
+        self.audio_output = None
+        self.video_widget = None
+        self.seek_slider = None
+        self.time_label = None
+        self.btn_play = None
+        self.btn_mute = None
+        self.volume_slider = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # Header bar
+        header = QHBoxLayout()
+        title_lbl = QLabel(title_text)
+        title_lbl.setStyleSheet("font-weight: 800; font-size: 13px; color: #a78bfa; text-transform: uppercase; letter-spacing: 1px;")
+        header.addWidget(title_lbl)
+        header.addStretch()
+
+        btn_delete = QPushButton("🗑 Delete File")
+        btn_delete.setObjectName("btnDelete")
+        btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_delete.clicked.connect(lambda: self.delete_requested.emit(self.info))
+        header.addWidget(btn_delete)
+        layout.addLayout(header)
+
+        # Media area
+        if info.media_type == 'video':
+            self.video_widget = DoubleClickVideoWidget(self)
+            self.video_widget.setMinimumHeight(240)
+            self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.video_widget.setStyleSheet("background: #000000; border-radius: 8px;")
+            layout.addWidget(self.video_widget, 1)
+
+            self.player = QMediaPlayer(self)
+            self.audio_output = QAudioOutput(self)
+            self.player.setAudioOutput(self.audio_output)
+            self.player.setVideoOutput(self.video_widget)
+            self.audio_output.setVolume(0.7)
+
+            # Controls
+            ctrls = QVBoxLayout()
+            ctrls.setSpacing(4)
+            
+            slider_row = QHBoxLayout()
+            self.seek_slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self)
+            self.seek_slider.setRange(0, 1000)
+            self.seek_slider.sliderMoved.connect(self._on_seek)
+            slider_row.addWidget(self.seek_slider, 1)
+
+            self.time_label = QLabel("00:00 / 00:00")
+            self.time_label.setStyleSheet("font-family: monospace; font-size: 10px; color: #a78bfa;")
+            slider_row.addWidget(self.time_label)
+            ctrls.addLayout(slider_row)
+
+            btns_row = QHBoxLayout()
+            self.btn_play = QPushButton("▶")
+            self.btn_play.setFixedSize(28, 28)
+            self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_play.clicked.connect(self._toggle_playback)
+            btns_row.addWidget(self.btn_play)
+
+            self.btn_mute = QPushButton("🔊")
+            self.btn_mute.setFixedSize(28, 28)
+            self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_mute.clicked.connect(self._toggle_mute)
+            btns_row.addWidget(self.btn_mute)
+
+            self.volume_slider = QSlider(Qt.Orientation.Horizontal, self)
+            self.volume_slider.setRange(0, 100)
+            self.volume_slider.setValue(70)
+            self.volume_slider.setFixedWidth(70)
+            self.volume_slider.valueChanged.connect(self._on_volume_changed)
+            btns_row.addWidget(self.volume_slider)
+            btns_row.addStretch()
+            ctrls.addLayout(btns_row)
+
+            layout.addLayout(ctrls)
+
+            self.player.positionChanged.connect(self._on_position_changed)
+            self.player.durationChanged.connect(self._on_duration_changed)
+            self.player.playbackStateChanged.connect(self._on_playback_state_changed)
+
+            self.player.setSource(QUrl.fromLocalFile(info.filepath))
+            self.player.pause()
+
+        elif info.media_type == 'image':
+            img_label = QLabel(self)
+            img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img_label.setMinimumHeight(240)
+            img_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            pix = QPixmap(info.filepath)
+            if not pix.isNull():
+                img_label.setPixmap(pix.scaled(540, 360, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                img_label.setText("Failed to load image")
+            img_label.setStyleSheet("background: #09071c; border-radius: 8px; border: 1px solid rgba(167, 139, 250, 0.15);")
+            layout.addWidget(img_label, 1)
+
+        else:
+            other_box = QFrame(self)
+            other_box.setMinimumHeight(200)
+            other_box.setStyleSheet("background: #09071c; border-radius: 8px;")
+            o_layout = QVBoxLayout(other_box)
+            icon_lbl = QLabel("🎵" if info.media_type == 'audio' else "📄")
+            icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_lbl.setStyleSheet("font-size: 48px;")
+            o_layout.addWidget(icon_lbl)
+            name_lbl = QLabel(info.filename)
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_lbl.setWordWrap(True)
+            o_layout.addWidget(name_lbl)
+            layout.addWidget(other_box, 1)
+
+            if info.media_type == 'audio':
+                self.player = QMediaPlayer(self)
+                self.audio_output = QAudioOutput(self)
+                self.player.setAudioOutput(self.audio_output)
+                self.player.setSource(QUrl.fromLocalFile(info.filepath))
+
+        # Metadata Card
+        meta_group = QGroupBox("Properties")
+        meta_group.setStyleSheet("QGroupBox { font-size: 11px; font-weight: bold; margin-top: 8px; } QGroupBox::title { color: #c4b5fd; }")
+        self.meta_form = QFormLayout(meta_group)
+        self.meta_form.setContentsMargins(10, 12, 10, 10)
+        self.meta_form.setSpacing(6)
+
+        self.lbl_filename = QLabel(info.filename)
+        self.lbl_filename.setWordWrap(True)
+        self.lbl_folder = QLabel(os.path.dirname(info.filepath))
+        self.lbl_folder.setWordWrap(True)
+        self.lbl_folder.setStyleSheet("color: #9ca3af; font-size: 10px;")
+
+        res_str = f"{info.width} × {info.height}" if info.width and info.height else (getattr(info, 'resolution', '') or "—")
+        self.lbl_res = QLabel(res_str)
+        
+        self.lbl_size = QLabel(format_size(getattr(info, 'size_bytes', 0)))
+        dur_str = format_duration(info.duration_seconds) if getattr(info, 'duration_seconds', 0) > 0 else "—"
+        self.lbl_dur = QLabel(dur_str)
+
+        # NOTE: MediaInfo carries no codec/bitrate fields (deep metadata needs a
+        # separate ffprobe call), so show file type instead of dead "—" fields.
+        _, parsed_rating = parse_naming_format(info.filename)
+        self.lbl_rating = QLabel(parsed_rating if parsed_rating else "Unrated")
+        tags_list = getattr(info, 'tags', [])
+        self.lbl_tags = QLabel(", ".join(tags_list) if tags_list else "—")
+
+        self.meta_form.addRow("Filename:", self.lbl_filename)
+        self.meta_form.addRow("Folder:", self.lbl_folder)
+        self.meta_form.addRow("Resolution:", self.lbl_res)
+        self.meta_form.addRow("File Size:", self.lbl_size)
+        self.meta_form.addRow("Duration:", self.lbl_dur)
+        self.meta_form.addRow("Rating:", self.lbl_rating)
+        self.meta_form.addRow("Tags:", self.lbl_tags)
+
+        layout.addWidget(meta_group)
+
+    def highlight_diffs(self, other_info: MediaInfo):
+        diff_style = "color: #fbbf24; font-weight: bold; background: rgba(245, 158, 11, 0.15); border-radius: 4px; padding: 1px 4px;"
+        same_style = "color: #e0e0e0; font-weight: normal; background: transparent; padding: 1px 4px;"
+
+        # Resolution
+        my_res = (self.info.width, self.info.height)
+        other_res = (other_info.width, other_info.height)
+        self.lbl_res.setStyleSheet(diff_style if my_res != other_res and (my_res[0] or other_res[0]) else same_style)
+
+        # Size
+        self.lbl_size.setStyleSheet(diff_style if self.info.size_bytes != other_info.size_bytes else same_style)
+
+        # Duration
+        dur1 = round(getattr(self.info, 'duration_seconds', 0), 1)
+        dur2 = round(getattr(other_info, 'duration_seconds', 0), 1)
+        self.lbl_dur.setStyleSheet(diff_style if dur1 != dur2 and (dur1 > 0 or dur2 > 0) else same_style)
+
+        # Rating (parsed from filename convention)
+        _, r1 = parse_naming_format(self.info.filename)
+        _, r2 = parse_naming_format(other_info.filename)
+        r1 = r1 if r1 else 'Unrated'
+        r2 = r2 if r2 else 'Unrated'
+        self.lbl_rating.setStyleSheet(diff_style if r1 != r2 else same_style)
+
+        # Tags
+        t1 = set(getattr(self.info, 'tags', []))
+        t2 = set(getattr(other_info, 'tags', []))
+        self.lbl_tags.setStyleSheet(diff_style if t1 != t2 else same_style)
+
+    def _toggle_playback(self):
+        if not self.player: return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            if self.parent_window and self.parent_window.is_synced():
+                self.parent_window.sync_pause(self)
+        else:
+            self.player.play()
+            if self.parent_window and self.parent_window.is_synced():
+                self.parent_window.sync_play(self)
+
+    def _toggle_mute(self):
+        if not self.audio_output: return
+        is_muted = self.audio_output.isMuted()
+        self.audio_output.setMuted(not is_muted)
+        self.btn_mute.setText("🔇" if not is_muted else "🔊")
+
+    def _on_volume_changed(self, val):
+        if self.audio_output:
+            self.audio_output.setVolume(val / 100.0)
+
+    def _on_seek(self, slider_pos):
+        if not self.player: return
+        dur = self.player.duration()
+        if dur > 0:
+            pos = int((slider_pos / 1000.0) * dur)
+            self.player.setPosition(pos)
+            if self.parent_window and self.parent_window.is_synced():
+                self.parent_window.sync_seek(self, slider_pos)
+
+    def _on_position_changed(self, pos):
+        dur = self.player.duration() if self.player else 0
+        if dur > 0 and self.seek_slider and not self.seek_slider.isSliderDown():
+            self.seek_slider.setValue(int((pos / dur) * 1000))
+        if self.time_label:
+            self.time_label.setText(f"{self._format_ms(pos)} / {self._format_ms(dur)}")
+
+    def _on_duration_changed(self, dur):
+        pos = self.player.position() if self.player else 0
+        if self.time_label:
+            self.time_label.setText(f"{self._format_ms(pos)} / {self._format_ms(dur)}")
+
+    def _on_playback_state_changed(self, state):
+        if self.btn_play:
+            self.btn_play.setText("⏸" if state == QMediaPlayer.PlaybackState.PlayingState else "▶")
+
+    def _format_ms(self, ms: int) -> str:
+        s = max(0, ms // 1000)
+        return f"{s // 60:02d}:{s % 60:02d}"
+
+    def cleanup(self):
+        if self.player:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.player.setVideoOutput(None)
+
+
+class ComparisonViewWindow(QMainWindow):
+    def __init__(self, info_left: MediaInfo, info_right: MediaInfo, parent_tab=None, parent=None):
+        super().__init__(parent)
+        self.info_left = info_left
+        self.info_right = info_right
+        self.parent_tab = parent_tab
+
+        self.setWindowTitle(f"MediaFlow — Comparison: {info_left.filename} vs {info_right.filename}")
+        self.resize(1200, 750)
+        self.setMinimumSize(900, 600)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
+
+        # Top Action Bar
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(10)
+
+        self.btn_sync = QPushButton("🔗 Synced Playback")
+        self.btn_sync.setObjectName("btnWatch")
+        self.btn_sync.setCheckable(True)
+        is_both_videos = (info_left.media_type == 'video' and info_right.media_type == 'video')
+        self.btn_sync.setChecked(is_both_videos)
+        self.btn_sync.setEnabled(is_both_videos)
+        top_bar.addWidget(self.btn_sync)
+
+        self.btn_swap = QPushButton("🔄 Swap Sides")
+        self.btn_swap.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_swap.clicked.connect(self._swap_sides)
+        top_bar.addWidget(self.btn_swap)
+
+        top_bar.addStretch()
+
+        btn_keep_both = QPushButton("✓ Keep Both (Close)")
+        btn_keep_both.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_keep_both.clicked.connect(self.close)
+        top_bar.addWidget(btn_keep_both)
+
+        root_layout.addLayout(top_bar)
+
+        # Splitter with Left and Right Panes
+        self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.setChildrenCollapsible(False)
+
+        self.pane_left = _ComparisonPane(self.info_left, "Left File", is_left=True, parent_window=self)
+        self.pane_right = _ComparisonPane(self.info_right, "Right File", is_left=False, parent_window=self)
+
+        self.pane_left.delete_requested.connect(self._delete_file)
+        self.pane_right.delete_requested.connect(self._delete_file)
+
+        self.splitter.addWidget(self.pane_left)
+        self.splitter.addWidget(self.pane_right)
+        self.splitter.setSizes([600, 600])
+
+        root_layout.addWidget(self.splitter, 1)
+
+        # Highlight metadata differences
+        self.pane_left.highlight_diffs(self.info_right)
+        self.pane_right.highlight_diffs(self.info_left)
+
+    def is_synced(self) -> bool:
+        return self.btn_sync.isChecked()
+
+    def sync_play(self, source_pane: _ComparisonPane):
+        target = self.pane_right if source_pane is self.pane_left else self.pane_left
+        if target.player and target.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            target.player.play()
+
+    def sync_pause(self, source_pane: _ComparisonPane):
+        target = self.pane_right if source_pane is self.pane_left else self.pane_left
+        if target.player and target.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            target.player.pause()
+
+    def sync_seek(self, source_pane: _ComparisonPane, slider_pos: int):
+        target = self.pane_right if source_pane is self.pane_left else self.pane_left
+        if target.player:
+            dur = target.player.duration()
+            if dur > 0:
+                pos = int((slider_pos / 1000.0) * dur)
+                target.player.setPosition(pos)
+
+    def _swap_sides(self):
+        self.pane_left.cleanup()
+        self.pane_right.cleanup()
+
+        self.info_left, self.info_right = self.info_right, self.info_left
+        self.setWindowTitle(f"MediaFlow — Comparison: {self.info_left.filename} vs {self.info_right.filename}")
+
+        # Replace panes
+        self.pane_left.deleteLater()
+        self.pane_right.deleteLater()
+
+        self.pane_left = _ComparisonPane(self.info_left, "Left File", is_left=True, parent_window=self)
+        self.pane_right = _ComparisonPane(self.info_right, "Right File", is_left=False, parent_window=self)
+
+        self.pane_left.delete_requested.connect(self._delete_file)
+        self.pane_right.delete_requested.connect(self._delete_file)
+
+        self.splitter.addWidget(self.pane_left)
+        self.splitter.addWidget(self.pane_right)
+        self.splitter.setSizes([600, 600])
+
+        self.pane_left.highlight_diffs(self.info_right)
+        self.pane_right.highlight_diffs(self.info_left)
+
+    def _delete_file(self, info: MediaInfo):
+        ret = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Are you sure you want to send this file to the Recycle Bin?\n\n{info.filename}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        # Cleanup players first to release locks
+        self.pane_left.cleanup()
+        self.pane_right.cleanup()
+
+        success = send_to_recycle_bin(info.filepath)
+        if success:
+            if self.parent_tab:
+                # Find row in table and remove
+                for row in range(self.parent_tab.table.rowCount()):
+                    row_info = self.parent_tab._get_row_info(row)
+                    if row_info and row_info.filepath == info.filepath:
+                        self.parent_tab._remove_row_from_list(row)
+                        break
+                if hasattr(self.parent_tab, '_show_toast'):
+                    self.parent_tab._show_toast(f"Deleted {info.filename}", 'success')
+            self.close()
+        else:
+            QMessageBox.warning(self, "Delete Failed", f"Could not send {info.filename} to the Recycle Bin.")
+
+    def closeEvent(self, event):
+        self.pane_left.cleanup()
+        self.pane_right.cleanup()
+        super().closeEvent(event)
+
+
 # ─── Main Window Tab ─────────────────────────────────────────────────────────────
 
 from PyQt6.QtCore import QRunnable, pyqtSlot, QObject
@@ -3276,7 +4476,7 @@ from PyQt6.QtCore import QRunnable, pyqtSlot, QObject
 
 class _ThumbnailWorkerSignals(QObject):
     """Holds Qt signals for a thumbnail worker — QRunnable can't emit signals directly."""
-    finished = pyqtSignal(int, object, object, object)  # row, info, label, pixmap
+    finished = pyqtSignal(int, object, object, object)  # row, info, label, QImage
 
 
 class _ThumbnailRunnable(QRunnable):
@@ -3295,15 +4495,46 @@ class _ThumbnailRunnable(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            pixmap = generate_thumbnail(self.info.filepath, self.info.media_type)
+            image = generate_thumbnail(self.info.filepath, self.info.media_type)
         except Exception as e:
             logger.warning("Thumbnail generation failed for %s: %s", self.info.filepath, e)
-            pixmap = None
+            image = None
         # Emit signal — Qt cross-thread connection will queue it on the main thread
         try:
-            self.signals.finished.emit(self.row, self.info, self.label, pixmap)
+            self.signals.finished.emit(self.row, self.info, self.label, image)
         except RuntimeError:
             # Parent tab or label was destroyed before we finished — silently drop
+            pass
+
+
+class _MediaInfoWorkerSignals(QObject):
+    ready = pyqtSignal(object)  # MediaInfo or None
+
+
+class _MediaInfoRunnable(QRunnable):
+    """Extracts MediaInfo metadata for one file OFF the GUI thread.
+
+    Used by watch mode: constructing MediaInfo can block on cv2/ffprobe for
+    seconds, which previously froze the whole UI when new files appeared.
+    """
+    def __init__(self, filepath: str, media_type: str, parent_tab):
+        super().__init__()
+        self.filepath = filepath
+        self.media_type = media_type
+        self.parent_tab = parent_tab
+        self.signals = _MediaInfoWorkerSignals()
+        self.setAutoDelete(True)
+
+    @pyqtSlot()
+    def run(self):
+        info = None
+        try:
+            info = MediaInfo(self.filepath, self.media_type)
+        except Exception as e:
+            logger.warning("Watch metadata extraction failed for %s: %s", self.filepath, e)
+        try:
+            self.signals.ready.emit(info)
+        except RuntimeError:
             pass
 
 class MediaTab(QWidget):
@@ -3355,6 +4586,15 @@ class MediaTab(QWidget):
         self._hovered_grid_info = None
         self._dismissed_info = None
         
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(3000)
+        self._watch_timer.timeout.connect(self._check_for_changes)
+        self._watch_enabled = False
+        self._known_files = {}
+        
+        self._search_history = []
+        self._stats_dirty = True
+        
         self._build_ui()
         if self.is_smart_folder: self.btn_load.setEnabled(True)
 
@@ -3388,9 +4628,17 @@ class MediaTab(QWidget):
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_clear.setVisible(False)
         self.btn_clear.setIconSize(QSize(16, 16))
+        
+        self.btn_watch = QPushButton("👁️ Watch")
+        self.btn_watch.setObjectName("btnWatch")
+        self.btn_watch.setCheckable(True)
+        self.btn_watch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_watch.toggled.connect(self._toggle_watch)
+        
         row1_layout.addWidget(self.btn_load)
         row1_layout.addWidget(self.btn_stop)
         row1_layout.addWidget(self.btn_clear)
+        row1_layout.addWidget(self.btn_watch)
         row1_layout.addStretch()
         self.btn_view_mode = QPushButton("Grid View")
         self.btn_view_mode.setObjectName("btnViewMode")
@@ -3404,8 +4652,14 @@ class MediaTab(QWidget):
         self.btn_toggle_preview.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_preview.clicked.connect(self._toggle_preview)
         self.btn_toggle_preview.setIconSize(QSize(16, 16))
+        self.btn_toggle_stats = QPushButton("📊 Stats")
+        self.btn_toggle_stats.setObjectName("btnToggleStats")
+        self.btn_toggle_stats.setCheckable(True)
+        self.btn_toggle_stats.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_stats.clicked.connect(self._toggle_stats)
         row1_layout.addWidget(self.btn_view_mode)
         row1_layout.addWidget(self.btn_toggle_preview)
+        row1_layout.addWidget(self.btn_toggle_stats)
         row2_layout = QHBoxLayout()
         row2_layout.setContentsMargins(0, 0, 0, 0)
         row2_layout.setSpacing(12)
@@ -3427,9 +4681,16 @@ class MediaTab(QWidget):
         filter_layout.setContentsMargins(12, 8, 12, 8)
         filter_layout.setSpacing(12)
         filter_layout.addWidget(QLabel("🔍"))
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filter by filename, name, or rating...")
-        self.search_input.textChanged.connect(self._on_filter_changed)
+        self.search_input = QComboBox()
+        self.search_input.setObjectName("searchComboBox")
+        self.search_input.setEditable(True)
+        self.search_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.search_input.lineEdit().setPlaceholderText("Filter by filename, name, or rating...")
+        self.search_input.lineEdit().textChanged.connect(self._on_filter_changed)
+        self.search_input.lineEdit().returnPressed.connect(self._on_search_return_pressed)
+        self.search_input.activated.connect(self._on_search_history_activated)
+        self.search_input.setMaxVisibleItems(15)
+        self.search_input.text = lambda: self.search_input.currentText()
         filter_layout.addWidget(self.search_input, 1)
         if not self.is_smart_folder:
             self.btn_save_search = QPushButton("")
@@ -3445,8 +4706,71 @@ class MediaTab(QWidget):
         self.exclude_input.setPlaceholderText("Exclude patterns (comma-separated, e.g., *sample*, temp*)")
         self.exclude_input.textChanged.connect(self._on_exclude_changed)
         filter_layout.addWidget(self.exclude_input, 1)
+        
+        self.btn_advanced_filter = QPushButton("▼ Advanced")
+        self.btn_advanced_filter.setObjectName("btnAdvancedFilter")
+        self.btn_advanced_filter.setCheckable(True)
+        self.btn_advanced_filter.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_advanced_filter.toggled.connect(lambda checked: self.advanced_filter_panel.setVisible(checked))
+        filter_layout.addWidget(self.btn_advanced_filter)
+        
         root_layout.addWidget(filter_panel)
+        
+        self.advanced_filter_panel = QFrame()
+        self.advanced_filter_panel.setObjectName("advancedFilterPanel")
+        self.advanced_filter_panel.setVisible(False)
+        advanced_layout = QHBoxLayout(self.advanced_filter_panel)
+        advanced_layout.setContentsMargins(12, 8, 12, 8)
+        advanced_layout.setSpacing(12)
+        
+        self.adv_res = QComboBox()
+        self.adv_res.addItems(["All Resolutions", "8K (4320p+)", "4K (2160p)", "1440p", "1080p", "720p", "480p", "Below 480p"])
+        self.adv_res.currentIndexChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(QLabel("Resolution:"))
+        advanced_layout.addWidget(self.adv_res)
+        
+        self.adv_dur_min = QSpinBox()
+        self.adv_dur_min.setRange(0, 99999)
+        self.adv_dur_min.valueChanged.connect(lambda: self._filter_timer.start())
+        self.adv_dur_max = QSpinBox()
+        self.adv_dur_max.setRange(0, 99999)
+        self.adv_dur_max.setValue(0)
+        self.adv_dur_max.valueChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(QLabel("Duration (s):"))
+        advanced_layout.addWidget(self.adv_dur_min)
+        advanced_layout.addWidget(QLabel("-"))
+        advanced_layout.addWidget(self.adv_dur_max)
+        
+        self.adv_size_min = QDoubleSpinBox()
+        self.adv_size_min.setRange(0, 99999)
+        self.adv_size_min.valueChanged.connect(lambda: self._filter_timer.start())
+        self.adv_size_max = QDoubleSpinBox()
+        self.adv_size_max.setRange(0, 99999)
+        self.adv_size_max.setValue(0)
+        self.adv_size_max.valueChanged.connect(lambda: self._filter_timer.start())
+        self.adv_size_unit = QComboBox()
+        self.adv_size_unit.addItems(["MB", "KB", "GB"])
+        self.adv_size_unit.currentIndexChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(QLabel("Size:"))
+        advanced_layout.addWidget(self.adv_size_min)
+        advanced_layout.addWidget(QLabel("-"))
+        advanced_layout.addWidget(self.adv_size_max)
+        advanced_layout.addWidget(self.adv_size_unit)
+        
+        self.adv_rating = QComboBox()
+        self.adv_rating.addItems(["All Ratings", "Unrated"] + [f"≥{i}" for i in range(1, 11)])
+        self.adv_rating.currentIndexChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(QLabel("Rating:"))
+        advanced_layout.addWidget(self.adv_rating)
+        
+        self.btn_clear_adv = QPushButton("Clear")
+        self.btn_clear_adv.clicked.connect(self._clear_advanced_filters)
+        advanced_layout.addWidget(self.btn_clear_adv)
+        advanced_layout.addStretch()
+        
+        root_layout.addWidget(self.advanced_filter_panel)
         self.table = QTableWidget()
+        self.table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.table.setColumnCount(self.NUM_COLS)
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         if self.media_type == 'image': self.table.setColumnHidden(self.COL_DURATION, True)
@@ -3520,7 +4844,9 @@ class MediaTab(QWidget):
         self.content_layout.setSpacing(12)
         self.content_layout.addWidget(self.view_stack, 1)
         self._build_preview_pane()
+        self._build_stats_panel()
         self.content_layout.addWidget(self.preview_panel)
+        self.content_layout.addWidget(self.stats_panel)
         root_layout.addLayout(self.content_layout, 1)
         bottom_layout = QVBoxLayout()
         bottom_layout.setContentsMargins(0, 0, 0, 0)
@@ -3568,6 +4894,11 @@ class MediaTab(QWidget):
         self.btn_batch_edit.clicked.connect(self._on_batch_edit)
         self.btn_batch_edit.setEnabled(False)
         self.btn_batch_edit.setIconSize(QSize(16, 16))
+        self.btn_batch_tag = QPushButton("🏷️ Batch Tag")
+        self.btn_batch_tag.setObjectName("btnBatchTag")
+        self.btn_batch_tag.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_tag.clicked.connect(self._on_batch_tag)
+        self.btn_batch_tag.setEnabled(False)
         self.btn_relocate = QPushButton("Relocate Files")
         self.btn_relocate.setObjectName("btnBatchEdit")
         self.btn_relocate.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3588,6 +4919,7 @@ class MediaTab(QWidget):
         self.btn_process.setIconSize(QSize(18, 18))
         bottom_row2.addWidget(self.btn_find_dupes)
         bottom_row2.addWidget(self.btn_batch_edit)
+        bottom_row2.addWidget(self.btn_batch_tag)
         bottom_row2.addWidget(self.btn_relocate)
         bottom_row2.addWidget(self.btn_delete)
         bottom_row2.addStretch()
@@ -3637,13 +4969,53 @@ class MediaTab(QWidget):
             else:
                 combo.setStyleSheet("QComboBox { background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 6px; color: #64748b; padding-left: 8px; } QComboBox::drop-down { border: none; width: 16px; } QComboBox::down-arrow { border-top: 4px solid #6366f1; border-left: 3px solid transparent; border-right: 3px solid transparent; }")
 
+    def _on_search_return_pressed(self):
+        query = self.search_input.currentText().strip()
+        if query:
+            self._save_search_to_history(query)
+        self._apply_filter()
+
+    def _save_search_to_history(self, query: str):
+        query = query.strip()
+        if not query: return
+        if query in self._search_history:
+            self._search_history.remove(query)
+        self._search_history.insert(0, query)
+        self._search_history = self._search_history[:20]
+        self._refresh_search_combobox_items()
+
+    def _refresh_search_combobox_items(self):
+        if not hasattr(self, 'search_input') or not isinstance(self.search_input, QComboBox):
+            return
+        curr = self.search_input.currentText()
+        self.search_input.blockSignals(True)
+        self.search_input.clear()
+        if self._search_history:
+            for item in self._search_history:
+                self.search_input.addItem(item)
+            self.search_input.insertSeparator(self.search_input.count())
+            self.search_input.addItem("✕ Clear Search History")
+        self.search_input.setEditText(curr)
+        self.search_input.blockSignals(False)
+
+    def _on_search_history_activated(self, index: int):
+        text = self.search_input.itemText(index)
+        if text == "✕ Clear Search History":
+            self._search_history.clear()
+            self._refresh_search_combobox_items()
+            self._show_toast("Search history cleared", 'info')
+            return
+        self.search_input.setEditText(text)
+        self._save_search_to_history(text)
+        self._apply_filter()
+
     def _on_filter_changed(self, text: str):
         # Debounce: kick off the timer; if the user keeps typing, the timer
         # keeps resetting. Only when they pause for 250ms does _apply_filter run.
         self._filter_timer.start()
 
     def _apply_filter(self):
-        text = self.search_input.text()
+        text = self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()
         search_lower = text.lower().strip()
         self.filtered_rows.clear()
         for row in range(self.table.rowCount()):
@@ -3668,17 +5040,108 @@ class MediaTab(QWidget):
             else:
                 self.table.setRowHidden(row, True)
                 if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+        self._apply_advanced_filters()
         self._update_stats()
         self._load_visible_widgets()
+
+    def _clear_advanced_filters(self):
+        self.adv_res.setCurrentIndex(0)
+        self.adv_dur_min.setValue(0)
+        self.adv_dur_max.setValue(0)
+        self.adv_size_min.setValue(0)
+        self.adv_size_max.setValue(0)
+        self.adv_rating.setCurrentIndex(0)
+        self._filter_timer.start()
+
+    def _apply_advanced_filters(self):
+        # Quick check if any advanced filters are active
+        res_idx = self.adv_res.currentIndex()
+        dur_min = self.adv_dur_min.value()
+        dur_max = self.adv_dur_max.value()
+        sz_min = self.adv_size_min.value()
+        sz_max = self.adv_size_max.value()
+        rat_idx = self.adv_rating.currentIndex()
+
+        if res_idx == 0 and dur_min == 0 and dur_max == 0 and sz_min == 0 and sz_max == 0 and rat_idx <= 0:
+            return
+
+        sz_multiplier = 1024 * 1024
+        if self.adv_size_unit.currentText() == "KB":
+            sz_multiplier = 1024
+        elif self.adv_size_unit.currentText() == "GB":
+            sz_multiplier = 1024 * 1024 * 1024
+
+        rows_to_remove = []
+        for row in self.filtered_rows:
+            info = self._get_row_info(row)
+            if not info: continue
+            
+            keep = True
+            
+            # Resolution
+            if res_idx > 0 and info.height > 0:
+                h = info.height
+                if res_idx == 1 and h < 4320: keep = False # 8K+
+                elif res_idx == 2 and (h < 2160 or h >= 4320): keep = False # 4K
+                elif res_idx == 3 and (h < 1440 or h >= 2160): keep = False # 1440p
+                elif res_idx == 4 and (h < 1080 or h >= 1440): keep = False # 1080p
+                elif res_idx == 5 and (h < 720 or h >= 1080): keep = False # 720p
+                elif res_idx == 6 and (h < 480 or h >= 720): keep = False # 480p
+                elif res_idx == 7 and h >= 480: keep = False # Below 480p
+
+            # Duration
+            if keep and dur_max > 0:
+                d = info.duration_seconds
+                if d < dur_min or d > dur_max: keep = False
+            elif keep and dur_min > 0:
+                if info.duration_seconds < dur_min: keep = False
+
+            # Size
+            if keep and sz_max > 0:
+                s = info.size_bytes
+                if s < sz_min * sz_multiplier or s > sz_max * sz_multiplier: keep = False
+            elif keep and sz_min > 0:
+                if info.size_bytes < sz_min * sz_multiplier: keep = False
+
+            # Rating
+            if keep and rat_idx > 0:
+                rating_widget = self.table.cellWidget(row, self.COL_RATING)
+                if rating_widget:
+                    r_text = rating_widget.currentText()
+                else:
+                    rating_item = self.table.item(row, self.COL_RATING)
+                    r_text = rating_item.text().strip() if rating_item else ""
+                
+                if rat_idx == 1: # Unrated
+                    if r_text and r_text != "—":
+                        keep = False
+                else:
+                    thresh = rat_idx - 1
+                    try:
+                        if not r_text or r_text == "—" or float(r_text) < thresh:
+                            keep = False
+                    except ValueError:
+                        keep = False
+
+            if not keep:
+                rows_to_remove.append(row)
+                self.table.setRowHidden(row, True)
+                if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setHidden(True)
+
+        for row in rows_to_remove:
+            self.filtered_rows.remove(row)
 
     def _focus_search(self):
         """Helper for keyboard shortcut — safely focuses the search input."""
         if hasattr(self, 'search_input') and self.search_input:
             self.search_input.setFocus()
-            self.search_input.selectAll()
+            if hasattr(self.search_input, 'lineEdit') and self.search_input.lineEdit():
+                self.search_input.lineEdit().selectAll()
+            elif hasattr(self.search_input, 'selectAll'):
+                self.search_input.selectAll()
 
     def _on_save_search_clicked(self):
-        query = self.search_input.text().strip()
+        query = self.search_input.currentText().strip() if hasattr(self.search_input, 'currentText') else self.search_input.text().strip()
         if not query:
             QMessageBox.warning(self, "Empty Filter", "Please type a search query first to save it as a Smart Folder."); return
         main_win = self.window()
@@ -3694,14 +5157,45 @@ class MediaTab(QWidget):
         self._exclude_patterns = patterns
         if self.directories: self._start_scan(self.directories)
 
+    def _should_exclude(self, filepath: str) -> bool:
+        if not self._exclude_patterns: return False
+        filename = os.path.basename(filepath).lower()
+        for pattern in self._exclude_patterns:
+            pattern = pattern.lower().strip()
+            if not pattern: continue
+            if pattern.startswith('*') and pattern.endswith('*'):
+                if pattern[1:-1] in filename: return True
+            elif pattern.startswith('*'):
+                if filename.endswith(pattern[1:]): return True
+            elif pattern.endswith('*'):
+                if filename.startswith(pattern[:-1]): return True
+            elif pattern in filename: return True
+        return False
+
     def _start_scan(self, folders: list[str], force_full: bool = False):
-        if getattr(self, 'scanner_thread', None) is not None:
-            if self.scanner_thread.isRunning():
-                self.scanner_thread.requestInterruption()
-                self.scanner_thread.quit()
-                self.scanner_thread.wait(2000)
+        old = getattr(self, 'scanner_thread', None)
+        if old is not None and old.isRunning():
+            old.requestInterruption()
+            # NOTE: no quit() here — ScannerThread.run() has no event loop; it
+            # polls isInterruptionRequested() instead.
+            if not old.wait(2000):
+                # Still busy (blocked in cv2/ffprobe work). Detach its signals
+                # so late emissions can't corrupt the new scan, keep a Python
+                # reference so Qt never destroys a running QThread, and clean
+                # it up automatically once run() actually returns.
+                for sig in (old.progress, old.file_found, old.scan_complete, old.status_update):
+                    try:
+                        sig.disconnect()
+                    except TypeError:
+                        pass
+                if not hasattr(self, '_orphaned_scanners'):
+                    self._orphaned_scanners = []
+                self._orphaned_scanners.append(old)
+                old.finished.connect(old.deleteLater)
                 
-        self._on_clear()
+        was_watch = getattr(self, '_watch_enabled', False)
+        self._on_clear(keep_watch=was_watch)
+        self._watch_enabled = was_watch
         self.directories = folders
         if self.directories: self.btn_load.setEnabled(True)
         else: self.btn_load.setEnabled(False)
@@ -3725,7 +5219,149 @@ class MediaTab(QWidget):
         self.scanner_thread.status_update.connect(lambda msg: self.status_label.setText(msg))
         self.scanner_thread.start()
 
-    def _on_clear(self):
+    def _toggle_watch(self, checked: bool):
+        if checked and not self.directories:
+            self.btn_watch.setChecked(False)
+            self._show_toast("Please add/select folders first before enabling watch.", 'warning')
+            return
+        self._watch_enabled = checked
+        if checked:
+            self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
+            self._watch_timer.start(3000)
+            self._show_toast(f"👁️ Watching {len(self.directories)} folder(s)...", 'success')
+        else:
+            self._watch_timer.stop()
+            self._show_toast("Watch folder disabled.", 'info')
+
+    def _check_for_changes(self):
+        if not getattr(self, '_watch_enabled', False) or not self.directories:
+            return
+        if getattr(self, 'scanner_thread', None) is not None and self.scanner_thread.isRunning():
+            return
+        # Renames/deletes moved files to new paths since the last tick —
+        # rebuild the baseline so old paths don't count as "removed" while
+        # their new paths are already known (prevents duplicate rows).
+        if getattr(self, '_known_files_dirty', False):
+            self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
+            self._known_files_dirty = False
+            
+        valid_exts = get_extensions_for_type(self.media_type)
+        current_files = {}
+
+        for directory in self.directories:
+            if not os.path.isdir(directory): continue
+            stack = [directory]
+            while stack:
+                current_dir = stack.pop()
+                try:
+                    for entry in os.scandir(current_dir):
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                            elif entry.is_file(follow_symlinks=False):
+                                ext = os.path.splitext(entry.name)[1].lower()
+                                # Match ScannerThread semantics: known extensions
+                                # plus extensionless files only ('all' already
+                                # unions every supported set).
+                                if ext == '' or ext in valid_exts:
+                                    full_path = os.path.normpath(entry.path)
+                                    norm_case = os.path.normcase(full_path)
+                                    if not self._should_exclude(full_path):
+                                        current_files[norm_case] = full_path
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        if not hasattr(self, '_known_files') or not isinstance(self._known_files, dict):
+            self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
+
+        current_keys = set(current_files.keys())
+        known_keys = set(self._known_files.keys())
+
+        added_keys = current_keys - known_keys
+        removed_keys = known_keys - current_keys
+
+        if not added_keys and not removed_keys:
+            return
+
+        # 1. Handle removals safely by table row lookup
+        if removed_keys:
+            rows_to_remove = []
+            for r in range(self.table.rowCount()):
+                row_info = self._get_row_info(r)
+                if row_info and os.path.normcase(os.path.normpath(row_info.filepath)) in removed_keys:
+                    rows_to_remove.append(r)
+
+            was_sorting = self.table.isSortingEnabled()
+            self.table.setSortingEnabled(False)
+            for r in sorted(rows_to_remove, reverse=True):
+                self._remove_row_from_list(r)
+            self.table.setSortingEnabled(was_sorting)
+
+        # 2. Handle additions — extract metadata OFF the GUI thread (each
+        # MediaInfo can block on cv2/ffprobe for seconds); results are batched
+        # through _flush_pending_watch_infos() so the UI stays responsive.
+        if added_keys:
+            if not hasattr(self, '_watch_info_pool'):
+                self._watch_info_pool = QThreadPool(self)
+                self._watch_info_pool.setMaxThreadCount(2)
+            for k in added_keys:
+                runnable = _MediaInfoRunnable(current_files[k], self.media_type, self)
+                # Cross-thread queued connection — handler runs on main thread
+                runnable.signals.ready.connect(self._on_watch_info_ready)
+                self._watch_info_pool.start(runnable)
+
+        self._known_files = current_files
+        if added_keys or removed_keys:
+            self.status_label.setText(f"Watch: +{len(added_keys)} added, -{len(removed_keys)} removed ({len(self.media_infos)} files total)")
+            self._show_toast(f"👁️ Watch: +{len(added_keys)} added, -{len(removed_keys)} removed", 'info')
+
+    def _on_watch_info_ready(self, info):
+        """Called on the main thread when a watch-mode MediaInfo worker finishes."""
+        if info is None:
+            return
+        if not hasattr(self, '_pending_watch_infos'):
+            self._pending_watch_infos = []
+        self._pending_watch_infos.append(info)
+        if not hasattr(self, '_watch_flush_timer'):
+            self._watch_flush_timer = QTimer(self)
+            self._watch_flush_timer.setSingleShot(True)
+            self._watch_flush_timer.setInterval(250)
+            self._watch_flush_timer.timeout.connect(self._flush_pending_watch_infos)
+        self._watch_flush_timer.start()
+
+    def _flush_pending_watch_infos(self):
+        pending = getattr(self, '_pending_watch_infos', [])
+        if not pending:
+            return
+        self._pending_watch_infos = []
+        was_sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        try:
+            for info in pending:
+                if info.is_valid:
+                    row = self.table.rowCount()
+                    self._on_file_found(info)
+                    # Apply persisted artist/rating/tags for files restored from config
+                    self._apply_saved_file_data_to_row(row)
+        finally:
+            self.table.setSortingEnabled(was_sorting)
+        self._apply_filter()
+        self._update_stats()
+        self._load_visible_widgets()
+
+    def _on_clear(self, keep_watch: bool = False):
+        if not keep_watch:
+            self._watch_timer.stop()
+            self._watch_enabled = False
+            if hasattr(self, 'btn_watch'):
+                self.btn_watch.setChecked(False)
+        self._known_files = {}
+        # Invalidate rename history — undoing across a cleared/reloaded list
+        # would rename files from the previous session on disk.
+        self._rename_history.clear()
+        self._redo_history.clear()
         self._release_file_locks()
         self.table.setSortingEnabled(False)
         self.table.setUpdatesEnabled(True)
@@ -3741,6 +5377,7 @@ class MediaTab(QWidget):
         self.btn_stop.setVisible(False)
         self.btn_process.setEnabled(False)
         self.btn_batch_edit.setEnabled(False)
+        self.btn_batch_tag.setEnabled(False)
         self.btn_relocate.setEnabled(False)
         self.btn_find_dupes.setEnabled(False)
         self.btn_undo.setEnabled(False)
@@ -3785,9 +5422,15 @@ class MediaTab(QWidget):
             self.btn_load.setEnabled(False)
             self._on_clear()
 
+    def _show_toast(self, message, toast_type='info'):
+        if hasattr(self.window(), 'show_toast'):
+            self.window().show_toast(message, toast_type)
+
+
     def get_state_dict(self) -> dict:
         state = {
             'exclude_patterns': self._exclude_patterns,
+            'search_history': self._search_history,
             'files': {},
             'column_visibility': {}
         }
@@ -3820,6 +5463,8 @@ class MediaTab(QWidget):
         self._exclude_patterns = state.get('exclude_patterns', [])
         if self._exclude_patterns and hasattr(self, 'exclude_input'):
             self.exclude_input.setText(', '.join(self._exclude_patterns))
+        self._search_history = state.get('search_history', [])
+        self._refresh_search_combobox_items()
         col_visibility = state.get('column_visibility', {})
         for col_str, is_visible in col_visibility.items():
             col = int(col_str)
@@ -3853,7 +5498,7 @@ class MediaTab(QWidget):
             painter.drawText(QRect(0, 0, 120, 68), Qt.AlignmentFlag.AlignCenter, emoji)
         grid_item.setIcon(QIcon(placeholder_pix))
         info.grid_item = grid_item
-        search_text = self.search_input.text().lower().strip()
+        search_text = (self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()).lower().strip()
         is_hidden = False
         if self.is_smart_folder and not matches_query(info, self.smart_query): is_hidden = True
         elif search_text and not matches_query(info, search_text): is_hidden = True
@@ -3990,9 +5635,11 @@ class MediaTab(QWidget):
         runnable.signals.finished.connect(self._on_thumbnail_ready)
         self._thumb_pool.start(runnable)
 
-    def _on_thumbnail_ready(self, row: int, info: MediaInfo, label: QLabel, pixmap: QPixmap):
+    def _on_thumbnail_ready(self, row: int, info: MediaInfo, label: QLabel, image):
         """Called on the main thread when a thumbnail worker finishes."""
         if row >= self.table.rowCount(): return
+        # Worker threads produce QImage; QPixmap is only safe on the GUI thread
+        pixmap = QPixmap.fromImage(image) if image is not None else None
         if pixmap and not pixmap.isNull():
             current_widget = self.table.cellWidget(row, self.COL_THUMB)
             if current_widget is label:
@@ -4090,6 +5737,10 @@ class MediaTab(QWidget):
         if self._saved_file_data:
             self._restore_file_data()
             self._saved_file_data = {}
+        if getattr(self, '_watch_enabled', False):
+            self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
+            if not self._watch_timer.isActive():
+                self._watch_timer.start(3000)
         self._load_visible_widgets()
 
     def _ensure_widgets_for_row(self, row: int):
@@ -4116,7 +5767,6 @@ class MediaTab(QWidget):
             artist_input.setPlaceholderText("Enter name…")
             artist_input.setMaxLength(100)
             if val: artist_input.setText(val)
-            artist_input.setProperty("row_index", row)
             artist_input.textChanged.connect(self._on_input_changed_sender)
             artist_input.editingFinished.connect(self._on_artist_editing_finished)
             self.table.setCellWidget(row, self.COL_ARTIST, artist_input)
@@ -4131,7 +5781,6 @@ class MediaTab(QWidget):
             rating_combo.addItems(["—"] + [str(i) for i in range(1, 11)])
             idx = rating_combo.findText(val)
             if idx >= 0: rating_combo.setCurrentIndex(idx)
-            rating_combo.setProperty("row_index", row)
             rating_combo.currentTextChanged.connect(self._on_input_changed_sender)
             rating_combo.currentTextChanged.connect(self._on_rating_changed)
             rating_combo.currentTextChanged.connect(lambda text, cb=rating_combo: self._style_rating_combo(cb, text))
@@ -4147,7 +5796,6 @@ class MediaTab(QWidget):
             tag_input = QLineEdit()
             tag_input.setPlaceholderText("e.g. nature, 4k, favorite")
             if val: tag_input.setText(val)
-            tag_input.setProperty("row_index", row)
             tag_input.editingFinished.connect(self._on_tags_edited)
             self.table.setCellWidget(row, self.COL_TAGS, tag_input)
 
@@ -4216,12 +5864,14 @@ class MediaTab(QWidget):
     def _on_tags_edited(self):
         sender = self.sender()
         if not sender: return
-        row = sender.property("row_index")
-        if row is None:
-            for r in range(self.table.rowCount()):
-                if self.table.cellWidget(r, self.COL_TAGS) is sender:
-                    row = r
-                    break
+        # Resolve the row dynamically by widget identity — a stored row index
+        # goes stale after sorting (widgets move rows, the int doesn't), which
+        # wrote tags onto the WRONG file's info.
+        row = None
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, self.COL_TAGS) is sender:
+                row = r
+                break
         if row is None: return
         info = self._get_row_info(row)
         if not info: return
@@ -4351,6 +6001,64 @@ class MediaTab(QWidget):
             artist, rating = dialog.get_values()
             self._apply_batch_edit(selected_rows, artist, rating)
 
+    def _on_batch_tag(self):
+        selected_rows = set()
+        for rng in self.table.selectedRanges():
+            for row in range(rng.topRow(), rng.bottomRow() + 1):
+                if row in self.filtered_rows or not self.filtered_rows:
+                    info = self._get_row_info(row)
+                    if info and info.is_valid: selected_rows.add(row)
+        if len(selected_rows) < 2:
+            QMessageBox.information(self, "Selection Required", "Please select at least 2 valid files."); return
+            
+        selected_infos = [self._get_row_info(r) for r in selected_rows]
+        dialog = BatchTagDialog(selected_infos, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            mode, input_tags = dialog.get_result()
+            was_sorting = self.table.isSortingEnabled()
+            self.table.setSortingEnabled(False)
+            self._updating_table = True
+            try:
+                for row, info in zip(selected_rows, selected_infos):
+                    current_tags = getattr(info, 'tags', [])
+                    new_tags = list(current_tags)
+
+                    if mode == "Add Tags":
+                        for t in input_tags:
+                            if t not in new_tags:
+                                new_tags.append(t)
+                    elif mode == "Remove Tags":
+                        new_tags = [t for t in new_tags if t not in input_tags]
+                    elif mode == "Replace All Tags":
+                        new_tags = input_tags
+
+                    info.tags = new_tags
+                    # FIX: was self._update_table_item(...) — that method never
+                    # existed, so batch-tagging crashed with AttributeError after
+                    # mutating tags. Update item AND cell widget (the widget is
+                    # what the user actually sees), then refresh the preview.
+                    tags_text = ", ".join(new_tags)
+                    tags_item = self.table.item(row, self.COL_TAGS)
+                    if tags_item:
+                        tags_item.setText(tags_text)
+                    tags_widget = self.table.cellWidget(row, self.COL_TAGS)
+                    if tags_widget and tags_widget.text() != tags_text:
+                        tags_widget.setText(tags_text)
+                    if hasattr(info, 'grid_item') and info.grid_item:
+                        tag_str = tags_text if new_tags else ""
+                        info.grid_item.setToolTip(f"{info.filename}\nTags: {tag_str}" if tag_str else info.filename)
+            finally:
+                self._updating_table = False
+                self.table.setSortingEnabled(was_sorting)
+
+            for row, info in zip(selected_rows, selected_infos):
+                self._update_row_preview(row)
+
+            if hasattr(self.window(), '_debounced_save_state'):
+                self.window()._debounced_save_state()
+            self._show_toast(f"Updated tags for {len(selected_rows)} files.", 'success')
+
     def _apply_batch_edit(self, rows: set[int], artist: str | None, rating: str | None):
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
@@ -4402,8 +6110,13 @@ class MediaTab(QWidget):
 
         # Compute the allowed root (everything before the first {variable})
         # so we can validate each resolved dest_dir stays inside it.
+        # NOTE: allowed_root stays None when the template starts with a
+        # {variable} or contains none — that's still safe because
+        # parse_destination_template strips all separators/'..' from every
+        # substituted value, so traversal can only come from template literals
+        # the user typed deliberately.
         first_var = template.find('{')
-        allowed_root = os.path.abspath(template[:first_var]) if first_var > 0 else None
+        allowed_root = os.path.normcase(os.path.abspath(template[:first_var])) if first_var > 0 else None
 
         success_count = 0
         error_count = 0
@@ -4437,7 +6150,7 @@ class MediaTab(QWidget):
 
             # Path-traversal safety: ensure resolved dest_dir stays under allowed_root
             if allowed_root:
-                abs_dest = os.path.abspath(dest_dir)
+                abs_dest = os.path.normcase(os.path.abspath(dest_dir))
                 try:
                     if os.path.commonpath([allowed_root, abs_dest]) != allowed_root:
                         error_count += 1
@@ -4452,7 +6165,8 @@ class MediaTab(QWidget):
                 os.makedirs(dest_dir, exist_ok=True)
 
                 dest_file = os.path.join(dest_dir, info.filename)
-                if os.path.exists(dest_file) and os.path.normpath(src) != os.path.normpath(dest_file):
+                same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
+                if os.path.exists(dest_file) and not same_file:
                     base, ext = os.path.splitext(info.filename)
                     counter = 1
                     while os.path.exists(dest_file):
@@ -4472,6 +6186,10 @@ class MediaTab(QWidget):
                     if fname_item:
                         fname_item.setText(info.filename)
                         fname_item.setToolTip(dest_file)
+                    # Keep the grid card in sync (was stale until next rescan)
+                    if hasattr(info, 'grid_item') and info.grid_item:
+                        info.grid_item.setText(info.filename)
+                        info.grid_item.setToolTip(dest_file)
                     self._update_row_preview(row_idx)
                     self._add_to_history(src, dest_file, row_idx)
 
@@ -4489,6 +6207,8 @@ class MediaTab(QWidget):
 
         self._updating_table = False
         self.table.setSortingEnabled(was_sorting)
+        if success_count > 0:
+            self._known_files_dirty = True
 
         self.table.viewport().update()
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
@@ -4532,7 +6252,7 @@ class MediaTab(QWidget):
             if main_win:
                 if not hasattr(main_win, '_native_players'):
                     main_win._native_players = []
-                main_win._native_players = [p for p in main_win._native_players if p.isVisible()]
+                prune_native_players(main_win)
                 if info.media_type == 'video':
                     player_win = NativeVideoPlayerWindow(filepath, parent=main_win)
                 elif info.media_type == 'image':
@@ -4571,7 +6291,7 @@ class MediaTab(QWidget):
         if main_win:
             if not hasattr(main_win, '_native_players'):
                 main_win._native_players = []
-            main_win._native_players = [p for p in main_win._native_players if p.isVisible()]
+            prune_native_players(main_win)
             player_win = SplitVideoPlayerWindow(filepaths, parent=main_win)
             player_win.show()
             main_win._native_players.append(player_win)
@@ -4623,10 +6343,21 @@ class MediaTab(QWidget):
             play4_action.triggered.connect(lambda: self._play_four_videos(selected_video_paths))
             menu.addAction(play4_action)
             menu.addSeparator()
-            
+
+        if len(selected_rows) == 2:
+            compare_action = QAction("🔍  Compare Selected (2 Files)", self)
+            compare_action.triggered.connect(self._on_compare_selected)
+            menu.addAction(compare_action)
+            menu.addSeparator()
+
         play_action = QAction("▶️  Play / Open", self)
         play_action.triggered.connect(lambda: self._play_video(row))
         menu.addAction(play_action)
+
+        if info.media_type == 'video':
+            trim_action = QAction("✂️  Quick Trim / Cut Video", self)
+            trim_action.triggered.connect(lambda checked=False, r=row: self._on_quick_trim(r))
+            menu.addAction(trim_action)
 
         # ─── Open With Submenu ───
         open_with_menu = menu.addMenu("🌐  Open with…")
@@ -4688,6 +6419,42 @@ class MediaTab(QWidget):
         dialog = DetailedInfoDialog(info.filepath, ffprobe_path, self)
         dialog.exec()
 
+    def _show_file_info_dialog(self):
+        """Ctrl+I handler — shows detailed info for the current row."""
+        row = self.table.currentRow()
+        if row >= 0:
+            self._show_detailed_info(row)
+
+    def _on_compare_selected(self):
+        selected_rows = []
+        for rng in self.table.selectedRanges():
+            for r in range(rng.topRow(), rng.bottomRow() + 1):
+                if r not in selected_rows:
+                    selected_rows.append(r)
+        if len(selected_rows) != 2:
+            QMessageBox.information(self, "Comparison Selection", "Please select exactly 2 files to compare.")
+            return
+        info1 = self._get_row_info(selected_rows[0])
+        info2 = self._get_row_info(selected_rows[1])
+        if not info1 or not info2: return
+        main_win = self.window()
+        comp_win = ComparisonViewWindow(info1, info2, parent_tab=self, parent=main_win)
+        if main_win:
+            if not hasattr(main_win, '_native_players') or main_win._native_players is None:
+                main_win._native_players = []
+            main_win._native_players.append(comp_win)
+        comp_win.show()
+
+    def _on_quick_trim(self, row: int = -1):
+        if row == -1:
+            row = self.table.currentRow()
+        if row < 0: return
+        info = self._get_row_info(row)
+        if not info or not os.path.exists(info.filepath): return
+        main_win = self.window()
+        dialog = QuickTrimDialog(info.filepath, parent_tab=self, parent=main_win)
+        dialog.exec()
+
     def _open_with_system(self, filepath: str):
         if sys.platform == 'win32':
             try:
@@ -4707,7 +6474,7 @@ class MediaTab(QWidget):
         if main_win:
             if not hasattr(main_win, '_native_players'):
                 main_win._native_players = []
-            main_win._native_players = [p for p in main_win._native_players if p.isVisible()]
+            prune_native_players(main_win)
             if self.media_type == 'video':
                 player_win = NativeVideoPlayerWindow(filepath, parent=main_win)
             elif self.media_type == 'image':
@@ -4780,16 +6547,23 @@ class MediaTab(QWidget):
         if info:
             QApplication.clipboard().setText(info.filepath)
             self.status_label.setText("📋 Path copied to clipboard")
+            self._show_toast("📋 Path copied to clipboard", 'success')
             QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
 
     def _remove_row_from_list(self, row: int):
         info = self._get_row_info(row)
-        if info and info.filepath in [v.filepath for v in self.media_infos]:
+        if info:
             self.media_infos = [v for v in self.media_infos if v.filepath != info.filepath]
             self.table.removeRow(row)
             if hasattr(info, 'grid_item') and info.grid_item:
                 row_item = self.grid_view.row(info.grid_item)
                 if row_item >= 0: self.grid_view.takeItem(row_item)
+            # Keep filtered_rows consistent: every index above the removed row
+            # shifts down by one (prevents later bulk ops targeting stale rows).
+            self.filtered_rows.discard(row)
+            self.filtered_rows = {r - 1 if r > row else r for r in self.filtered_rows}
+            # Renames/deletes invalidate the watch-mode path baseline
+            self._known_files_dirty = True
             self._update_stats()
 
     def _on_remove_selected(self):
@@ -4842,6 +6616,7 @@ class MediaTab(QWidget):
             QMessageBox.warning(self, "Deletion Errors", f"Failed to delete {len(error_files)} file(s):\n\n" + "\n".join(error_files[:10]))
         else:
             self.status_label.setText(f"Deleted {success_count} file(s).")
+            self._show_toast(f"Deleted {success_count} file(s).", 'success')
 
     def _set_rating_for_row(self, row: int, rating: str):
         self._ensure_widgets_for_row(row)
@@ -4866,9 +6641,18 @@ class MediaTab(QWidget):
         old_text = info.filename
         if not new_text or new_text == old_text: return
         src = info.filepath
-        new_name_no_ext = os.path.splitext(new_text)[0]
+        # Only strip the extension if the typed text actually ends with it.
+        # The old splitext() approach truncated names containing inner dots
+        # ("Ep 1.5 Pilot.mp4" became "Ep 1.mp4").
+        if info.extension and new_text.lower().endswith(info.extension.lower()):
+            new_name_no_ext = new_text[:-len(info.extension)]
+        else:
+            new_name_no_ext = new_text
         dst = os.path.join(os.path.dirname(src), new_name_no_ext + info.extension)
-        if os.path.exists(dst) and os.path.normpath(src) != os.path.normpath(dst):
+        # normcase: on Windows the FS is case-insensitive, so renaming
+        # ABC.mp4 -> abc.mp4 must NOT be treated as a collision.
+        same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+        if os.path.exists(dst) and not same_file:
             base = new_name_no_ext
             ext = info.extension
             counter = 1
@@ -4886,7 +6670,10 @@ class MediaTab(QWidget):
             self._updating_table = True
             item.setText(info.filename)
             self._updating_table = False
-            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+            if hasattr(info, 'grid_item') and info.grid_item:
+                info.grid_item.setText(info.filename)
+                info.grid_item.setToolTip(dst)
+            self._known_files_dirty = True
             self._add_to_history(src, dst, row)
         except Exception as e:
             QMessageBox.warning(self, "Rename Error", f"Cannot rename file:\n{e}")
@@ -4929,7 +6716,9 @@ class MediaTab(QWidget):
             for row, info, target_display in ready_rows:
                 src = info.filepath
                 dst = os.path.join(os.path.dirname(src), target_display)
-                if os.path.exists(dst) and os.path.normpath(src) != os.path.normpath(dst):
+                # normcase: case-only renames on Windows are not collisions
+                same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+                if os.path.exists(dst) and not same_file:
                     base, ext = os.path.splitext(target_display)
                     counter = 1
                     while os.path.exists(dst):
@@ -4954,10 +6743,14 @@ class MediaTab(QWidget):
                     error_count += 1
                     errors.append(f"{info.filename}: {e}")
                     status_item = self.table.item(row, self.COL_STATUS)
-                    status_item.setText("✕ Error")
-                    status_item.setForeground(QColor("#f87171"))
-                    status_item.setToolTip(str(e))
+                    if status_item:
+                        status_item.setText("✕ Error")
+                        status_item.setForeground(QColor("#f87171"))
+                        status_item.setToolTip(str(e))
+            if success_count > 0:
+                self._known_files_dirty = True
         finally:
+            self._updating_table = False
             self.table.setSortingEnabled(was_sorting)
         msg = f"✅ Successfully renamed {success_count} file{'s' if success_count != 1 else ''}."
         if error_count > 0:
@@ -4965,6 +6758,10 @@ class MediaTab(QWidget):
             msg += "\n".join(errors[:10])
             if len(errors) > 10: msg += f"\n… and {len(errors) - 10} more."
         self.status_label.setText(f"Done — {success_count} renamed, {error_count} errors.")
+        if success_count > 0:
+            self._show_toast(f"Done — {success_count} renamed, {error_count} errors.", 'success' if error_count == 0 else 'warning')
+        else:
+            self._show_toast(f"Rename failed: {error_count} errors.", 'error')
         self._update_stats()
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
         QMessageBox.information(self, "Rename Complete", msg)
@@ -4998,7 +6795,6 @@ class MediaTab(QWidget):
                             self.table.item(row, self.COL_FILENAME).setToolTip(src)
                             self.table.item(row, self.COL_STATUS).setText("✓ Valid")
                             self.table.item(row, self.COL_STATUS).setForeground(QColor("#34d399"))
-                            self._updating_table = False
                             if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
                 except Exception as te:
                     # Table update failed after successful move — attempt to roll
@@ -5014,8 +6810,12 @@ class MediaTab(QWidget):
                         return
                     self._rename_history.append(last)
                     return
+                finally:
+                    self._updating_table = False
                 self.status_label.setText(f"↩️ Undone: {os.path.basename(dst)}")
+                self._show_toast(f"↩️ Undone: {os.path.basename(dst)}", 'success')
                 self._update_stats()
+                self._known_files_dirty = True
                 self._redo_history.append(last)
                 self.btn_redo.setEnabled(True)
             except Exception as e:
@@ -5038,20 +6838,38 @@ class MediaTab(QWidget):
             try:
                 shutil.move(src, dst)
                 row = last['row']
-                if row < self.table.rowCount():
-                    info = self._get_row_info(row)
-                    if info and info.filepath == src:
-                        self._updating_table = True
-                        info.filepath = dst
-                        info.filename = os.path.basename(dst)
-                        self.table.item(row, self.COL_FILENAME).setText(info.filename)
-                        self.table.item(row, self.COL_FILENAME).setToolTip(dst)
-                        self.table.item(row, self.COL_STATUS).setText("✓ Renamed")
-                        self.table.item(row, self.COL_STATUS).setForeground(QColor("#6dd5ed"))
-                        self._updating_table = False
-                        if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+                try:
+                    if row < self.table.rowCount():
+                        info = self._get_row_info(row)
+                        if info and info.filepath == src:
+                            self._updating_table = True
+                            info.filepath = dst
+                            info.filename = os.path.basename(dst)
+                            self.table.item(row, self.COL_FILENAME).setText(info.filename)
+                            self.table.item(row, self.COL_FILENAME).setToolTip(dst)
+                            self.table.item(row, self.COL_STATUS).setText("✓ Renamed")
+                            self.table.item(row, self.COL_STATUS).setForeground(QColor("#6dd5ed"))
+                            if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
+                except Exception as te:
+                    # Table update failed after successful move — roll the move
+                    # back so disk state and table state stay in sync (mirrors
+                    # the undo path; previously a failure here re-queued an
+                    # already-applied entry and lost the undo history).
+                    logger.exception("Table update failed after redo move; rolling back")
+                    try:
+                        shutil.move(dst, src)
+                    except Exception:
+                        logger.error("ROLLBACK FAILED for %s -> %s; filesystem and UI are out of sync", dst, src)
+                        QMessageBox.critical(self, "Fatal Desync", f"Filesystem and UI out of sync. Please reload folder.\n\nFailed to revert:\n{dst}\nto\n{src}")
+                        return
+                    self._redo_history.append(last)
+                    return
+                finally:
+                    self._updating_table = False
                 self.status_label.setText(f"🔁 Redone: {os.path.basename(dst)}")
+                self._show_toast(f"🔁 Redone: {os.path.basename(dst)}", 'success')
                 self._update_stats()
+                self._known_files_dirty = True
                 self._add_to_history(src, dst, row, clear_redo=False)
             except Exception as e:
                 QMessageBox.warning(self, "Redo Failed", f"Cannot redo rename:\n{e}")
@@ -5061,45 +6879,52 @@ class MediaTab(QWidget):
         self.btn_redo.setEnabled(len(self._redo_history) > 0)
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
 
+    def _apply_saved_file_data_to_row(self, row: int):
+        """Apply persisted artist/rating/tags (from config) to a single row."""
+        info = self._get_row_info(row)
+        if not info: return
+        data = self._saved_file_data.get(os.path.normpath(info.filepath))
+        if not data: return
+
+        artist = data.get('artist', '')
+        if artist:
+            artist_item = self.table.item(row, self.COL_ARTIST)
+            if artist_item: artist_item.setText(artist)
+            artist_widget = self.table.cellWidget(row, self.COL_ARTIST)
+            if artist_widget: artist_widget.setText(artist)
+
+        rating = data.get('rating', '—')
+        if rating != '—':
+            rating_item = self.table.item(row, self.COL_RATING)
+            if rating_item:
+                rating_item.setText(rating)
+                rating_item.sort_key = int(rating) if rating.isdigit() else 0
+            rating_widget = self.table.cellWidget(row, self.COL_RATING)
+            if rating_widget:
+                idx = rating_widget.findText(rating)
+                if idx >= 0: rating_widget.setCurrentIndex(idx)
+
+        tags = data.get('tags', [])
+        if tags:
+            info.tags = tags
+            tags_item = self.table.item(row, self.COL_TAGS)
+            if tags_item: tags_item.setText(", ".join(tags))
+            tags_widget = self.table.cellWidget(row, self.COL_TAGS)
+            if tags_widget: tags_widget.setText(", ".join(tags))
+
     def _restore_file_data(self):
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
         self._updating_table = True
-        for row in range(self.table.rowCount()):
-            info = self._get_row_info(row)
-            if not info: continue
-            data = self._saved_file_data.get(os.path.normpath(info.filepath))
-            if not data: continue
-            
-            artist = data.get('artist', '')
-            if artist:
-                artist_item = self.table.item(row, self.COL_ARTIST)
-                if artist_item: artist_item.setText(artist)
-                artist_widget = self.table.cellWidget(row, self.COL_ARTIST)
-                if artist_widget: artist_widget.setText(artist)
-                
-            rating = data.get('rating', '—')
-            if rating != '—':
-                rating_item = self.table.item(row, self.COL_RATING)
-                if rating_item:
-                    rating_item.setText(rating)
-                    rating_item.sort_key = int(rating) if rating.isdigit() else 0
-                rating_widget = self.table.cellWidget(row, self.COL_RATING)
-                if rating_widget:
-                    idx = rating_widget.findText(rating)
-                    if idx >= 0: rating_widget.setCurrentIndex(idx)
-                    
-            tags = data.get('tags', [])
-            if tags:
-                info.tags = tags
-                tags_item = self.table.item(row, self.COL_TAGS)
-                if tags_item: tags_item.setText(", ".join(tags))
-                tags_widget = self.table.cellWidget(row, self.COL_TAGS)
-                if tags_widget: tags_widget.setText(", ".join(tags))
-                
-            self._update_row_preview(row)
-        self._updating_table = False
-        self.table.setSortingEnabled(was_sorting)
+        try:
+            for row in range(self.table.rowCount()):
+                info = self._get_row_info(row)
+                if not info: continue
+                self._apply_saved_file_data_to_row(row)
+                self._update_row_preview(row)
+        finally:
+            self._updating_table = False
+            self.table.setSortingEnabled(was_sorting)
 
     def _find_exact_duplicates(self): self._find_duplicates_logic(mode='exact')
     def _find_visual_duplicates(self): self._find_duplicates_logic(mode='visual')
@@ -5108,15 +6933,14 @@ class MediaTab(QWidget):
         if mode == 'visual' and self.media_type == 'audio':
             QMessageBox.warning(self, "Unsupported", "Visual duplicates scanning is not supported for Audio files."); return
         self._clear_highlights()
-        # CRITICAL FIX: build valid_infos from the TABLE view (not media_infos list)
-        # because QTableWidget reorders rows when sorted. The old code used list
-        # indices as table-row indices, which highlighted/renamed the WRONG files
-        # after any sort.
+        # Collect info OBJECTS (not row indices) — rows can shift during the
+        # scan, but object identity is stable. Rows are resolved fresh at
+        # highlight time via id(info) -> current row.
         valid_infos = []
         for r in range(self.table.rowCount()):
             info = self._get_row_info(r)
             if info and info.is_valid:
-                valid_infos.append((r, info))
+                valid_infos.append(info)
         if not valid_infos:
             QMessageBox.information(self, "No Files", "No valid files loaded to scan for duplicates."); return
         self.progress_bar.setVisible(True)
@@ -5125,46 +6949,69 @@ class MediaTab(QWidget):
         task_name = "MD5 exact" if mode == 'exact' else "pHash visual"
         self.progress_bar.setFormat(f"Scanning duplicates ({task_name}): %v/%m…")
         self.status_label.setText(f"Scanning duplicates ({task_name})…")
-        hashes = {}
+        hashes = {}  # id(info) -> hash string
+        # Suspend watch mode: its 3s timer mutates rows and would corrupt the
+        # id->row mapping resolved below.
+        watch_was_active = False
+        if getattr(self, '_watch_timer', None) is not None and self._watch_timer.isActive():
+            watch_was_active = True
+            self._watch_timer.stop()
         # Disable duplicate buttons during scan to prevent re-entrancy from
         # processEvents() mid-loop. The old code's processEvents() allowed the
         # user to trigger another scan mid-scan, corrupting table state.
         self.btn_find_dupes.setEnabled(False)
         try:
-            for idx, (row, info) in enumerate(valid_infos):
+            for idx, info in enumerate(valid_infos):
                 # Use head-only hashing for large files to avoid minutes-long
                 # full-file MD5 on multi-GB videos.
                 if mode == 'exact': h = calculate_file_hash(info.filepath, head_only=True)
                 else: h = calculate_perceptual_hash(info.filepath, self.media_type)
-                if h: hashes[row] = h
+                if h: hashes[id(info)] = h
                 self.progress_bar.setValue(idx + 1)
-                QApplication.processEvents()  # keep UI responsive but buttons disabled
+                # Keep UI responsive while EXCLUDING user input events — plain
+                # processEvents() let sort clicks / Delete shortcut mutate rows
+                # mid-hash, which mislabeled the wrong files as duplicates.
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
         finally:
             self.btn_find_dupes.setEnabled(True)
+            if watch_was_active and getattr(self, '_watch_enabled', False):
+                self._watch_timer.start(3000)
         self.progress_bar.setVisible(False)
         self.status_label.setText("Processing duplicates list…")
-        QApplication.processEvents()
-        groups = []
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        groups = []  # each group is a list of id(info)
         if mode == 'exact':
-            hash_to_rows = {}
-            for r, h in hashes.items(): hash_to_rows.setdefault(h, []).append(r)
-            for h, grp in hash_to_rows.items():
+            hash_to_ids = {}
+            for i, h in hashes.items(): hash_to_ids.setdefault(h, []).append(i)
+            for h, grp in hash_to_ids.items():
                 if len(grp) > 1: groups.append(grp)
         else:
+            # Single-linkage grouping: compare against ANY member of the group,
+            # not just the representative. The old code tested each candidate
+            # only against the first element, so chained near-duplicates
+            # (A≈B≈C where A≁C) silently escaped grouping.
             visited = set()
-            rows_list = list(hashes.keys())
-            for i in range(len(rows_list)):
-                r1 = rows_list[i]
-                if r1 in visited: continue
-                h1 = hashes[r1]
-                current_group = [r1]
-                for j in range(i + 1, len(rows_list)):
-                    r2 = rows_list[j]
-                    if r2 in visited: continue
-                    h2 = hashes[r2]
-                    if hamming_distance(h1, h2) <= 10: current_group.append(r2)
+            ids_list = list(hashes.keys())
+            for i in range(len(ids_list)):
+                seed = ids_list[i]
+                if seed in visited: continue
+                current_group = [seed]
+                visited.add(seed)
+                grew = True
+                while grew:  # grow until transitive closure
+                    grew = False
+                    for cand in ids_list:
+                        if cand in visited: continue
+                        if any(hamming_distance(hashes[m], hashes[cand]) <= 10 for m in current_group):
+                            current_group.append(cand)
+                            visited.add(cand)
+                            grew = True
                 if len(current_group) > 1: groups.append(current_group)
-                for r in current_group: visited.add(r)
+        # Resolve CURRENT rows for the flagged infos (sort-proof)
+        id_to_row = {}
+        for r in range(self.table.rowCount()):
+            ri = self._get_row_info(r)
+            if ri is not None: id_to_row[id(ri)] = r
         if not groups:
             self.status_label.setText("No duplicates found.")
             QMessageBox.information(self, "No Duplicates", f"No {mode} duplicates found in the current list.")
@@ -5184,7 +7031,9 @@ class MediaTab(QWidget):
         total_dupes = 0
         for group_idx, grp in enumerate(groups):
             bg_color = QColor(239, 68, 68, 38) if group_idx % 2 == 0 else QColor(245, 158, 11, 38)
-            for row in grp:
+            for iid in grp:
+                row = id_to_row.get(iid, -1)
+                if row < 0: continue
                 total_dupes += 1
                 self.filtered_rows.add(row)
                 self.table.setRowHidden(row, False)
@@ -5230,9 +7079,153 @@ class MediaTab(QWidget):
     def _toggle_preview(self, checked):
         self.preview_panel.setVisible(checked)
         self.btn_toggle_preview.setChecked(checked)
+        # Symmetric exclusivity: opening the preview closes the stats panel
+        # (stats already closed preview; previously one-directional)
+        if checked and self.btn_toggle_stats.isChecked():
+            self._toggle_stats(False)
         self._update_preview_pane()
 
     def _close_preview_pane(self): self._toggle_preview(False)
+
+    def _build_stats_panel(self):
+        self.stats_panel = QFrame()
+        self.stats_panel.setObjectName("statsPanel")
+        self.stats_panel.setFixedWidth(320)
+        self.stats_panel.setVisible(False)
+        layout = QVBoxLayout(self.stats_panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        header_layout = QHBoxLayout()
+        title = QLabel("📊 Library Statistics")
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        
+        btn_close = QPushButton("✕")
+        btn_close.setObjectName("btnClosePreview")
+        btn_close.setFixedSize(24, 24)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(lambda: self._toggle_stats(False))
+        header_layout.addWidget(btn_close)
+        layout.addLayout(header_layout)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setStyleSheet("background: transparent;")
+        
+        self.stats_content = QWidget()
+        self.stats_layout = QVBoxLayout(self.stats_content)
+        self.stats_layout.setContentsMargins(0, 0, 0, 0)
+        self.stats_layout.setSpacing(16)
+        
+        scroll_area.setWidget(self.stats_content)
+        layout.addWidget(scroll_area)
+
+    def _toggle_stats(self, checked):
+        self.btn_toggle_stats.setChecked(checked)
+        self.stats_panel.setVisible(checked)
+        if checked:
+            if self.btn_toggle_preview.isChecked():
+                self._toggle_preview(False)
+            self._update_stats_dashboard()
+
+    def _update_stats_dashboard(self):
+        if not hasattr(self, 'stats_panel') or not self.stats_panel.isVisible():
+            return
+            
+        # Clear old stats
+        while self.stats_layout.count():
+            item = self.stats_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+                
+        if not self.media_infos:
+            self.stats_layout.addWidget(QLabel("No media loaded."))
+            self.stats_layout.addStretch()
+            return
+            
+        total_files = len(self.media_infos)
+        valid_files = sum(1 for i in self.media_infos if i.is_valid)
+        invalid_files = total_files - valid_files
+        total_size = sum(i.size_bytes for i in self.media_infos if getattr(i, 'size_bytes', 0))
+        
+        def add_section(title, content_dict):
+            group = QGroupBox(title)
+            group.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 15px; margin-top: 10px; }")
+            l = QFormLayout(group)
+            l.setContentsMargins(10, 15, 10, 10)
+            for k, v in content_dict.items():
+                lbl = QLabel(str(v))
+                lbl.setWordWrap(True)
+                l.addRow(k + ":", lbl)
+            self.stats_layout.addWidget(group)
+
+        # Overview
+        add_section("Overview", {
+            "Total Files": total_files,
+            "Valid Files": valid_files,
+            "Invalid/Errors": invalid_files,
+            "Total Size": format_size(total_size)
+        })
+
+        # Formats
+        formats = {}
+        for i in self.media_infos:
+            if not i.is_valid: continue
+            ext = os.path.splitext(i.filename)[1].lower() or "Unknown"
+            formats[ext] = formats.get(ext, 0) + 1
+            
+        format_stats = {k: f"{v} ({(v/valid_files*100):.1f}%)" for k, v in sorted(formats.items(), key=lambda x: x[1], reverse=True)[:10]}
+        if format_stats:
+            add_section("Format Breakdown", format_stats)
+
+        # Resolutions
+        if self.media_type in ('video', 'image', 'all'):
+            res = {}
+            for i in self.media_infos:
+                if not i.is_valid: continue
+                tag = getattr(i, 'resolution_tag', '') or (f"{i.width}x{i.height}" if i.width and i.height else "")
+                if tag:
+                    res[tag] = res.get(tag, 0) + 1
+            res_stats = {k: str(v) for k, v in sorted(res.items(), key=lambda x: x[1], reverse=True)[:10]}
+            if res_stats:
+                add_section("Resolutions", res_stats)
+                
+        # Durations
+        if self.media_type in ('video', 'audio', 'all'):
+            durs = [i.duration_seconds for i in self.media_infos if i.is_valid and hasattr(i, 'duration_seconds') and i.duration_seconds > 0]
+            if durs:
+                add_section("Duration", {
+                    "Total": format_duration(sum(durs)),
+                    "Average": format_duration(sum(durs)/len(durs)),
+                    "Shortest": format_duration(min(durs)),
+                    "Longest": format_duration(max(durs))
+                })
+
+        # Ratings
+        ratings = {}
+        for i in self.media_infos:
+            if not i.is_valid: continue
+            _, parsed_rating = parse_naming_format(i.filename)
+            r = parsed_rating or "Unrated"
+            ratings[r] = ratings.get(r, 0) + 1
+        rat_stats = {k: str(v) for k, v in sorted(ratings.items(), key=lambda x: (x[0] != "Unrated", float(x[0]) if x[0].replace('.','',1).isdigit() else 0), reverse=True)[:10]}
+        if rat_stats:
+            add_section("Ratings", rat_stats)
+            
+        # Tags
+        tags = {}
+        for i in self.media_infos:
+            if not i.is_valid: continue
+            for t in getattr(i, 'tags', []):
+                tags[t] = tags.get(t, 0) + 1
+        tag_stats = {k: str(v) for k, v in sorted(tags.items(), key=lambda x: x[1], reverse=True)[:10]}
+        if tag_stats:
+            add_section("Top Tags", tag_stats)
+
+        self.stats_layout.addStretch()
 
     def _build_preview_pane(self):
         self.preview_panel = QFrame()
@@ -5321,14 +7314,22 @@ class MediaTab(QWidget):
         main_win = self.window()
         if main_win:
             if hasattr(main_win, 'hover_overlay') and main_win.hover_overlay:
-                if not target_filepaths or (main_win.hover_overlay.info and main_win.hover_overlay.info.filepath in target_filepaths):
+                overlay_info = getattr(main_win.hover_overlay, 'info', None)
+                if not target_filepaths or overlay_info is None or overlay_info.filepath in target_filepaths:
                     main_win.hover_overlay.hide_preview()
             if hasattr(main_win, '_native_players') and main_win._native_players:
-                for player_win in main_win._native_players:
+                target_set = set(target_filepaths) if target_filepaths else None
+                for player_win in list(main_win._native_players):
                     try:
                         if player_win.isVisible():
                             p_path = getattr(player_win, 'filepath', None)
-                            if not target_filepaths or (p_path and p_path in target_filepaths):
+                            info_l = getattr(player_win, 'info_left', None)
+                            info_r = getattr(player_win, 'info_right', None)
+                            paths = set()
+                            if p_path: paths.add(p_path)
+                            if info_l: paths.add(info_l.filepath)
+                            if info_r: paths.add(info_r.filepath)
+                            if target_set is None or (paths & target_set):
                                 player_win.close()
                     except Exception:
                         pass
@@ -5432,13 +7433,14 @@ class MediaTab(QWidget):
 
     def _update_selection_buttons_and_preview(self):
         selected_ranges = self.table.selectedRanges()
-        has_valid = False
+        selected_valid_count = 0
         for rng in selected_ranges:
             for row in range(rng.topRow(), rng.bottomRow() + 1):
                 info = self._get_row_info(row)
-                if info and info.is_valid: has_valid = True; break
-            if has_valid: break
-        self.btn_batch_edit.setEnabled(len(selected_ranges) > 0 and has_valid)
+                if info and info.is_valid:
+                    selected_valid_count += 1
+        self.btn_batch_edit.setEnabled(selected_valid_count > 0)
+        self.btn_batch_tag.setEnabled(selected_valid_count >= 2)
         self.btn_delete.setEnabled(len(selected_ranges) > 0)
         self._update_preview_pane()
 
@@ -5499,6 +7501,8 @@ class MediaTab(QWidget):
         self.stat_valid._value_label.setText(str(valid))
         self.stat_unsupported._value_label.setText(str(unsupported))
         self.stat_size._value_label.setText(size_str)
+        if hasattr(self, '_update_stats_dashboard'):
+            self._update_stats_dashboard()
 
         # Enable or disable process renaming button dynamically based on whether renaming targets are ready
         # Optimization: short-circuit if btn_process is already enabled AND we
@@ -5558,14 +7562,66 @@ class MediaTab(QWidget):
                     preview_item.setFont(QFont(BASE_FONT_FAMILY, 10, QFont.Weight.Normal))
                     preview_item.setForeground(QColor("#7c7c9a") if is_dark else QColor("#64748b"))
 
+    def keyPressEvent(self, event):
+        if self.view_stack.currentIndex() == 0:  # table view
+            if event.key() == Qt.Key.Key_Up:
+                row = self.table.currentRow()
+                if row > 0:
+                    self.table.selectRow(row - 1)
+                elif row == -1 and self.table.rowCount() > 0:
+                    self.table.selectRow(0)
+                return
+            elif event.key() == Qt.Key.Key_Down:
+                row = self.table.currentRow()
+                if row < self.table.rowCount() - 1:
+                    self.table.selectRow(row + 1 if row != -1 else 0)
+                return
+            elif event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+                row = self.table.currentRow()
+                if row >= 0:
+                    self._play_video(row)
+                return
+            elif event.key() == Qt.Key.Key_A and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                # FIX: selectRow() clears the previous selection on every call,
+                # so the old loop left only the LAST visible row selected.
+                # setRangeSelected(..., True) accumulates instead.
+                for i in range(self.table.rowCount()):
+                    if not self.table.isRowHidden(i):
+                        self.table.setRangeSelected(
+                            QTableWidgetSelectionRange(i, 0, i, self.table.columnCount() - 1), True)
+                return
+        super().keyPressEvent(event)
+
 # ─── Main App Window ─────────────────────────────────────────────────────────────
+
+def prune_native_players(main_win):
+    """Drop closed player windows from the tracked list, safely.
+
+    Player/comparison dialogs use WA_DeleteOnClose, so their Python wrappers
+    can outlive the C++ objects; calling isVisible() on such a wrapper raises
+    RuntimeError and (unhandled) silently broke all native playback afterwards.
+    """
+    players = getattr(main_win, '_native_players', None)
+    if not players:
+        return
+    alive = []
+    for p in players:
+        try:
+            if p.isVisible():
+                alive.append(p)
+        except RuntimeError:
+            pass  # wrapper of an already-deleted window
+    main_win._native_players = alive
+
 
 class MediaFlowWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MediaFlow — Multimedia Manager & Renamer")
         self.setMinimumSize(1300, 810)
-        self.resize(1120, 630)
+        # FIX: was resize(1120, 630) which Qt clamps up to the 1300x810
+        # minimum every launch — use a default at/above the minimum.
+        self.resize(1400, 900)
         self._settings_visible = False
         self.setAcceptDrops(True)
         self.global_mute = False
@@ -5582,8 +7638,24 @@ class MediaFlowWindow(QMainWindow):
 
         self.hover_overlay = HoverPreviewOverlay(self)
         self._setup_shortcuts()
+        self._active_toasts = []
         self._load_state()
         if not os.path.exists(CONFIG_FILE): self._center_on_screen()
+
+    def show_toast(self, message, toast_type='info'):
+        toast = ToastNotification(message, toast_type, parent=self)
+        self._active_toasts.append(toast)
+
+        start_y = self.height() - 20 - toast.sizeHint().height()
+        
+        for t in reversed(self._active_toasts[:-1]):
+            if t.isVisible():
+                start_y -= t.height() + 10
+                
+        target_pos = QPoint(self.width() - toast.width() - 20, start_y)
+        
+        toast.destroyed.connect(lambda: self._active_toasts.remove(toast) if toast in self._active_toasts else None)
+        toast.show_toast(target_pos)
 
     def _center_on_screen(self):
         screen = QApplication.primaryScreen()
@@ -5811,12 +7883,11 @@ class MediaFlowWindow(QMainWindow):
         self.template_list.model().blockSignals(False)
         self.template_list.blockSignals(False)
         
+        # NOTE: only itemChanged is connected — one user action previously fired
+        # this handler 2-3x through redundant view+model signals (each run did
+        # a full fsync save + refreshed every preview row in every tab).
+        # Reorders are handled explicitly by NamingTemplateListWidget.dropEvent.
         self.template_list.itemChanged.connect(self._on_naming_template_changed)
-        self.template_list.model().dataChanged.connect(lambda topLeft, bottomRight, roles=None: self._on_naming_template_changed())
-        self.template_list.model().layoutChanged.connect(self._on_naming_template_changed)
-        self.template_list.model().rowsMoved.connect(lambda parent, start, end, dest, row: self._on_naming_template_changed())
-        self.template_list.model().rowsInserted.connect(lambda parent, start, end: self._on_naming_template_changed())
-        self.template_list.model().rowsRemoved.connect(lambda parent, start, end: self._on_naming_template_changed())
         naming_layout.addWidget(self.template_list)
 
         # Preview layout
@@ -6166,7 +8237,14 @@ class MediaFlowWindow(QMainWindow):
             name, new_type, new_query = dialog.get_values()
             self.add_smart_folder(name, new_type, new_query)
 
+    BUILTIN_PAGE_TITLES = ("videos", "images", "audio", "pdfs")
+
     def add_smart_folder(self, name: str, media_type: str, query: str):
+        # Case-insensitive dedupe against existing smart folders AND the
+        # built-in page titles (Videos/Images/Audio/PDFs) — duplicate page
+        # titles were previously allowed for built-ins.
+        if name.strip().lower() in self.BUILTIN_PAGE_TITLES:
+            QMessageBox.warning(self, "Reserved Name", f"'{name}' is a built-in page. Please choose another name."); return
         if any(f['name'].lower() == name.lower() for f in self.smart_folders_config):
             QMessageBox.warning(self, "Duplicate Folder", f"A Smart Folder named '{name}' already exists."); return
         config = {'name': name, 'type': media_type, 'query': query}
@@ -6194,7 +8272,9 @@ class MediaFlowWindow(QMainWindow):
             smart_tab = self.smart_folder_tabs.pop(name)
             self.stacked_widget.removeWidget(smart_tab)
             smart_tab.deleteLater()
-        self.smart_folders_config = [f for f in self.smart_folders_config if f['name'] != name]
+        # Case-insensitive filter to match the case-insensitive dedupe used at
+        # creation time (previously exact-case, so 'Videos' vs 'videos' drifted)
+        self.smart_folders_config = [f for f in self.smart_folders_config if f['name'].lower() != name.lower()]
         self._save_state()
         self._switch_page(0)
 
@@ -6248,20 +8328,37 @@ class MediaFlowWindow(QMainWindow):
         def _safe_call(method_name, *args):
             w = self.stacked_widget.currentWidget()
             if w is None: return
-            fn = getattr(w, method_name, None)
+            if '.' in method_name:
+                parts = method_name.split('.')
+                obj = w
+                for p in parts[:-1]:
+                    obj = getattr(obj, p, None)
+                    if obj is None: return
+                fn = getattr(obj, parts[-1], None)
+            else:
+                fn = getattr(w, method_name, None)
             if callable(fn):
                 fn(*args)
+        # Gate keyboard shortcuts on the corresponding button state — otherwise
+        # Ctrl+Z/Y/Delete fire even when the UI disabled them (e.g. after a
+        # list clear, where stale history could rename old-session files).
+        def _gated_call(method_name, button_attr, *args):
+            w = self.stacked_widget.currentWidget()
+            btn = getattr(w, button_attr, None) if w is not None else None
+            if btn is not None and not btn.isEnabled():
+                return
+            _safe_call(method_name, *args)
         shortcut_reload = QAction("Reload Files", self)
         shortcut_reload.setShortcut(QKeySequence("Ctrl+R"))
         shortcut_reload.triggered.connect(lambda: _safe_call('_on_load_files'))
         self.addAction(shortcut_reload)
         shortcut_undo = QAction("Undo Rename", self)
         shortcut_undo.setShortcut(QKeySequence("Ctrl+Z"))
-        shortcut_undo.triggered.connect(lambda: _safe_call('_on_undo_rename'))
+        shortcut_undo.triggered.connect(lambda: _gated_call('_on_undo_rename', 'btn_undo'))
         self.addAction(shortcut_undo)
         shortcut_redo = QAction("Redo Rename", self)
         shortcut_redo.setShortcut(QKeySequence("Ctrl+Y"))
-        shortcut_redo.triggered.connect(lambda: _safe_call('_on_redo_rename'))
+        shortcut_redo.triggered.connect(lambda: _gated_call('_on_redo_rename', 'btn_redo'))
         self.addAction(shortcut_redo)
         shortcut_search = QAction("Focus Search", self)
         shortcut_search.setShortcut(QKeySequence("Ctrl+F"))
@@ -6269,13 +8366,39 @@ class MediaFlowWindow(QMainWindow):
         self.addAction(shortcut_search)
         shortcut_delete = QAction("Delete Selected", self)
         shortcut_delete.setShortcut(QKeySequence("Delete"))
-        shortcut_delete.triggered.connect(lambda: _safe_call('_on_delete_selected'))
+        shortcut_delete.triggered.connect(lambda: _gated_call('_on_delete_selected', 'btn_delete'))
         self.addAction(shortcut_delete)
         shortcut_refresh = QAction("Refresh", self)
         shortcut_refresh.setShortcut(QKeySequence("F5"))
         shortcut_refresh.triggered.connect(lambda: _safe_call('_on_load_files'))
         self.addAction(shortcut_refresh)
+        
+        shortcut_dupes = QAction("Find Duplicates", self)
+        shortcut_dupes.setShortcut(QKeySequence("Ctrl+Shift+D"))
+        # FIX: was '_on_find_duplicates' (nonexistent — silently dead shortcut)
+        shortcut_dupes.triggered.connect(lambda: _safe_call('_find_exact_duplicates'))
+        self.addAction(shortcut_dupes)
 
+        shortcut_info = QAction("File Info", self)
+        shortcut_info.setShortcut(QKeySequence("Ctrl+I"))
+        # FIX: was '_show_file_info_dialog' (nonexistent — silently dead shortcut)
+        shortcut_info.triggered.connect(lambda: _safe_call('_show_file_info_dialog'))
+        self.addAction(shortcut_info)
+
+        shortcut_preview = QAction("Toggle Preview", self)
+        shortcut_preview.setShortcut(QKeySequence("Ctrl+P"))
+        shortcut_preview.triggered.connect(lambda: _safe_call('btn_toggle_preview.click'))
+        self.addAction(shortcut_preview)
+
+        shortcut_compare = QAction("Compare Selected", self)
+        shortcut_compare.setShortcut(QKeySequence("Ctrl+Shift+C"))
+        shortcut_compare.triggered.connect(lambda: _safe_call('_on_compare_selected'))
+        self.addAction(shortcut_compare)
+
+        shortcut_trim = QAction("Quick Trim", self)
+        shortcut_trim.setShortcut(QKeySequence("Ctrl+T"))
+        shortcut_trim.triggered.connect(lambda: _safe_call('_on_quick_trim'))
+        self.addAction(shortcut_trim)
     def _update_native_button_text(self):
         if self.video_tab.default_player == "native":
             self.btn_native_vp.setText("System")
@@ -6400,6 +8523,10 @@ class MediaFlowWindow(QMainWindow):
         self._save_state()
 
     def _on_naming_template_changed(self):
+        # Attribute sync stays synchronous (cheap, and close-time saves read
+        # these values), but the expensive parts — fsync disk write and the
+        # O(all rows × all tabs) preview refresh — are debounced so a drag or
+        # keystroke doesn't hammer the disk and UI.
         all_ordered = []
         checked_fields = []
         for i in range(self.template_list.count()):
@@ -6417,8 +8544,13 @@ class MediaFlowWindow(QMainWindow):
         self.naming_separator = self.separator_input.text()
         self.naming_keep_extension = self.keep_extension_checkbox.isChecked()
         self._update_template_preview()
-        self._save_state()
-        self._refresh_all_tab_previews()
+        self._debounced_save_state()
+        if not hasattr(self, '_preview_refresh_timer'):
+            self._preview_refresh_timer = QTimer(self)
+            self._preview_refresh_timer.setSingleShot(True)
+            self._preview_refresh_timer.setInterval(300)
+            self._preview_refresh_timer.timeout.connect(self._refresh_all_tab_previews)
+        self._preview_refresh_timer.start()
 
     def _update_template_preview(self):
         preview_parts = []
@@ -6455,7 +8587,7 @@ class MediaFlowWindow(QMainWindow):
             if is_maximized:
                 norm_geo = self.normalGeometry()
                 if norm_geo.width() > 100 and norm_geo.height() > 100: geo = {'x': norm_geo.x(), 'y': norm_geo.y(), 'width': norm_geo.width(), 'height': norm_geo.height()}
-                else: geo = self._normal_geometry if hasattr(self, '_normal_geometry') else {'x': self.x(), 'y': self.y(), 'width': 1120, 'height': 630}
+                else: geo = self._normal_geometry if hasattr(self, '_normal_geometry') else {'x': self.x(), 'y': self.y(), 'width': max(self.minimumWidth(), self.width()), 'height': max(self.minimumHeight(), self.height())}
             else: geo = {'x': self.x(), 'y': self.y(), 'width': self.width(), 'height': self.height()}
             state = {
                 'geometry': geo, 'maximized': is_maximized,
@@ -6465,6 +8597,8 @@ class MediaFlowWindow(QMainWindow):
                 'video_tab': self.video_tab.get_state_dict(), 'image_tab': self.image_tab.get_state_dict(), 'audio_tab': self.audio_tab.get_state_dict(), 'pdf_tab': self.pdf_tab.get_state_dict(),
                 'smart_folders': getattr(self, 'smart_folders_config', []),
                 'theme': self.theme_combo.currentText(),
+                # FIX: global mute was never persisted — every launch reset it
+                'global_mute': bool(getattr(self, 'global_mute', False)),
                 'naming_separator': self.naming_separator,
                 'naming_fields': self.naming_fields,
                 'naming_all_fields_ordered': self.naming_all_fields_ordered,
@@ -6491,30 +8625,87 @@ class MediaFlowWindow(QMainWindow):
         self._save_state_timer.start()
 
     def _load_state(self):
-        # Narrow try/except with logging — was `except Exception: pass` which
-        # silently swallowed corrupt-JSON, KeyError, and shape-mismatch errors.
+        """Load persisted state with PER-SECTION isolation.
+
+        A malformed value in one section must not abort the rest of the load.
+        Data-bearing sections (folders/tabs/naming/smart folders) set
+        _load_failed on failure so closeEvent skips saving — otherwise a
+        half-loaded session would overwrite a recoverable config on disk
+        with near-empty state.
+        """
+        self._load_failed = False
+        if not os.path.exists(CONFIG_FILE):
+            ThemeManager.apply_theme(self, "System (Auto)")
+            return
         try:
-            if not os.path.exists(CONFIG_FILE):
-                ThemeManager.apply_theme(self, "System (Auto)")
-                return
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f: state = json.load(f)
-            
+            if not isinstance(state, dict):
+                raise TypeError("config root is not a JSON object")
+        except json.JSONDecodeError as e:
+            logger.warning("Corrupt config file (%s); starting fresh: %s", CONFIG_FILE, e)
+            self._load_failed = True
+            ThemeManager.apply_theme(self, "System (Auto)")
+            return
+        except OSError as e:
+            logger.warning("Could not read config %s; starting fresh: %s", CONFIG_FILE, e)
+            self._load_failed = True
+            ThemeManager.apply_theme(self, "System (Auto)")
+            return
+
+        def run_section(label, fn, destructive=True):
+            try:
+                fn()
+            except Exception as e:
+                logger.exception("Failed to load '%s' section from config: %s", label, e)
+                if destructive:
+                    # Don't risk replacing on-disk state with a partial load
+                    self._load_failed = True
+
+        def _str_list(val):
+            if isinstance(val, list): return [v for v in val if isinstance(v, str) and v]
+            if isinstance(val, str) and val: return [val]
+            return []
+
+        # ── Theme (non-destructive) ──
+        def _theme():
             theme = state.get('theme', 'System (Auto)')
+            # Validate against combo items — setCurrentText() is a silent no-op
+            # for unknown values but apply_theme() still maps them, desyncing
+            # the UI from the applied theme.
+            items = [self.theme_combo.itemText(i) for i in range(self.theme_combo.count())]
+            if theme not in items:
+                logger.warning("Unknown saved theme %r; using System (Auto)", theme)
+                theme = 'System (Auto)'
             self.theme_combo.blockSignals(True)
             self.theme_combo.setCurrentText(theme)
             self.theme_combo.blockSignals(False)
             ThemeManager.apply_theme(self, theme)
+        run_section('theme', _theme, destructive=False)
 
-            # Restore Custom Naming Template configuration
-            # Use module-level DEFAULT_NAMING_FIELDS for consistency
-            self.naming_separator = state.get('naming_separator', ' ')
-            self.naming_fields = state.get('naming_fields', list(DEFAULT_NAMING_FIELDS))
-            self.naming_all_fields_ordered = state.get('naming_all_fields_ordered', list(DEFAULT_NAMING_FIELDS_ORDERED))
-            # Don't mutate the loaded config in-place; instead ensure the UI shows Tags
-            # without rewriting the saved field list on next save.
-            self.naming_keep_extension = state.get('naming_keep_extension', True)
-            self.open_with_apps = state.get('open_with_apps', [])
-            
+        # ── Custom Naming Template ──
+        def _naming():
+            sep = state.get('naming_separator', ' ')
+            self.naming_separator = sep if isinstance(sep, str) else ' '
+            fields = state.get('naming_fields', list(DEFAULT_NAMING_FIELDS))
+            self.naming_fields = [f for f in fields if f in FIELD_MAP.values()] if isinstance(fields, list) else list(DEFAULT_NAMING_FIELDS)
+            ordered = state.get('naming_all_fields_ordered', None)
+            if not isinstance(ordered, list):
+                ordered = list(DEFAULT_NAMING_FIELDS_ORDERED)
+            # Reconcile against FIELD_MAP: keep known fields in their saved
+            # order, drop unknown leftovers, and append fields added by newer
+            # versions so they actually appear for existing configs.
+            reconciled, seen = [], set()
+            for f_name in ordered + list(DEFAULT_NAMING_FIELDS_ORDERED):
+                if isinstance(f_name, str) and f_name in FIELD_MAP and f_name not in seen:
+                    reconciled.append(f_name); seen.add(f_name)
+            dropped = [f for f in ordered if isinstance(f, str) and f not in FIELD_MAP]
+            if dropped:
+                logger.warning("Dropping unknown naming fields from config: %s", dropped)
+            self.naming_all_fields_ordered = reconciled
+            self.naming_keep_extension = bool(state.get('naming_keep_extension', True))
+            apps = state.get('open_with_apps', [])
+            self.open_with_apps = apps if isinstance(apps, list) else []
+
             # Sync Custom Naming Template settings UI widgets
             self.separator_input.blockSignals(True)
             self.separator_input.setText(self.naming_separator)
@@ -6523,106 +8714,156 @@ class MediaFlowWindow(QMainWindow):
             self.keep_extension_checkbox.blockSignals(True)
             self.keep_extension_checkbox.setChecked(self.naming_keep_extension)
             self.keep_extension_checkbox.blockSignals(False)
-            
+
             self.template_list.blockSignals(True)
             self.template_list.model().blockSignals(True)
             self.template_list.clear()
             for f_name in self.naming_all_fields_ordered:
                 item = QListWidgetItem(f_name)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
-                # Use FIELD_MAP.get() — was dict subscript that raised KeyError on
-                # unknown field names, silently aborting the entire state load.
-                config_key = FIELD_MAP.get(f_name)
-                if config_key is None:
-                    logger.warning("Skipping unknown naming field: %s", f_name)
-                    continue
+                config_key = FIELD_MAP[f_name]
                 is_checked = config_key in self.naming_fields
                 item.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
                 self.template_list.addItem(item)
             self.template_list.model().blockSignals(False)
             self.template_list.blockSignals(False)
-            
+
             self._update_template_preview()
+        run_section('naming template', _naming)
 
+        # ── Global mute (non-destructive) ──
+        def _mute():
+            if bool(state.get('global_mute', False)) and not getattr(self, 'global_mute', False):
+                self._toggle_global_mute()
+        run_section('global mute', _mute, destructive=False)
+
+        # ── Geometry (non-destructive) ──
+        def _geometry():
             geo = state.get('geometry', {})
-            if geo:
-                self.setGeometry(geo['x'], geo['y'], geo['width'], geo['height'])
-                self._normal_geometry = geo
+            has_geo = False
+            if isinstance(geo, dict):
+                try:
+                    x, y = int(geo.get('x', 0)), int(geo.get('y', 0))
+                    w, h = int(geo.get('width', 0)), int(geo.get('height', 0))
+                except (TypeError, ValueError):
+                    logger.warning("Malformed geometry in config; using default")
+                else:
+                    if w > 100 and h > 100:
+                        self.setGeometry(x, y, w, h)
+                        self._normal_geometry = {'x': x, 'y': y, 'width': w, 'height': h}
+                        has_geo = True
             if state.get('maximized', False): self.showMaximized()
-            elif not geo: self._center_on_screen()
-            video_folders = state.get('video_folders', [])
-            self.videos_list_widget.clear()
-            self.videos_list_widget.addItems(video_folders)
-            self.video_tab.set_directories(video_folders)
-            image_folders = state.get('image_folders', [])
-            self.images_list_widget.clear()
-            self.images_list_widget.addItems(image_folders)
-            self.image_tab.set_directories(image_folders)
-            audio_folders = state.get('audio_folders', [])
-            self.audio_list_widget.clear()
-            self.audio_list_widget.addItems(audio_folders)
-            self.audio_tab.set_directories(audio_folders)
-            pdf_folders = state.get('pdf_folders', [])
-            self.pdf_list_widget.clear()
-            self.pdf_list_widget.addItems(pdf_folders)
-            self.pdf_tab.set_directories(pdf_folders)
-            vp = state.get('default_video_player', '')
-            if vp:
-                if vp == "native":
-                    self.video_tab.default_player = "native"
-                    self.video_player_label.setText("Native Player")
-                elif os.path.exists(vp):
-                    self.video_tab.default_player = vp
-                    app_name = os.path.splitext(os.path.basename(vp))[0]
-                    self.video_player_label.setText(f"{app_name}\n{vp}")
-            self._update_native_button_text()
+            elif not has_geo: self._center_on_screen()
+        run_section('geometry', _geometry, destructive=False)
 
+        # ── Source folder lists + per-tab directories ──
+        video_folders = image_folders = audio_folders = pdf_folders = []
+
+        def _folders():
+            nonlocal video_folders, image_folders, audio_folders, pdf_folders
+            pairs = [
+                ('video_folders', self.videos_list_widget, self.video_tab),
+                ('image_folders', self.images_list_widget, self.image_tab),
+                ('audio_folders', self.audio_list_widget, self.audio_tab),
+                ('pdf_folders', self.pdf_list_widget, self.pdf_tab),
+            ]
+            for key, widget, tab in pairs:
+                folders = _str_list(state.get(key, []))
+                widget.clear()
+                widget.addItems(folders)   # addItems(str) would insert every CHARACTER as an item
+                tab.set_directories(folders)
+                if key == 'video_folders': video_folders = folders
+                elif key == 'image_folders': image_folders = folders
+                elif key == 'audio_folders': audio_folders = folders
+                elif key == 'pdf_folders': pdf_folders = folders
+        run_section('source folders', _folders)
+
+        # ── Default external players (non-destructive) ──
+        def _players():
+            vp = state.get('default_video_player', '')
+            if vp == "native":
+                self.video_tab.default_player = "native"
+                self.video_player_label.setText("Native Player")
+            elif isinstance(vp, str) and vp and os.path.exists(vp):
+                self.video_tab.default_player = vp
+                app_name = os.path.splitext(os.path.basename(vp))[0]
+                self.video_player_label.setText(f"{app_name}\n{vp}")
             io = state.get('default_image_opener', '')
-            if io:
-                if io == "native":
-                    self.image_tab.default_player = "native"
-                    self.image_opener_label.setText("Native Viewer")
-                elif os.path.exists(io):
-                    self.image_tab.default_player = io
-                    app_name = os.path.splitext(os.path.basename(io))[0]
-                    self.image_opener_label.setText(f"{app_name}\n{io}")
+            if io == "native":
+                self.image_tab.default_player = "native"
+                self.image_opener_label.setText("Native Viewer")
+            elif isinstance(io, str) and io and os.path.exists(io):
+                self.image_tab.default_player = io
+                app_name = os.path.splitext(os.path.basename(io))[0]
+                self.image_opener_label.setText(f"{app_name}\n{io}")
             ap = state.get('default_audio_player', '')
-            if ap:
-                if ap == "native":
-                    self.audio_tab.default_player = "native"
-                    self.audio_player_label.setText("Native Player")
-                elif os.path.exists(ap):
-                    self.audio_tab.default_player = ap
-                    app_name = os.path.splitext(os.path.basename(ap))[0]
-                    self.audio_player_label.setText(f"{app_name}\n{ap}")
+            if ap == "native":
+                self.audio_tab.default_player = "native"
+                self.audio_player_label.setText("Native Player")
+            elif isinstance(ap, str) and ap and os.path.exists(ap):
+                self.audio_tab.default_player = ap
+                app_name = os.path.splitext(os.path.basename(ap))[0]
+                self.audio_player_label.setText(f"{app_name}\n{ap}")
             po = state.get('default_pdf_opener', '')
-            if po and po != "native":
-                if os.path.exists(po):
-                    self.pdf_tab.default_player = po
-                    app_name = os.path.splitext(os.path.basename(po))[0]
-                    self.pdf_opener_label.setText(f"{app_name}\n{po}")
+            if po != "native" and isinstance(po, str) and po and os.path.exists(po):
+                self.pdf_tab.default_player = po
+                app_name = os.path.splitext(os.path.basename(po))[0]
+                self.pdf_opener_label.setText(f"{app_name}\n{po}")
             self._update_native_button_text()
+        run_section('default players', _players, destructive=False)
+
+        # ── FFprobe path (#25: only accept existing files) ──
+        def _ffprobe():
             fp = state.get('ffprobe_path', '')
-            self.ffprobe_path = fp
-            if fp and os.path.exists(fp):
+            if isinstance(fp, str) and fp and os.path.exists(fp):
+                self.ffprobe_path = fp
                 app_name = os.path.splitext(os.path.basename(fp))[0]
                 self.ffprobe_path_label.setText(f"{app_name}\n{fp}")
-            if 'video_tab' in state: self.video_tab.load_state_dict(state['video_tab'])
-            if 'image_tab' in state: self.image_tab.load_state_dict(state['image_tab'])
-            if 'audio_tab' in state: self.audio_tab.load_state_dict(state['audio_tab'])
-            if 'pdf_tab' in state: self.pdf_tab.load_state_dict(state['pdf_tab'])
+            else:
+                if fp:
+                    logger.warning("Ignoring stored ffprobe path that no longer exists: %s", fp)
+                self.ffprobe_path = ''
+        run_section('ffprobe path', _ffprobe, destructive=False)
+
+        # ── Per-tab file metadata (artist/rating/tags/columns/history) ──
+        def _tabs():
+            for key, tab in (('video_tab', self.video_tab), ('image_tab', self.image_tab),
+                             ('audio_tab', self.audio_tab), ('pdf_tab', self.pdf_tab)):
+                raw = state.get(key)
+                if isinstance(raw, dict):
+                    tab.load_state_dict(raw)
+        run_section('tab state', _tabs)
+
+        # ── Kick off initial scans ──
+        try:
             if video_folders: self.video_tab._start_scan(video_folders)
             if image_folders: self.image_tab._start_scan(image_folders)
             if audio_folders: self.audio_tab._start_scan(audio_folders)
             if pdf_folders: self.pdf_tab._start_scan(pdf_folders)
+        except Exception as e:
+            logger.exception("Failed to start initial scans: %s", e)
+            self._load_failed = True
+
+        # ── Smart folders ──
+        def _smart():
             smart_folders = state.get('smart_folders', [])
+            if not isinstance(smart_folders, list): return
             for sf in smart_folders:
                 try:
+                    if not isinstance(sf, dict):
+                        raise TypeError("entry is not an object")
                     name = sf['name']; media_type = sf['type']; query = sf['query']
-                except KeyError as ke:
-                    logger.warning("Skipping malformed smart folder entry (missing %s): %s", ke, sf)
+                    if not isinstance(name, str) or not name.strip():
+                        raise TypeError("'name' must be a non-empty string")
+                    if media_type not in ('video', 'image', 'audio', 'pdf', 'all'):
+                        raise ValueError(f"unknown media type {media_type!r}")
+                    if not isinstance(query, str): query = str(query)
+                except (KeyError, TypeError, ValueError) as se:
+                    # Broadened from KeyError-only: non-dict entries / non-string
+                    # names previously escaped and aborted the whole load.
+                    logger.warning("Skipping malformed smart folder entry (%s): %s", se, sf)
                     continue
-                if any(f['name'].lower() == name.lower() for f in self.smart_folders_config): continue
+                if any(isinstance(f, dict) and f['name'].lower() == name.lower() for f in self.smart_folders_config): continue
                 config = {'name': name, 'type': media_type, 'query': query}
                 self.smart_folders_config.append(config)
                 smart_tab = MediaTab(media_type, smart_query=query, is_smart_folder=True)
@@ -6634,16 +8875,7 @@ class MediaFlowWindow(QMainWindow):
                 idx = self.smart_container_layout.count() - 1
                 self.smart_container_layout.insertWidget(idx, nav_item)
                 self.smart_folder_nav_items[name] = nav_item
-        except json.JSONDecodeError as e:
-            logger.warning("Corrupt config file (%s); starting fresh: %s", CONFIG_FILE, e)
-            ThemeManager.apply_theme(self, "System (Auto)")
-        except (OSError, KeyError, ValueError, TypeError) as e:
-            logger.exception("Failed to load MediaFlow state from %s: %s", CONFIG_FILE, e)
-            # Try to apply default theme at least so the window isn't unstyled
-            try:
-                ThemeManager.apply_theme(self, "System (Auto)")
-            except Exception:
-                pass
+        run_section('smart folders', _smart)
 
     def resizeEvent(self, event):
         if not self.isMaximized() and not self.isFullScreen():
@@ -6658,7 +8890,15 @@ class MediaFlowWindow(QMainWindow):
         super().moveEvent(event)
 
     def closeEvent(self, event):
-        self._save_state()
+        # Stop any pending debounced save so it can't fire during teardown
+        if hasattr(self, '_save_state_timer'):
+            self._save_state_timer.stop()
+        # FIX: never overwrite a config we failed to load — a half-initialized
+        # session would replace recoverable on-disk state with near-empty data.
+        if getattr(self, '_load_failed', False):
+            logger.warning("Skipping state save on close: config failed to load earlier; preserving original file.")
+        else:
+            self._save_state()
         super().closeEvent(event)
 
     def _toggle_global_mute(self):
@@ -6855,7 +9095,12 @@ class MediaFlowWindow(QMainWindow):
             elif active_tab.media_type == 'image': allowed_exts = IMAGE_EXTENSIONS
             elif active_tab.media_type == 'audio': allowed_exts = AUDIO_EXTENSIONS
             elif active_tab.media_type == 'pdf': allowed_exts = PDF_EXTENSIONS
-            valid_files = [f for f in files if os.path.splitext(f)[1].lower() in allowed_exts]
+            else:
+                # 'all' / smart folders: accept the full supported union plus
+                # extensionless files (was empty set → drops silently ignored)
+                allowed_exts = get_extensions_for_type(active_tab.media_type)
+            valid_files = [f for f in files
+                           if os.path.splitext(f)[1].lower() in allowed_exts or not os.path.splitext(f)[1]]
             if valid_files:
                 was_sorting = active_tab.table.isSortingEnabled()
                 active_tab.table.setSortingEnabled(False)
