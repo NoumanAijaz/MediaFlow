@@ -21,3 +21,7 @@ dist/
 
 # Project specific
 config.json
+scan_cache.json
+rename_audit.csv
+*.log
+*.tmp

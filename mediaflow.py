@@ -31,9 +31,10 @@ if not logger.handlers:
 _ICON_CACHE = {}
 
 # Single source of truth for naming field mappings
-FIELD_MAP = {"Name": "name", "Duration": "duration", "Resolution": "resolution", "Rating": "rating", "Tags": "tags"}
+FIELD_MAP = {"Name": "name", "Duration": "duration", "Resolution": "resolution", "Rating": "rating", "Tags": "tags",
+             "Date Taken": "date_taken", "Year-Month": "ym"}  # date fields: EXIF for photos, mtime fallback
 DEFAULT_NAMING_FIELDS = ["name", "duration", "resolution", "rating", "tags"]
-DEFAULT_NAMING_FIELDS_ORDERED = ["Name", "Duration", "Resolution", "Rating", "Tags"]
+DEFAULT_NAMING_FIELDS_ORDERED = ["Name", "Duration", "Resolution", "Rating", "Tags", "Date Taken", "Year-Month"]
 
 # Lock to serialize OpenCV calls (FFmpeg backend is not guaranteed thread-safe)
 _CV_LOCK = threading.Lock()
@@ -53,13 +54,14 @@ from PyQt6.QtWidgets import (
     QFrame, QAbstractItemView, QMenu, QCheckBox, QDialog, QDialogButtonBox, QRadioButton,
     QFormLayout, QGroupBox, QStackedWidget, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QSlider, QScrollArea, QStyle, QSpinBox, QDoubleSpinBox,
-    QSplitter, QSizePolicy, QInputDialog, QTableWidgetSelectionRange
+    QSplitter, QSizePolicy, QInputDialog, QTableWidgetSelectionRange, QDateEdit
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, pyqtSlot, QPropertyAnimation, QEasingCurve,
     QTimer, QSize, QRect, QUrl, QPoint, QPointF, QRectF, QEvent, QObject, QThreadPool, QRunnable,
-    QEventLoop
+    QEventLoop, QDate, QDateTime
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QFont, QColor, QIcon, QPalette, QPainter,
     QAction, QPixmap, QKeySequence, QImage, QBrush, QGuiApplication,
@@ -104,7 +106,28 @@ def get_extensions_for_type(media_type: str) -> set[str]:
     elif media_type == 'pdf': return PDF_EXTENSIONS
     else: return VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
 
-CONFIG_DIR = os.path.join(os.environ.get('APPDATA', '.'), 'MediaFlow')
+def _resolve_config_dir() -> str:
+    """Resolve where MediaFlow stores its config.
+
+    Portable mode: if a 'MediaFlow.portable' flag file sits next to the
+    executable (or the .py script), all config lives in 'MediaFlowData/'
+    beside it instead of %APPDATA% — USB / no-install friendly.
+    Otherwise: %APPDATA%/MediaFlow on Windows, ~/.config/MediaFlow on
+    Linux/macOS (avoids polluting CWD when APPDATA is unset).
+    """
+    base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(base, "MediaFlow.portable")):
+        return os.path.join(base, "MediaFlowData")
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        return os.path.join(appdata, 'MediaFlow')
+    # Linux/macOS fallback — XDG or HOME
+    xdg = os.environ.get('XDG_CONFIG_HOME')
+    if xdg:
+        return os.path.join(xdg, 'MediaFlow')
+    return os.path.join(os.path.expanduser('~'), '.config', 'MediaFlow')
+
+CONFIG_DIR = _resolve_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 
 def get_resource_path(relative_path):
@@ -175,6 +198,15 @@ def format_duration(total_seconds: float) -> str:
         return f"{minutes}m {seconds:02d}s"
     else:
         return f"{seconds}s"
+
+def format_timestamp(ts: float) -> str:
+    """Human date for table cells ('—' when unknown)."""
+    try:
+        if ts and ts > 0:
+            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError, TypeError):
+        pass
+    return "—"
 
 def format_size(size_bytes: int) -> str:
     if size_bytes <= 0: return "0 B"
@@ -515,6 +547,121 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
         return canvas
     except Exception as e:
         logger.warning("generate_thumbnail failed for %s: %s", filepath, e)
+        return None
+
+# ─── EXIF / Sidecar helpers ─────────────────────────────────────────────────────
+
+_SIDECAR_EXTS = {'.srt', '.ass', '.ssa', '.sub', '.vtt', '.nfo'}
+
+def find_sidecars(filepath: str) -> list[str]:
+    """Sibling subtitle/NFO files sharing this file's stem (plus optional
+    language tags like movie.en.srt) — they follow the video on rename/move."""
+    base = os.path.splitext(filepath)[0]
+    parent = os.path.dirname(filepath)
+    stem = os.path.basename(base)
+    low = stem.lower()
+    found = []
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        return found
+    for name in entries:
+        full = os.path.join(parent, name)
+        if full == filepath or not os.path.isfile(full):
+            continue
+        nlow = name.lower()
+        ext = os.path.splitext(nlow)[1]
+        if ext not in _SIDECAR_EXTS or not nlow.startswith(low) or len(nlow) <= len(low):
+            continue
+        mid = nlow[len(low):-len(ext)]
+        # Accept exact stem, or a short language marker (.en / -de / _pt-br …)
+        if mid == "" or re.fullmatch(r"[\.\-_ ]{1,3}[a-z]{2,3}(?:[-_][a-z]{2,4})?", mid):
+            found.append(full)
+    return found
+
+def _exif_datetime_original(filepath: str) -> datetime | None:
+    """Read DateTimeOriginal/CreateDate from JPEG (APP1 Exif) or TIFF files."""
+    try:
+        with open(filepath, 'rb') as f:
+            head = f.read(2)
+            tiff_data = None
+            if head == b"\xff\xd8":  # JPEG — scan segments for APP1/Exif
+                while True:
+                    b = f.read(2)
+                    if len(b) < 2: return None
+                    marker = b[1]
+                    # Standalone markers (SOI/TEM/RSTn) have no length/payload — must not consume bytes
+                    if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                        continue
+                    sz_bytes = f.read(2)
+                    if len(sz_bytes) < 2: return None
+                    size = int.from_bytes(sz_bytes, "big")
+                    if size < 2: return None
+                    payload = f.read(size - 2)
+                    if len(payload) < size - 2: return None
+                    if marker == 0xDA: return None  # start of scan — no Exif found
+                    if marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+                        tiff_data = payload[6:]
+                        break
+            elif head in (b"II", b"MM"):
+                f.seek(0)
+                tiff_data = f.read()
+            if not tiff_data or len(tiff_data) < 16:
+                return None
+
+            endian = "little" if tiff_data[:2] == b"II" else "big"
+            ifd0 = int.from_bytes(tiff_data[4:8], endian)
+
+            def rd(off, n): return tiff_data[off:off + n]
+
+            def walk_ifd(ifd_off, want):
+                vals = {}
+                if ifd_off + 2 > len(tiff_data):
+                    return vals
+                cnt = int.from_bytes(rd(ifd_off, 2), endian)
+                if ifd_off + 2 + cnt * 12 > len(tiff_data):
+                    return vals
+                for i in range(cnt):
+                    e = ifd_off + 2 + i * 12
+                    if e + 12 > len(tiff_data):
+                        break
+                    tag = int.from_bytes(rd(e, 2), endian)
+                    typ = int.from_bytes(rd(e + 2, 2), endian)
+                    num = int.from_bytes(rd(e + 4, 4), endian)
+                    if tag in want and typ == 2:
+                        if num <= 4:
+                            vo = e + 8
+                        else:
+                            vo = int.from_bytes(rd(e + 8, 4), endian)
+                            if vo + num > len(tiff_data):
+                                continue
+                        vals[tag] = rd(vo, max(0, num - 1)).decode("ascii", "replace")
+                    elif tag == 0x8769:
+                        if typ != 4:  # must be LONG
+                            continue
+                        sub = int.from_bytes(rd(e + 8, 4), endian)
+                        if sub < len(tiff_data):
+                            vals.update(walk_ifd(sub, want))
+                return vals
+
+            got = walk_ifd(ifd0, {0x9003, 0x9004, 0x0132})
+            raw = got.get(0x9003) or got.get(0x9004) or got.get(0x0132)
+            if raw:
+                return datetime.strptime(raw.strip()[:19], "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return None
+    return None
+
+def get_media_datetime(info) -> datetime | None:
+    """Best capture-time guess: EXIF for images, else file modified time."""
+    if getattr(info, 'media_type', '') == 'image':
+        dt = _exif_datetime_original(info.filepath)
+        if dt is not None:
+            return dt
+    ts = float(getattr(info, 'mtime', 0) or 0)
+    try:
+        return datetime.fromtimestamp(ts) if ts > 0 else None
+    except (OverflowError, OSError, ValueError):
         return None
 
 def send_to_recycle_bin(path: str) -> bool:
@@ -1277,6 +1424,21 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 QLabel[heading="true"] { font-size: 12px; font-weight: 700; color: #4338ca; text-transform: uppercase; letter-spacing: 1px; margin-top: 6px; }
 """
 
+def scale_stylesheet(css: str, scale: float) -> str:
+    """Scale every explicit font-size in a stylesheet.
+
+    Qt px-based stylesheet rules ignore QApplication.setFont(), so the UI-size
+    setting must rewrite them. Keeps at least 8px for legibility.
+    """
+    if not scale or scale == 1.0:
+        return css
+    return re.sub(r'font-size:\s*(\d+(?:\.\d+)?)px',
+                  lambda m: f"font-size: {max(8, round(float(m.group(1)) * scale))}px",
+                  css)
+
+def _scale_stylesheet(css: str, scale: float) -> str:  # legacy alias
+    return scale_stylesheet(css, scale)
+
 class ThemeManager:
     @staticmethod
     def get_system_theme():
@@ -1294,17 +1456,18 @@ class ThemeManager:
         return "light"
 
     @staticmethod
-    def apply_theme(window, theme_choice):
+    def apply_theme(window, theme_choice, ui_scale=None):
         app = QApplication.instance()
         if theme_choice == "System (Auto)":
             actual_theme = ThemeManager.get_system_theme()
         else:
             actual_theme = "dark" if "Dark" in theme_choice else "light"
-            
+
         window.current_theme = actual_theme
         is_dark = (actual_theme == "dark")
-        
-        app.setStyleSheet(DARK_STYLESHEET if is_dark else LIGHT_STYLESHEET)
+        scale = ui_scale if ui_scale is not None else float(getattr(window, 'ui_scale', 1.0) or 1.0)
+
+        app.setStyleSheet(scale_stylesheet(DARK_STYLESHEET if is_dark else LIGHT_STYLESHEET, scale))
         
         palette = QPalette()
         if is_dark:
@@ -1487,6 +1650,14 @@ class MediaInfo:
             self.size_bytes = cached_data.get('size_bytes', 0)
             self.size_formatted = cached_data.get('size_formatted', "—")
             self.tags = cached_data.get('tags', [])
+            self.mtime = float(cached_data.get('mtime', 0) or 0)
+            self.ctime = float(cached_data.get('ctime', 0) or 0)
+            # Backfill for old caches that never stored ctime
+            if self.ctime == 0.0:
+                try:
+                    self.ctime = float(os.stat(filepath).st_ctime)
+                except OSError:
+                    pass
         else:
             self.width = 0
             self.height = 0
@@ -1499,9 +1670,14 @@ class MediaInfo:
             self.size_bytes = 0
             self.size_formatted = "—"
             self.tags = []
+            self.mtime = 0.0
+            self.ctime = 0.0
             try:
                 if os.path.exists(filepath):
-                    self.size_bytes = os.path.getsize(filepath)
+                    st_ = os.stat(filepath)
+                    self.mtime = float(st_.st_mtime)
+                    self.ctime = float(getattr(st_, 'st_ctime', 0))
+                    self.size_bytes = st_.st_size
                     if self.size_bytes >= 1024**3: self.size_formatted = f"{self.size_bytes / (1024**3):.2f} GB"
                     elif self.size_bytes >= 1024**2: self.size_formatted = f"{self.size_bytes / (1024**2):.1f} MB"
                     elif self.size_bytes >= 1024: self.size_formatted = f"{self.size_bytes / 1024:.0f} KB"
@@ -1643,6 +1819,46 @@ class ScannerThread(QThread):
             elif pattern in filename: return True
         return False
 
+    @staticmethod
+    def _process_scan_item(item, cache, force_full, media_type):
+        """Decide cached-vs-fresh for one scanned file.
+
+        Returns (MediaInfo, entry_data|None): entry_data None means the cache
+        was used. Size must match exactly AND mtime within tolerance (JSON
+        round-trips lose ns precision); any mismatch re-extracts fresh.
+        """
+        vpath, size, mtime = item
+        cached_entry = cache.get(vpath)
+        use_cache = (
+            not force_full
+            and cached_entry is not None
+            and cached_entry.get('size') == size
+            # mtime tolerance: JSON round-trips may lose ns precision vs stat;
+            # a real modification falls through to fresh extraction below.
+            and abs(float(cached_entry.get('mtime', -1) or -1) - float(mtime)) < 0.001
+        )
+        if use_cache:
+            info = MediaInfo(vpath, media_type, cached_data=cached_entry)
+            return info, None
+
+        info = MediaInfo(vpath, media_type)
+        entry_data = {
+            'size': size,
+            'mtime': mtime,
+            'ctime': float(getattr(info, 'ctime', 0) or 0),
+            'width': info.width,
+            'height': info.height,
+            'duration_seconds': info.duration_seconds,
+            'duration_formatted': info.duration_formatted,
+            'resolution_tag': info.resolution_tag,
+            'duration_compact': info.duration_compact,
+            'is_valid': info.is_valid,
+            'error_message': info.error_message,
+            'size_bytes': info.size_bytes,
+            'size_formatted': info.size_formatted
+        }
+        return info, entry_data
+
     def run(self):
         paths_with_stats = []
         self.status_update.emit("Scanning directories…")
@@ -1692,37 +1908,13 @@ class ScannerThread(QThread):
         except Exception:
             pass
 
-        def process_path(item):
-            vpath, size, mtime = item
-            cached_entry = cache.get(vpath)
-            if not self.force_full and cached_entry and cached_entry.get('size') == size and cached_entry.get('mtime') == mtime:
-                info = MediaInfo(vpath, self.media_type, cached_data=cached_entry)
-                return info, None
-            else:
-                info = MediaInfo(vpath, self.media_type)
-                entry_data = {
-                    'size': size,
-                    'mtime': mtime,
-                    'width': info.width,
-                    'height': info.height,
-                    'duration_seconds': info.duration_seconds,
-                    'duration_formatted': info.duration_formatted,
-                    'resolution_tag': info.resolution_tag,
-                    'duration_compact': info.duration_compact,
-                    'is_valid': info.is_valid,
-                    'error_message': info.error_message,
-                    'size_bytes': info.size_bytes,
-                    'size_formatted': info.size_formatted
-                }
-                return info, entry_data
-
         new_entries = {}
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        
+
         # Use a safe worker pool for CPU/IO operations
         num_workers = min(8, os.cpu_count() or 4)
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(process_path, item): idx for idx, item in enumerate(paths_with_stats)}
+            futures = {executor.submit(self._process_scan_item, item, cache, self.force_full, self.media_type): idx for idx, item in enumerate(paths_with_stats)}
             for idx, future in enumerate(as_completed(futures)):
                 if self.isInterruptionRequested():
                     executor.shutdown(wait=False, cancel_futures=True)
@@ -2923,6 +3115,84 @@ class DeepMetadataWorker(QThread):
             self.metadata_ready.emit(None)
 
 
+class AudioTagEditorDialog(QDialog):
+    """Edit embedded audio tags (ID3/Vorbis/MP4) via mutagen's easy API.
+
+    Writes title/artist/album/genre/date straight back into the file so the
+    changes are visible in every other player, too.
+    """
+    FIELDS = ("title", "artist", "album", "genre", "date")
+
+    def __init__(self, filepath: str, parent=None):
+        super().__init__(parent)
+        self.filepath = filepath
+        self.setWindowTitle(f"Edit Audio Tags \u2014 {os.path.basename(filepath)}")
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        self._edits = {}
+        form = QFormLayout()
+        labels = {"title": "Title:", "artist": "Artist:", "album": "Album:",
+                  "genre": "Genre:", "date": "Year / Date:"}
+        for key in self.FIELDS:
+            edit = QLineEdit()
+            self._edits[key] = edit
+            form.addRow(labels[key], edit)
+        layout.addLayout(form)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #9ca3af; font-size: 11px;")
+        layout.addWidget(self.status_lbl)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._mutagen_ok = True
+        self._load_tags()
+
+    def _load_tags(self):
+        try:
+            from mutagen import File as MutagenFile
+            mfile = MutagenFile(self.filepath, easy=True)
+            if mfile is None:
+                raise ValueError("Unsupported audio format for tagging.")
+            for key in self.FIELDS:
+                vals = mfile.get(key, [])
+                self._edits[key].setText(str(vals[0]) if vals else "")
+            self.status_lbl.setText(os.path.basename(self.filepath))
+        except ImportError:
+            self._mutagen_ok = False
+            self.status_lbl.setText("mutagen is not installed \u2014 run: pip install mutagen")
+            self.status_lbl.setStyleSheet("color: #f87171; font-size: 11px;")
+        except Exception as e:
+            self._mutagen_ok = False
+            self.status_lbl.setText(f"Could not read tags: {e}")
+            self.status_lbl.setStyleSheet("color: #f87171; font-size: 11px;")
+
+    def get_values(self) -> dict:
+        return {k: self._edits[k].text().strip() for k in self.FIELDS}
+
+    def save(self):
+        if not self._mutagen_ok:
+            raise RuntimeError("mutagen is not installed")
+        from mutagen import File as MutagenFile
+        mfile = MutagenFile(self.filepath, easy=True)
+        if mfile is None:
+            raise ValueError("Unsupported audio format for tagging.")
+        values = self.get_values()
+        for key in self.FIELDS:
+            val = values[key]
+            if val:
+                mfile[key] = [val]
+            else:
+                mfile.pop(key, None)  # emptied field clears the tag on purpose
+        mfile.save()
+
+
 class DetailedInfoDialog(QDialog):
     def __init__(self, filepath: str, custom_ffprobe_path: str = None, parent=None):
         super().__init__(parent)
@@ -3329,7 +3599,17 @@ class ToastNotification(QWidget):
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.hide_toast)
 
+    def _motion_reduced(self):
+        return bool(getattr(self.parent(), 'reduced_motion', False))
+
     def show_toast(self, target_pos):
+        if self._motion_reduced():
+            # Reduced motion: appear in place, no slide/fade
+            self.setWindowOpacity(0.9)
+            self.move(target_pos)
+            self.show()
+            self.timer.start(3000)
+            return
         self.setWindowOpacity(0.0)
         self.move(target_pos.x(), target_pos.y() + 20)
         self.show()
@@ -3338,16 +3618,22 @@ class ToastNotification(QWidget):
         self.pos_anim.setEndValue(target_pos)
         self.opacity_anim.setStartValue(0.0)
         self.opacity_anim.setEndValue(0.9)
-        
+
         self.pos_anim.start()
         self.opacity_anim.start()
-        
+
         self.timer.start(3000)
 
     def hide_toast(self):
+        if self._motion_reduced():
+            self.close(); return
+        try:
+            self.opacity_anim.finished.disconnect()
+        except TypeError:
+            pass
+        self.opacity_anim.finished.connect(self.close)
         self.opacity_anim.setStartValue(self.windowOpacity())
         self.opacity_anim.setEndValue(0.0)
-        self.opacity_anim.finished.connect(self.close)
         self.opacity_anim.start()
 
 class DoubleClickVideoWidget(QVideoWidget):
@@ -4516,7 +4802,8 @@ class _ThumbnailRunnable(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            image = generate_thumbnail(self.info.filepath, self.info.media_type)
+            tw_, th_ = self.parent_tab._thumb_dims()
+            image = generate_thumbnail(self.info.filepath, self.info.media_type, width=tw_, height=th_)
         except Exception as e:
             logger.warning("Thumbnail generation failed for %s: %s", self.info.filepath, e)
             image = None
@@ -4569,8 +4856,10 @@ class MediaTab(QWidget):
     COL_RATING     = 7
     COL_TAGS       = 8
     COL_PREVIEW    = 9
-    NUM_COLS       = 10
-    HEADERS = ["Preview", "Status", "File Name", "Size", "Resolution", "Duration", "Name", "Rating", "Tags", "New Name Preview"]
+    COL_DATE_MOD   = 10   # optional â€” hidden by default, toggle via header menu
+    COL_DATE_CREATED = 11 # optional â€” hidden by default
+    NUM_COLS       = 12
+    HEADERS = ["Preview", "Status", "File Name", "Size", "Resolution", "Duration", "Name", "Rating", "Tags", "New Name Preview", "Modified", "Created"]
 
     def __init__(self, media_type: str, smart_query: str = "", is_smart_folder: bool = False):
         super().__init__()
@@ -4761,6 +5050,30 @@ class MediaTab(QWidget):
         advanced_layout.addWidget(self.adv_dur_min)
         advanced_layout.addWidget(QLabel("-"))
         advanced_layout.addWidget(self.adv_dur_max)
+
+        # Modified-date range — 'Any' sentinels sit at the min/max bounds
+        advanced_layout.addWidget(QLabel("Modified:"))
+        self.adv_date_from = QDateEdit()
+        self.adv_date_from.setCalendarPopup(True)
+        self.adv_date_from.setDisplayFormat("yyyy-MM-dd")
+        self.adv_date_from.setMinimumDate(QDate(2000, 1, 1))
+        self.adv_date_from.setMaximumDate(QDate(9999, 12, 31))
+        self.adv_date_from.setDate(self.adv_date_from.minimumDate())
+        self.adv_date_from.setSpecialValueText("Any")
+        self.adv_date_from.setToolTip("Only show files modified on/after this date ('Any' disables)")
+        self.adv_date_from.dateChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(self.adv_date_from)
+        advanced_layout.addWidget(QLabel("\u2192"))
+        self.adv_date_to = QDateEdit()
+        self.adv_date_to.setCalendarPopup(True)
+        self.adv_date_to.setDisplayFormat("yyyy-MM-dd")
+        self.adv_date_to.setMinimumDate(QDate(2000, 1, 1))
+        self.adv_date_to.setMaximumDate(QDate(9999, 12, 31))
+        self.adv_date_to.setDate(self.adv_date_to.maximumDate())
+        self.adv_date_to.setSpecialValueText("Any")
+        self.adv_date_to.setToolTip("Only show files modified on/before this date ('Any' disables)")
+        self.adv_date_to.dateChanged.connect(lambda: self._filter_timer.start())
+        advanced_layout.addWidget(self.adv_date_to)
         
         self.adv_size_min = QDoubleSpinBox()
         self.adv_size_min.setRange(0, 99999)
@@ -4828,6 +5141,13 @@ class MediaTab(QWidget):
         self.table.setColumnWidth(self.COL_TAGS, 180)
         header.setSectionResizeMode(self.COL_PREVIEW, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(self.COL_PREVIEW, 300)
+        header.setSectionResizeMode(self.COL_DATE_MOD, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(self.COL_DATE_MOD, 140)
+        header.setSectionResizeMode(self.COL_DATE_CREATED, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(self.COL_DATE_CREATED, 140)
+        # Optional metadata columns â€” off until the user enables them
+        self.table.setColumnHidden(self.COL_DATE_MOD, True)
+        self.table.setColumnHidden(self.COL_DATE_CREATED, True)
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         header.customContextMenuRequested.connect(self._on_header_context_menu)
         self.table.setItemDelegateForColumn(self.COL_ARTIST, NoTextDelegate(self))
@@ -4850,8 +5170,12 @@ class MediaTab(QWidget):
         self.grid_view.setViewMode(QListWidget.ViewMode.IconMode)
         self.grid_view.setResizeMode(QListWidget.ResizeMode.Adjust)
         self.grid_view.setSpacing(16)
-        self.grid_view.setIconSize(QSize(120, 68))
-        self.grid_view.setGridSize(QSize(150, 120))
+        # Thumbnail box width — Appearance slider adjusts; drives table rows,
+        # grid icons and worker-generated pixmaps alike.
+        self.thumb_size = 130
+        _ts_w, _ts_h = self.thumb_size, int(round(self.thumb_size * 0.567))
+        self.grid_view.setIconSize(QSize(_ts_w, _ts_h))
+        self.grid_view.setGridSize(QSize(_ts_w + 20, _ts_h + 50))
         self.grid_view.setWordWrap(True)
         self.grid_view.itemSelectionChanged.connect(self._on_grid_selection_changed)
         self.grid_view.itemDoubleClicked.connect(self._on_grid_item_double_clicked)
@@ -4892,6 +5216,10 @@ class MediaTab(QWidget):
         bottom_row1.addWidget(self.status_label, 1)
         bottom_row1.addWidget(self.btn_undo)
         bottom_row1.addWidget(self.btn_redo)
+        # Live selection summary ("N selected · size") for quick bulk sanity
+        self.sel_stats_label = QLabel("")
+        self.sel_stats_label.setObjectName("folderPathLabel")
+        bottom_row1.addWidget(self.sel_stats_label)
         bottom_row2 = QHBoxLayout()
         bottom_row2.setContentsMargins(0, 0, 0, 0)
         bottom_row2.setSpacing(8)
@@ -5072,6 +5400,8 @@ class MediaTab(QWidget):
 
     def _clear_advanced_filters(self):
         self.adv_res.setCurrentIndex(0)
+        self.adv_date_from.setDate(self.adv_date_from.minimumDate())
+        self.adv_date_to.setDate(self.adv_date_to.maximumDate())
         self.adv_dur_min.setValue(0)
         self.adv_dur_max.setValue(0)
         self.adv_size_min.setValue(0)
@@ -5087,8 +5417,13 @@ class MediaTab(QWidget):
         sz_min = self.adv_size_min.value()
         sz_max = self.adv_size_max.value()
         rat_idx = self.adv_rating.currentIndex()
+        date_from = self.adv_date_from.date()
+        date_to = self.adv_date_to.date()
+        date_active = (date_from != self.adv_date_from.minimumDate()
+                       or date_to != self.adv_date_to.maximumDate())
 
-        if res_idx == 0 and dur_min == 0 and dur_max == 0 and sz_min == 0 and sz_max == 0 and rat_idx <= 0:
+        if res_idx == 0 and dur_min == 0 and dur_max == 0 and sz_min == 0 and sz_max == 0 \
+                and rat_idx <= 0 and not date_active:
             return
 
         sz_multiplier = 1024 * 1024
@@ -5121,6 +5456,14 @@ class MediaTab(QWidget):
                 if d < dur_min or d > dur_max: keep = False
             elif keep and dur_min > 0:
                 if info.duration_seconds < dur_min: keep = False
+
+            # Modified date range (local time, matches os.stat display)
+            if keep and date_active:
+                m_ts = float(getattr(info, 'mtime', 0) or 0)
+                if m_ts > 0:
+                    m_date = QDateTime.fromSecsSinceEpoch(int(m_ts)).date()
+                    if m_date < date_from or m_date > date_to:
+                        keep = False
 
             # Size
             if keep and sz_max > 0:
@@ -5514,14 +5857,15 @@ class MediaTab(QWidget):
         grid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         grid_item.setData(Qt.ItemDataRole.UserRole, info)
         if not info.is_valid: grid_item.setToolTip(info.error_message)
-        placeholder_pix = QPixmap(120, 68)
+        pw, ph = self._thumb_dims()
+        placeholder_pix = QPixmap(pw, ph)
         placeholder_pix.fill(QColor("#1e1b4b"))
         with QPainter(placeholder_pix) as painter:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             painter.setFont(QFont(BASE_FONT_FAMILY, 20))
             painter.setPen(QColor("#a78bfa"))
             emoji = "🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️"))
-            painter.drawText(QRect(0, 0, 120, 68), Qt.AlignmentFlag.AlignCenter, emoji)
+            painter.drawText(QRect(0, 0, pw, ph), Qt.AlignmentFlag.AlignCenter, emoji)
         grid_item.setIcon(QIcon(placeholder_pix))
         info.grid_item = grid_item
         search_text = (self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()).lower().strip()
@@ -5536,8 +5880,11 @@ class MediaTab(QWidget):
             thumb_label = QLabel()
             thumb_label.setObjectName("thumbnailLabel")
             thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb_label.setText("🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️")))
-            thumb_label.setFixedSize(120, 68)
+            emoji_txt = "🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️"))
+            thumb_label.setProperty("emoji", emoji_txt)
+            thumb_label.setText(emoji_txt)
+            lw, lh = self._thumb_dims()
+            thumb_label.setFixedSize(lw, lh)
             self.table.setCellWidget(row, self.COL_THUMB, thumb_label)
             if info.media_type == 'video':
                 thumb_label.setProperty("media_info", info)
@@ -5600,6 +5947,15 @@ class MediaTab(QWidget):
         dur_item.setFont(bold_meta_font)
         dur_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
         self.table.setItem(row, self.COL_DURATION, dur_item)
+
+        for col, attr in ((self.COL_DATE_MOD, 'mtime'), (self.COL_DATE_CREATED, 'ctime')):
+            ts = float(getattr(info, attr, 0) or 0)
+            dt_item = NumericTableWidgetItem(format_timestamp(ts), sort_key=ts)
+            dt_item.setFlags(dt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            dt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            dt_item.setFont(bold_meta_font)
+            dt_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
+            self.table.setItem(row, col, dt_item)
         parsed_artist, parsed_rating = parse_naming_format(info.filename)
         is_dark = getattr(self.window(), 'current_theme', 'dark') == 'dark'
         text_color = QColor("#e0e0e0") if is_dark else QColor("#0f172a")
@@ -5642,7 +5998,8 @@ class MediaTab(QWidget):
         preview_item.setFlags(preview_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         preview_item.setForeground(QColor("#7c7c9a"))
         self.table.setItem(row, self.COL_PREVIEW, preview_item)
-        self.table.setRowHeight(row, 75)
+        _, row_h = self._thumb_dims()
+        self.table.setRowHeight(row, row_h + 8)
         self._updating_table = False
         self._update_row_preview(row)
 
@@ -5669,7 +6026,9 @@ class MediaTab(QWidget):
         if pixmap and not pixmap.isNull():
             current_widget = self.table.cellWidget(row, self.COL_THUMB)
             if current_widget is label:
-                label.setPixmap(pixmap.scaled(120, 68, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                cw, ch = self._thumb_dims()
+                label.setFixedSize(cw, ch)
+                label.setPixmap(pixmap.scaled(cw, ch, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
             if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setIcon(QIcon(pixmap))
 
     @property
@@ -5825,6 +6184,41 @@ class MediaTab(QWidget):
             tag_input.editingFinished.connect(self._on_tags_edited)
             self.table.setCellWidget(row, self.COL_TAGS, tag_input)
 
+    def _thumb_dims(self):
+        """Inner thumbnail label size derived from the thumb_size setting."""
+        w = int(getattr(self, 'thumb_size', 130))
+        return w, max(50, round(w * 0.567))
+
+    def apply_thumbnail_size(self, size: int):
+        """Resize thumbnails across table + grid and re-render visible ones."""
+        size = max(90, min(200, int(size)))
+        self.thumb_size = size
+        w, h = self._thumb_dims()
+        was_sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+        try:
+            self.table.setColumnWidth(self.COL_THUMB, size)
+            self.grid_view.setIconSize(QSize(w, h))
+            self.grid_view.setGridSize(QSize(w + 20, h + 50))
+            for row in range(self.table.rowCount()):
+                self.table.setRowHeight(row, h + 8)
+                wdg = self.table.cellWidget(row, self.COL_THUMB)
+                if isinstance(wdg, QLabel) and wdg.objectName() == "thumbnailLabel":
+                    wdg.setFixedSize(w, h)
+                    if wdg.pixmap() is not None and not wdg.pixmap().isNull():
+                        # Reset to placeholder; _load_visible_widgets() will
+                        # regenerate at the new resolution (thumb_queued reset).
+                        emoji = wdg.property("emoji")
+                        wdg.setPixmap(QPixmap())
+                        if emoji:
+                            wdg.setText(emoji)
+                info = self._get_row_info(row)
+                if info is not None:
+                    info.thumb_queued = False
+        finally:
+            self.table.setSortingEnabled(was_sorting)
+        self._load_visible_widgets()
+
     def _load_visible_widgets(self):
         if self._updating_table: return
         scrollbar = self.table.verticalScrollBar()
@@ -5914,6 +6308,50 @@ class MediaTab(QWidget):
         if main_win and hasattr(main_win, '_debounced_save_state'):
             main_win._debounced_save_state()
 
+    def _update_date_items(self, row: int, info):
+        """Keep the optional Modified/Created cells accurate after renames."""
+        for col, attr in ((self.COL_DATE_MOD, 'mtime'), (self.COL_DATE_CREATED, 'ctime')):
+            it = self.table.item(row, col)
+            if it is not None:
+                ts = float(getattr(info, attr, 0) or 0)
+                it.setText(format_timestamp(ts))
+                it.sort_key = ts
+
+    def _move_sidecars(self, old_path: str, new_path: str) -> list:
+        """Move sibling subtitle/NFO files along with their media file.
+
+        Returns the list of (old, new) pairs so undo/redo can revert them.
+        Per-file failures are logged but never block the main rename.
+        """
+        moved = []
+        old_stem = os.path.basename(os.path.splitext(old_path)[0])
+        new_stem = os.path.splitext(new_path)[0]
+        for sidecar in find_sidecars(old_path):
+            rel = os.path.basename(sidecar)[len(old_stem):]
+            target = new_stem + rel
+            try:
+                if os.path.exists(target):
+                    b, x = os.path.splitext(target)
+                    counter = 1
+                    while os.path.exists(target):
+                        target = f"{b}_{counter}{x}"
+                        counter += 1
+                shutil.move(sidecar, target)
+                moved.append((sidecar, target))
+            except OSError as e:
+                logger.warning("Sidecar move failed (%s -> %s): %s", sidecar, target, e)
+        return moved
+
+    @staticmethod
+    def _refresh_row_dates(info):
+        """Re-stat a file after rename/move so Modified/Created stay accurate."""
+        try:
+            st_ = os.stat(info.filepath)
+            info.mtime = float(st_.st_mtime)
+            info.ctime = float(getattr(st_, 'st_ctime', 0))
+        except OSError:
+            pass
+
     def _get_templated_name(self, artist: str, rating: str, info) -> str:
         main_win = self.window()
         if not main_win:
@@ -5942,9 +6380,13 @@ class MediaTab(QWidget):
                 tags = getattr(info, 'tags', [])
                 if tags:
                     parts.append(" ".join(tags))
+            elif config_key in ("date_taken", "ym"):
+                dt = get_media_datetime(info)
+                if dt is not None:
+                    parts.append(dt.strftime("%Y-%m-%d") if config_key == "date_taken" else dt.strftime("%Y%m"))
         return separator.join(parts)
 
-    def _is_naming_data_complete(self, artist: str, rating: str) -> bool:
+    def _is_naming_data_complete(self, artist: str, rating: str, info=None) -> bool:
         main_win = self.window()
         if not main_win:
             return False
@@ -5955,6 +6397,9 @@ class MediaTab(QWidget):
             return False
         if "rating" in fields_checked and (not rating or rating == "—"):
             return False
+        if info is not None and ("date_taken" in fields_checked or "ym" in fields_checked):
+            if get_media_datetime(info) is None:
+                return False
         return True
 
     def _update_row_preview(self, row: int):
@@ -5977,7 +6422,7 @@ class MediaTab(QWidget):
         main_win = self.window()
         keep_ext = getattr(main_win, 'naming_keep_extension', True)
         
-        is_complete = self._is_naming_data_complete(artist, rating_text)
+        is_complete = self._is_naming_data_complete(artist, rating_text, info)
         new_name = self._get_templated_name(artist, rating_text, info) if is_complete else ""
         
         current_display_name = self.table.item(row, self.COL_FILENAME).text().strip() if self.table.item(row, self.COL_FILENAME) else ""
@@ -6011,6 +6456,17 @@ class MediaTab(QWidget):
             self.grid_view.blockSignals(False)
         finally:
             self._syncing_selection = False
+        # Selection stats: count + combined size of visible selected files (>1 only)
+        n_sel, total = 0, 0
+        for rng in self.table.selectedRanges():
+            for r in range(rng.topRow(), rng.bottomRow() + 1):
+                if self.table.isRowHidden(r):
+                    continue
+                inf = self._get_row_info(r)
+                if inf is not None:
+                    n_sel += 1
+                    total += int(getattr(inf, 'size_bytes', 0))
+        self.sel_stats_label.setText(f"{n_sel} selected \u00b7 {format_size(total)}" if n_sel > 1 else "")
         self._update_selection_buttons_and_preview()
 
     def _on_batch_edit(self):
@@ -6207,6 +6663,10 @@ class MediaTab(QWidget):
 
                 row_idx = id_to_row.get(id(info), -1)
 
+                # Sidecars + dates + history must happen even when row_idx==-1
+                # (cross-tab source, stale id_to_row) — disk state already moved
+                moved_extra = self._move_sidecars(src, dest_file)
+                self._refresh_row_dates(info)
                 if row_idx >= 0:
                     fname_item = self.table.item(row_idx, self.COL_FILENAME)
                     if fname_item:
@@ -6216,8 +6676,8 @@ class MediaTab(QWidget):
                     if hasattr(info, 'grid_item') and info.grid_item:
                         info.grid_item.setText(info.filename)
                         info.grid_item.setToolTip(dest_file)
-                    self._update_row_preview(row_idx)
-                    self._add_to_history(src, dest_file, row_idx)
+                    self._update_date_items(row_idx, info)
+                self._add_to_history(src, dest_file, row_idx, extra=moved_extra)
 
                 success_count += 1
 
@@ -6419,15 +6879,39 @@ class MediaTab(QWidget):
         open_folder.triggered.connect(lambda: self._open_folder_for_row(row))
         menu.addAction(open_folder)
         menu.addSeparator()
-        copy_path = QAction("📋  Copy File Path", self)
-        copy_path.triggered.connect(lambda: self._copy_path_for_row(row))
-        menu.addAction(copy_path)
+        sel_infos = []
+        for r in sorted(selected_rows):
+            if self.filtered_rows and r not in self.filtered_rows: continue
+            r_info = self._get_row_info(r)
+            if r_info is not None: sel_infos.append(r_info)
+        if len(sel_infos) > 1:
+            copy_paths = QAction(f"📋  Copy {len(sel_infos)} File Paths", self)
+            copy_paths.triggered.connect(
+                lambda: QApplication.clipboard().setText("\n".join(i.filepath for i in sel_infos)))
+            menu.addAction(copy_paths)
+            copy_names = QAction(f"📋  Copy {len(sel_infos)} File Names", self)
+            copy_names.triggered.connect(
+                lambda: QApplication.clipboard().setText("\n".join(i.filename for i in sel_infos)))
+            menu.addAction(copy_names)
+        else:
+            copy_path = QAction("📋  Copy File Path", self)
+            copy_path.triggered.connect(lambda: self._copy_path_for_row(row))
+            menu.addAction(copy_path)
         remove_action = QAction("✕  Remove From List", self)
         remove_action.triggered.connect(lambda: self._remove_row_from_list(row))
         menu.addAction(remove_action)
         delete_action = QAction("🗑️  Delete from Disk...", self)
         delete_action.triggered.connect(lambda: self._on_delete_selected(row))
         menu.addAction(delete_action)
+        menu.addSeparator()
+        export_csv_action = QAction("⬇️  Export List to CSV", self)
+        export_csv_action.setToolTip("Export the visible rows (current filters/duplicate view) to a CSV file")
+        export_csv_action.triggered.connect(self._export_list_csv)
+        menu.addAction(export_csv_action)
+        if info.media_type == 'audio':
+            audio_tags_action = QAction("🏷️  Edit Audio Tags\u2026", self)
+            audio_tags_action.triggered.connect(lambda checked=False, r=row: self._edit_audio_tags(r))
+            menu.addAction(audio_tags_action)
         if info.is_valid:
             menu.addSeparator()
             rating_menu = menu.addMenu("⭐  Set Rating")
@@ -6436,6 +6920,37 @@ class MediaTab(QWidget):
                 action.triggered.connect(lambda checked, rr=r: self._set_rating_for_row(row, rr))
                 rating_menu.addAction(action)
         menu.exec(global_pos)
+
+    def _export_list_csv(self):
+        """Export the CURRENTLY VISIBLE rows to CSV.
+
+        Respects search/advanced filters and the duplicate view; the Status
+        column carries 'Dup Group N' badges so a dupe scan can be exported
+        directly as a report. UTF-8 BOM keeps Excel happy with unicode names.
+        """
+        path, _ = QFileDialog.getSaveFileName(self, "Export List to CSV",
+                                              "mediaflow_export.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            import csv as _csv
+            with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+                wr = _csv.writer(f)
+                wr.writerow(list(self.HEADERS) + ["Path"])
+                count = 0
+                for row in range(self.table.rowCount()):
+                    if self.table.isRowHidden(row): continue
+                    vals = []
+                    for col in range(self.NUM_COLS):
+                        it = self.table.item(row, col)
+                        vals.append(it.text() if it else "")
+                    info = self._get_row_info(row)
+                    vals.append(info.filepath if info else "")
+                    wr.writerow(vals)
+                    count += 1
+            self._show_toast(f"Exported {count} rows \u2192 {os.path.basename(path)}", 'success')
+        except OSError as e:
+            QMessageBox.warning(self, "Export Failed", f"Could not write CSV:\n{e}")
 
     def _show_detailed_info(self, row: int):
         info = self._get_row_info(row)
@@ -6450,6 +6965,32 @@ class MediaTab(QWidget):
         row = self.table.currentRow()
         if row >= 0:
             self._show_detailed_info(row)
+
+    def _edit_audio_tags(self, row: int):
+        """B2: edit embedded tags of an audio file (writes via mutagen)."""
+        info = self._get_row_info(row)
+        if not info: return
+        dlg = AudioTagEditorDialog(info.filepath, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            dlg.save()
+        except Exception as e:
+            QMessageBox.critical(self, "Tag Save Failed", f"Could not write tags:\n{e}")
+            return
+        # Reflect a freshly-set Artist into the table when the cell was empty
+        artist = dlg.get_values().get('artist', '').strip()
+        if artist:
+            was_sorting = self.table.isSortingEnabled()
+            self.table.setSortingEnabled(False)
+            widget = self.table.cellWidget(row, self.COL_ARTIST)
+            item = self.table.item(row, self.COL_ARTIST)
+            if widget is not None and not widget.text().strip():
+                widget.setText(artist)
+            elif item is not None and not item.text().strip():
+                item.setText(artist)
+            self.table.setSortingEnabled(was_sorting)
+        self._show_toast("Audio tags saved.", 'success')
 
     def _on_compare_selected(self):
         selected_rows = []
@@ -6700,7 +7241,10 @@ class MediaTab(QWidget):
                 info.grid_item.setText(info.filename)
                 info.grid_item.setToolTip(dst)
             self._known_files_dirty = True
-            self._add_to_history(src, dst, row)
+            moved_extra = self._move_sidecars(src, dst)
+            self._refresh_row_dates(info)
+            self._update_date_items(row, info)
+            self._add_to_history(src, dst, row, extra=moved_extra)
         except Exception as e:
             QMessageBox.warning(self, "Rename Error", f"Cannot rename file:\n{e}")
             self._updating_table = True
@@ -6722,7 +7266,7 @@ class MediaTab(QWidget):
             rating_widget = self.table.cellWidget(row, self.COL_RATING)
             artist = artist_widget.text().strip() if artist_widget else (self.table.item(row, self.COL_ARTIST).text().strip() if self.table.item(row, self.COL_ARTIST) else "")
             rating = rating_widget.currentText() if rating_widget else (self.table.item(row, self.COL_RATING).text().strip() if self.table.item(row, self.COL_RATING) else "—")
-            if self._is_naming_data_complete(artist, rating):
+            if self._is_naming_data_complete(artist, rating, info):
                 new_name = self._get_templated_name(artist, rating, info)
                 current_display_name = self.table.item(row, self.COL_FILENAME).text().strip() if self.table.item(row, self.COL_FILENAME) else ""
                 target_display = new_name + (info.extension if keep_ext else "") if new_name else ""
@@ -6763,7 +7307,10 @@ class MediaTab(QWidget):
                     status_item.setForeground(QColor("#6dd5ed"))
                     self._updating_table = False
                     if hasattr(info, 'grid_item') and info.grid_item: info.grid_item.setText(info.filename)
-                    self._add_to_history(src, dst, row)
+                    moved_extra = self._move_sidecars(src, dst)
+                    self._refresh_row_dates(info)
+                    self._update_date_items(row, info)
+                    self._add_to_history(src, dst, row, extra=moved_extra)
                     success_count += 1
                 except Exception as e:
                     error_count += 1
@@ -6792,8 +7339,12 @@ class MediaTab(QWidget):
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
         QMessageBox.information(self, "Rename Complete", msg)
 
-    def _add_to_history(self, src: str, dst: str, row: int, clear_redo=True):
-        self._rename_history.append({'timestamp': datetime.now().isoformat(), 'src': src, 'dst': dst, 'row': row, 'filename': os.path.basename(dst)})
+    def _add_to_history(self, src: str, dst: str, row: int, clear_redo=True, extra=None):
+        extra = list(extra or [])
+        self._rename_history.append({'timestamp': datetime.now().isoformat(), 'src': src, 'dst': dst, 'row': row,
+                                     'filename': os.path.basename(dst), 'extra': extra})
+        # C3: append-only audit trail (forward renames; undo/redo are implied)
+        append_rename_audit([(src, dst)] + extra)
         if len(self._rename_history) > 50: self._rename_history.pop(0)
         self.btn_undo.setEnabled(True)
         if clear_redo:
@@ -6809,6 +7360,15 @@ class MediaTab(QWidget):
             self._release_file_locks([dst, src])
             try:
                 shutil.move(dst, src)
+                # Revert sidecar moves (best-effort; failures never block undo)
+                extra_done = []
+                for o_, n_ in reversed(last.get('extra') or []):
+                    if os.path.exists(n_) and not os.path.exists(o_):
+                        try:
+                            shutil.move(n_, o_)
+                            extra_done.append((o_, n_))
+                        except OSError as e_:
+                            logger.warning("Undo sidecar (%s -> %s): %s", n_, o_, e_)
                 row = last['row']
                 try:
                     if row < self.table.rowCount():
@@ -6834,6 +7394,11 @@ class MediaTab(QWidget):
                         logger.error("ROLLBACK FAILED for %s -> %s; filesystem and UI are out of sync", src, dst)
                         QMessageBox.critical(self, "Fatal Desync", f"Filesystem and UI out of sync. Please reload folder.\n\nFailed to revert:\n{src}\nto\n{dst}")
                         return
+                    for p_, q_ in reversed(extra_done):
+                        try:
+                            shutil.move(p_, q_)
+                        except OSError as e_:
+                            logger.error("Undo sidecar rollback failed (%s -> %s): %s", p_, q_, e_)
                     self._rename_history.append(last)
                     return
                 finally:
@@ -6863,6 +7428,14 @@ class MediaTab(QWidget):
             self._release_file_locks([src, dst])
             try:
                 shutil.move(src, dst)
+                extra_done = []
+                for o_, n_ in (last.get('extra') or []):
+                    if os.path.exists(o_) and not os.path.exists(n_):
+                        try:
+                            shutil.move(o_, n_)
+                            extra_done.append((o_, n_))
+                        except OSError as e_:
+                            logger.warning("Redo sidecar (%s -> %s): %s", o_, n_, e_)
                 row = last['row']
                 try:
                     if row < self.table.rowCount():
@@ -6888,6 +7461,11 @@ class MediaTab(QWidget):
                         logger.error("ROLLBACK FAILED for %s -> %s; filesystem and UI are out of sync", dst, src)
                         QMessageBox.critical(self, "Fatal Desync", f"Filesystem and UI out of sync. Please reload folder.\n\nFailed to revert:\n{dst}\nto\n{src}")
                         return
+                    for p_, q_ in reversed(extra_done):
+                        try:
+                            shutil.move(q_, p_)
+                        except OSError as e_:
+                            logger.error("Redo sidecar rollback failed (%s -> %s): %s", q_, p_, e_)
                     self._redo_history.append(last)
                     return
                 finally:
@@ -6896,7 +7474,8 @@ class MediaTab(QWidget):
                 self._show_toast(f"🔁 Redone: {os.path.basename(dst)}", 'success')
                 self._update_stats()
                 self._known_files_dirty = True
-                self._add_to_history(src, dst, row, clear_redo=False)
+                # Carry sidecar pairs forward — a later undo must revert them too
+                self._add_to_history(src, dst, row, clear_redo=False, extra=last.get('extra'))
             except Exception as e:
                 QMessageBox.warning(self, "Redo Failed", f"Cannot redo rename:\n{e}")
                 self._redo_history.append(last)
@@ -7549,7 +8128,7 @@ class MediaTab(QWidget):
                 if not artist_widget or not rating_widget: continue
                 artist = artist_widget.text().strip()
                 rating = rating_widget.currentText()
-                if self._is_naming_data_complete(artist, rating):
+                if self._is_naming_data_complete(artist, rating, info):
                     new_name = self._get_templated_name(artist, rating, info)
                     current_display_name = self.table.item(row, self.COL_FILENAME).text().strip() if self.table.item(row, self.COL_FILENAME) else ""
                     target_display = new_name + (info.extension if keep_ext else "") if new_name else ""
@@ -7651,6 +8230,9 @@ class MediaFlowWindow(QMainWindow):
         self._settings_visible = False
         self.setAcceptDrops(True)
         self.global_mute = False
+        # Accessibility / comfort settings (overridden by _load_state)
+        self.ui_scale = 1.0
+        self.reduced_motion = False
         self.ffprobe_path = ""
         self.current_theme = "dark"
         self.naming_separator = ' '
@@ -7868,6 +8450,43 @@ class MediaFlowWindow(QMainWindow):
         theme_row.addWidget(theme_lbl)
         theme_row.addWidget(self.theme_combo, 1)
         appearance_sec_layout.addLayout(theme_row)
+
+        # UI size (accessibility) — scales all stylesheet font sizes
+        size_row = QHBoxLayout()
+        size_lbl = QLabel("UI Size:")
+        size_lbl.setToolTip("Scales text across the whole app (Compact / Normal / Large)")
+        self.ui_size_combo = QComboBox()
+        self.ui_size_combo.addItems(["Compact", "Normal", "Large"])
+        self._ui_size_syncing = False
+        self.ui_size_combo.currentTextChanged.connect(self._on_ui_size_changed)
+        size_row.addWidget(size_lbl)
+        size_row.addWidget(self.ui_size_combo, 1)
+        appearance_sec_layout.addLayout(size_row)
+
+        # Reduced motion — skips slide/fade animations (toasts, settings panel)
+        self.reduced_motion_checkbox = QCheckBox("Reduce animations")
+        self.reduced_motion_checkbox.setToolTip("Disables slide/fade animations for toasts and the settings panel")
+        self.reduced_motion_checkbox.toggled.connect(self._on_reduced_motion_changed)
+        appearance_sec_layout.addWidget(self.reduced_motion_checkbox)
+
+        # Thumbnail size — applies to every tab's table + grid
+        thumb_row = QHBoxLayout()
+        thumb_lbl = QLabel("Thumbnails:")
+        self.thumb_size_slider = QSlider(Qt.Orientation.Horizontal)
+        self.thumb_size_slider.setRange(90, 200)
+        self.thumb_size_slider.setValue(int(getattr(self, 'thumb_size', 130)))
+        self.thumb_size_slider.setToolTip("Preview thumbnail size in list and grid views")
+        self.thumb_size_value_lbl = QLabel(f"{self.thumb_size_slider.value()}px")
+        self.thumb_size_value_lbl.setMinimumWidth(38)
+        def _thumb_lbl(v): self.thumb_size_value_lbl.setText(f"{v}px")
+        self.thumb_size_slider.valueChanged.connect(_thumb_lbl)
+        self.thumb_size_slider.sliderReleased.connect(self._on_thumb_size_changed)
+        self.thumb_size_slider.valueChanged.connect(self._on_thumb_size_live)
+        thumb_row.addWidget(thumb_lbl)
+        thumb_row.addWidget(self.thumb_size_slider, 1)
+        thumb_row.addWidget(self.thumb_size_value_lbl)
+        appearance_sec_layout.addLayout(thumb_row)
+
         settings_layout.addWidget(appearance_sec)
 
         # Custom Naming Template
@@ -8230,6 +8849,115 @@ class MediaFlowWindow(QMainWindow):
         ThemeManager.apply_theme(self, text)
         self._save_state()
 
+    UI_SCALES = {"Compact": 0.85, "Normal": 1.0, "Large": 1.2}
+
+    def _on_ui_size_changed(self, text):
+        if getattr(self, '_ui_size_syncing', False): return
+        self.ui_scale = self.UI_SCALES.get(text, 1.0)
+        ThemeManager.apply_theme(self, self.theme_combo.currentText())
+        self._save_state()
+
+    def _on_reduced_motion_changed(self, checked: bool):
+        self.reduced_motion = bool(checked)
+        self._save_state()
+
+    # Thumbnail size — live label updates while dragging; layout reflow on release
+    def _on_thumb_size_live(self, value: int):
+        self.thumb_size = int(value)
+
+    def _on_thumb_size_changed(self):
+        size = int(getattr(self, 'thumb_size', 130))
+        for tab in [self.video_tab, self.image_tab, self.audio_tab, self.pdf_tab] + list(getattr(self, 'smart_folder_tabs', {}).values()):
+            tab.apply_thumbnail_size(size)
+        self._save_state()
+
+    def open_folders_from_args(self, dirs):
+        """C2: route command-line / second-instance folders to matching tabs.
+
+        Picks the tab by sampling file extensions inside each directory
+        (falls back to Videos), appends it to that tab's sources and scans.
+        """
+        first_page = None
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            d = os.path.normpath(d)
+            exts = set()
+            try:
+                # Sample up to 300 files (filter first, slice after) for reliable type guess in mixed dirs
+                all_names = os.listdir(d)
+                file_names = [n for n in all_names if os.path.isfile(os.path.join(d, n))][:300]
+                for name in file_names:
+                    exts.add(os.path.splitext(name)[1].lower())
+            except OSError:
+                continue
+            if exts and (exts & IMAGE_EXTENSIONS) and not (exts & VIDEO_EXTENSIONS):
+                tab, page = self.image_tab, 1
+            elif exts and (exts & AUDIO_EXTENSIONS) and not (exts & VIDEO_EXTENSIONS):
+                tab, page = self.audio_tab, 2
+            elif exts and (exts & PDF_EXTENSIONS) and not (exts & VIDEO_EXTENSIONS):
+                tab, page = self.pdf_tab, 3
+            else:
+                tab, page = self.video_tab, 0
+
+            list_widget = {0: self.videos_list_widget, 1: self.images_list_widget,
+                           2: self.audio_list_widget, 3: self.pdf_list_widget}[page]
+            existing_items = [list_widget.item(i).text() for i in range(list_widget.count())]
+            if d not in existing_items:
+                list_widget.addItem(d)
+            current = [list_widget.item(i).text() for i in range(list_widget.count())]
+            try:
+                tab.update_directories(current)  # triggers a scan internally
+            except Exception as e:
+                logger.warning("Could not scan CLI folder %s: %s", d, e)
+            if first_page is None:
+                first_page = page
+        if first_page is not None:
+            self._switch_page(first_page)
+
+    SHORTCUTS_HELP = [
+        ("Ctrl+O", "Add source folder"),
+        ("Ctrl+R / F5", "Reload files"),
+        ("Ctrl+F", "Focus search filter"),
+        ("Ctrl+E", "Export visible rows to CSV"),
+        ("Ctrl+Z / Ctrl+Y", "Undo / redo rename (sidecars follow)"),
+        ("Delete", "Send selected files to Recycle Bin"),
+        ("Ctrl+A", "Select all visible rows"),
+        ("Ctrl+P", "Toggle preview panel"),
+        ("Ctrl+T", "Quick Trim selected video"),
+        ("Ctrl+Shift+C", "Compare two selected files"),
+        ("Ctrl+Shift+D", "Find exact duplicates"),
+        ("Ctrl+I", "Detailed file info"),
+        ("Enter", "Open / play focused row"),
+        ("Up / Down", "Move row selection"),
+        ("F1", "This cheat sheet"),
+    ]
+
+    def _show_shortcut_cheatsheet(self):
+        """D1: F1 keyboard shortcut reference."""
+        is_dark = getattr(self, 'current_theme', 'dark') == 'dark'
+        bg = "#1e1b4b" if is_dark else "#ffffff"
+        fg = "#e5e7eb" if is_dark else "#1f2937"
+        key_fg = "#c4b5fd" if is_dark else "#4338ca"
+        rows_html = "".join(
+            f"<tr><td style='padding:4px 18px 4px 0;color:{key_fg};white-space:nowrap;'>"
+            f"<b>{k}</b></td><td style='padding:4px 0;color:{fg};'>{d}</td></tr>"
+            for k, d in self.SHORTCUTS_HELP)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("MediaFlow — Keyboard Shortcuts")
+        dlg.setMinimumWidth(430)
+        lay = QVBoxLayout(dlg)
+        lbl = QLabel(f"<table>{rows_html}</table>")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(lbl)
+        btn = QPushButton("Close")
+        btn.setObjectName("btnSelectFolder")
+        btn.clicked.connect(dlg.accept)
+        h = QHBoxLayout(); h.addStretch(); h.addWidget(btn); h.addStretch()
+        lay.addLayout(h)
+        dlg.setStyleSheet(f"QDialog {{ background: {bg}; }}")
+        dlg.exec()
+
     def _switch_page(self, index: int):
         self.stacked_widget.setCurrentIndex(index)
         if index == 0: self.page_title.setText("Videos")
@@ -8425,6 +9153,18 @@ class MediaFlowWindow(QMainWindow):
         shortcut_trim.setShortcut(QKeySequence("Ctrl+T"))
         shortcut_trim.triggered.connect(lambda: _safe_call('_on_quick_trim'))
         self.addAction(shortcut_trim)
+
+        # A3: export current view
+        shortcut_export = QAction("Export CSV", self)
+        shortcut_export.setShortcut(QKeySequence("Ctrl+E"))
+        shortcut_export.triggered.connect(lambda: _safe_call('_export_list_csv'))
+        self.addAction(shortcut_export)
+
+        # D1: F1 cheat sheet
+        shortcut_help = QAction("Keyboard Shortcuts", self)
+        shortcut_help.setShortcut(QKeySequence("F1"))
+        shortcut_help.triggered.connect(self._show_shortcut_cheatsheet)
+        self.addAction(shortcut_help)
     def _update_native_button_text(self):
         if self.video_tab.default_player == "native":
             self.btn_native_vp.setText("System")
@@ -8625,6 +9365,9 @@ class MediaFlowWindow(QMainWindow):
                 'theme': self.theme_combo.currentText(),
                 # FIX: global mute was never persisted — every launch reset it
                 'global_mute': bool(getattr(self, 'global_mute', False)),
+                'ui_scale': float(getattr(self, 'ui_scale', 1.0)),
+                'reduced_motion': bool(getattr(self, 'reduced_motion', False)),
+                'thumb_size': int(getattr(self, 'thumb_size', 130)),
                 'naming_separator': self.naming_separator,
                 'naming_fields': self.naming_fields,
                 'naming_all_fields_ordered': self.naming_all_fields_ordered,
@@ -8691,6 +9434,39 @@ class MediaFlowWindow(QMainWindow):
             if isinstance(val, list): return [v for v in val if isinstance(v, str) and v]
             if isinstance(val, str) and val: return [val]
             return []
+
+        # ── Accessibility & comfort (non-destructive; loads BEFORE theme so
+        # apply_theme sees the saved ui_scale) ──
+        def _a11y():
+            s = state.get('ui_scale', 1.0)
+            try:
+                s = float(s)
+            except (TypeError, ValueError):
+                s = 1.0
+            self.ui_scale = s if 0.5 <= s <= 2.0 else 1.0
+            self.reduced_motion = bool(state.get('reduced_motion', False))
+            ts = state.get('thumb_size', 130)
+            try:
+                ts = int(ts)
+            except (TypeError, ValueError):
+                ts = 130
+            self.thumb_size = ts if 90 <= ts <= 200 else 130
+
+            # Settings widgets are built by now — sync them silently
+            self._ui_size_syncing = True
+            try:
+                scale_to_text = {v: k for k, v in self.UI_SCALES.items()}
+                self.ui_size_combo.setCurrentText(scale_to_text.get(self.ui_scale, "Normal"))
+            finally:
+                self._ui_size_syncing = False
+            self.reduced_motion_checkbox.blockSignals(True)
+            self.reduced_motion_checkbox.setChecked(self.reduced_motion)
+            self.reduced_motion_checkbox.blockSignals(False)
+            self.thumb_size_slider.blockSignals(True)
+            self.thumb_size_slider.setValue(int(self.thumb_size))
+            self.thumb_size_slider.blockSignals(False)
+            self.thumb_size_value_lbl.setText(f"{int(self.thumb_size)}px")
+        run_section('accessibility', _a11y, destructive=False)
 
         # ── Theme (non-destructive) ──
         def _theme():
@@ -8903,6 +9679,16 @@ class MediaFlowWindow(QMainWindow):
                 self.smart_folder_nav_items[name] = nav_item
         run_section('smart folders', _smart)
 
+        # Apply persisted thumbnail size to every tab (built with the default)
+        def _apply_thumbs():
+            tabs_ = [self.video_tab, self.image_tab, self.audio_tab, self.pdf_tab]
+            for st_ in getattr(self, 'smart_folder_tabs', {}).values():
+                tabs_.append(st_)
+            for t_ in tabs_:
+                if int(getattr(t_, 'thumb_size', 130)) != int(getattr(self, 'thumb_size', 130)):
+                    t_.apply_thumbnail_size(int(self.thumb_size))
+        run_section('thumbnail size', _apply_thumbs, destructive=False)
+
     def resizeEvent(self, event):
         if not self.isMaximized() and not self.isFullScreen():
             self._normal_geometry = {'x': self.x(), 'y': self.y(), 'width': self.width(), 'height': self.height()}
@@ -8967,6 +9753,11 @@ class MediaFlowWindow(QMainWindow):
     def _toggle_settings(self):
         self._settings_visible = not self._settings_visible
         target_width = 400 if self._settings_visible else 0
+        if getattr(self, 'reduced_motion', False):
+            # Reduced motion: jump instantly instead of animating
+            self.settings_panel.setMinimumWidth(target_width)
+            self.settings_panel.setMaximumWidth(target_width)
+            return
         if hasattr(self, 'settings_animation') and self.settings_animation.state() == QPropertyAnimation.State.Running: self.settings_animation.stop()
         if hasattr(self, 'settings_animation_max') and self.settings_animation_max.state() == QPropertyAnimation.State.Running: self.settings_animation_max.stop()
         self.settings_animation = QPropertyAnimation(self.settings_panel, b"minimumWidth")
@@ -9144,6 +9935,38 @@ class MediaFlowWindow(QMainWindow):
                 active_tab.btn_clear.setVisible(total > 0)
                 active_tab._update_stats()
 
+AUDIT_LOG_FILE = os.path.join(CONFIG_DIR, "rename_audit.csv")
+
+def append_rename_audit(entries):
+    """C3: append-only audit trail of every rename/move (old → new).
+
+    CSV rows: timestamp, operation, old_path, new_path. Best-effort — failures
+    are logged and never interrupt renames. Portable mode keeps this beside
+    the exe automatically via CONFIG_DIR.
+    """
+    if not entries:
+        return
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        import csv as _csv
+        ts = datetime.now().isoformat(timespec="seconds")
+        # Append atomically: check emptiness via file size after opening (avoids TOCTOU)
+        with open(AUDIT_LOG_FILE, 'a', encoding='utf-8', newline='') as f:
+            wr = _csv.writer(f)
+            try:
+                needs_header = f.tell() == 0
+            except OSError:
+                needs_header = not os.path.exists(AUDIT_LOG_FILE) or os.path.getsize(AUDIT_LOG_FILE) == 0
+            if needs_header:
+                wr.writerow(["timestamp", "operation", "old_path", "new_path"])
+            # First entry is the main file; rest are sidecars — header written once, no TOCTOU
+            first_old = entries[0][0] if entries else None
+            for old_p, new_p in entries:
+                op = "sidecar" if old_p != first_old else "rename"
+                wr.writerow([ts, op, old_p, new_p])
+    except OSError as e:
+        logger.warning("rename audit log write failed: %s", e)
+
 def main():
     if sys.platform == 'win32':
         try:
@@ -9154,6 +9977,29 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("MediaFlow")
     app.setOrganizationName("MediaFlow")
+
+    # ── C1: Single instance ──
+    # A second launch just focuses the running window (and hands over any
+    # folders passed on its command line). QLocalServer also cleans up stale
+    # locks after a crash.
+    _sock = QLocalSocket()
+    _sock.connectToServer("MediaFlowSingleInstance")
+    if _sock.waitForConnected(300):
+        hint_dirs = [a for a in sys.argv[1:] if os.path.isdir(a)]
+        try:
+            _sock.write(("open\t" + "\n".join(hint_dirs)).encode("utf-8"))
+            _sock.flush()
+            _sock.waitForBytesWritten(300)
+        except Exception:
+            pass
+        _sock.disconnectFromServer()
+        print("MediaFlow is already running \u2014 focusing the existing window.")
+        return
+    QLocalServer.removeServer("MediaFlowSingleInstance")  # stale lock from crash
+    _instance_server = QLocalServer()
+    if not _instance_server.listen("MediaFlowSingleInstance"):
+        logger.warning("Single-instance server unavailable (%s); continuing standalone.",
+                       _instance_server.errorString())
 
     # Set application-wide window icon (shows on top-left title bar and in the taskbar)
     logo_path = get_resource_path("logo.png")
@@ -9169,7 +10015,33 @@ def main():
     app.setPalette(palette)
 
     window = MediaFlowWindow()
+
+    def _second_instance_connected():
+        conn = _instance_server.nextPendingConnection()
+        if conn is None:
+            return
+        # Wait briefly for the payload — readAll() alone can race the sender
+        if not conn.bytesAvailable():
+            conn.waitForReadyRead(300)
+        data = bytes(conn.readAll()).decode("utf-8", "replace")
+        conn.disconnectFromServer()
+        window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        window.raise_()
+        window.activateWindow()
+        if data.startswith("open\t"):
+            dirs = [d for d in data.split("\t", 1)[1].split("\n") if d]
+            if dirs:
+                QTimer.singleShot(0, lambda: window.open_folders_from_args(dirs))
+
+    _instance_server.newConnection.connect(_second_instance_connected)
+
     window.show()
+
+    # ── C2: launch folders from the command line ──
+    cli_dirs = [os.path.abspath(a) for a in sys.argv[1:] if os.path.isdir(a)]
+    if cli_dirs:
+        QTimer.singleShot(0, lambda: window.open_folders_from_args(cli_dirs))
+
     sys.exit(app.exec())
 
 if __name__ == "__main__":
