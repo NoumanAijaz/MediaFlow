@@ -1029,10 +1029,13 @@ QWidget { color: #e0e0e0; font-family: 'Segoe UI', 'Inter', sans-serif; }
 #statLabel { font-size: 9px; color: #a78bfa; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
 QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
 #btnSelectFolder { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6); color: white; min-width: 180px; }
+/* Compact padding for control-panel action buttons — the generic 24px h-padding made six-button rows overflow at minimum window width */
+#btnLoadFiles, #btnStopLoading, #btnClearAll, #btnWatch, #btnViewMode, #btnTogglePreview, #btnToggleStats, #btnBatchEdit, #btnBatchTag, #btnFindDuplicates, #btnDelete, #btnProcessAll, #btnUndo, #btnRedo { padding-left: 14px; padding-right: 14px; }
+
 #btnSelectFolder:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #7c3aed); }
 #btnSelectFolder:pressed { background: #4338ca; }
 #btnSelectFolder:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
-#btnProcessAll { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #06d6a0); color: white; min-width: 180px; font-size: 14px; padding: 12px 32px; }
+#btnProcessAll { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10b981, stop:1 #06d6a0); color: white; min-width: 130px; font-size: 14px; padding: 12px 22px; }
 #btnProcessAll:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #10b981); }
 #btnProcessAll:pressed { background: #047857; }
 #btnProcessAll:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
@@ -1042,7 +1045,7 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnClearAll:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
 #btnWatch { background: rgba(255, 255, 255, 0.05); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.2); }
 #btnWatch:checked { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
-#btnLoadFiles { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #60a5fa); color: white; min-width: 140px; }
+#btnLoadFiles { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #60a5fa); color: white; min-width: 120px; }
 #btnLoadFiles:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #3b82f6); }
 #btnLoadFiles:pressed { background: #1d4ed8; }
 #btnLoadFiles:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
@@ -1050,11 +1053,11 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnStopLoading:hover { background: rgba(239, 68, 68, 0.35); color: #ffffff; }
 #btnStopLoading:pressed { background: rgba(185, 28, 28, 0.5); }
 #btnStopLoading:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
-#btnBatchEdit { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f59e0b, stop:1 #fbbf24); color: #1f2937; min-width: 140px; }
+#btnBatchEdit { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f59e0b, stop:1 #fbbf24); color: #1f2937; min-width: 115px; }
 #btnBatchEdit:hover { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #f59e0b); color: #ffffff; }
 #btnBatchEdit:pressed { background: #b45309; }
 #btnBatchEdit:disabled { background: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.2); }
-#btnFindDuplicates { background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); min-width: 140px; }
+#btnFindDuplicates { background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3); min-width: 105px; }
 #btnFindDuplicates:hover { background: rgba(14, 165, 233, 0.25); color: #ffffff; border: 1px solid #0ea5e9; }
 #btnFindDuplicates:pressed { background: #0369a1; }
 #btnFindDuplicates:disabled { background: transparent; color: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.05); }
@@ -1068,7 +1071,7 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnUndo:hover, #btnRedo:hover { background: rgba(139, 92, 246, 0.3); color: #ffffff; border: 1px solid #8b5cf6; }
 #btnUndo:pressed, #btnRedo:pressed { background: #6d28d9; }
 #btnUndo:disabled, #btnRedo:disabled { background: transparent; color: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.05); }
-#btnDelete { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); min-width: 120px; }
+#btnDelete { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); min-width: 105px; }
 #btnDelete:hover { background: rgba(239, 68, 68, 0.25); color: #ffffff; border: 1px solid #ef4444; }
 #btnDelete:pressed { background: #b91c1c; }
 #btnDelete:disabled { background: transparent; color: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.05); }
@@ -1079,6 +1082,9 @@ QHeaderView::section { background: #151233; color: #a78bfa; font-weight: 700; fo
 QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px; }
 QScrollBar::handle:vertical { background: rgba(167, 139, 250, 0.35); border-radius: 4px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: rgba(167, 139, 250, 0.55); }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 4px; }
+QScrollBar::handle:horizontal { background: rgba(167, 139, 250, 0.35); border-radius: 4px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: rgba(167, 139, 250, 0.55); }
 QLineEdit { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #8b5cf6; background: rgba(55, 48, 110, 0.9); }
 QComboBox { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; min-width: 55px; }
@@ -1107,6 +1113,12 @@ QToolTip { background: #1e1b4b; color: #e0e0e0; border: 1px solid rgba(167, 139,
 QGroupBox { background: rgba(30, 27, 75, 0.3); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 10px; margin-top: 12px; padding: 16px 10px 10px 10px; font-size: 13px; font-weight: 600; color: #a78bfa; }
 QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 10px; color: #c4b5fd; }
 QScrollArea { background: transparent; border: none; }
+/* FIX: a QScrollArea's viewport is a plain QWidget that keeps auto-filling
+   with the PALETTE Window color captured when it was first polished — after a
+   theme switch it renders the OLD theme's color (dark bands in light mode /
+   light blocks in dark mode). Force scroll contents transparent so the themed
+   parent background (#sidebar / #settingsPanel) shows through instead. */
+QScrollArea > QWidget > QWidget { background: transparent; }
 #btnGlobalMute, #btnSettingsToggle { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; border: 1px solid rgba(167, 139, 250, 0.3); border-radius: 8px; padding: 0px; font-size: 16px; }
 #btnGlobalMute:hover, #btnSettingsToggle:hover { background: rgba(167, 139, 250, 0.3); color: #ffffff; }
 #btnGlobalMute:pressed, #btnSettingsToggle:pressed { background: rgba(99, 102, 241, 0.4); }
@@ -1153,10 +1165,13 @@ QWidget { color: #0f172a; font-family: 'Segoe UI', 'Inter', sans-serif; }
 #statLabel { font-size: 9px; color: #6366f1; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
 QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
 #btnSelectFolder { background: #6366f1; color: white; min-width: 180px; }
+/* Compact padding for control-panel action buttons — the generic 24px h-padding made six-button rows overflow at minimum window width */
+#btnLoadFiles, #btnStopLoading, #btnClearAll, #btnWatch, #btnViewMode, #btnTogglePreview, #btnToggleStats, #btnBatchEdit, #btnBatchTag, #btnFindDuplicates, #btnDelete, #btnProcessAll, #btnUndo, #btnRedo { padding-left: 14px; padding-right: 14px; }
+
 #btnSelectFolder:hover { background: #4f46e5; }
 #btnSelectFolder:pressed { background: #3730a3; }
 #btnSelectFolder:disabled { background: #cbd5e1; color: #94a3b8; }
-#btnProcessAll { background: #10b981; color: white; min-width: 180px; font-size: 14px; padding: 12px 32px; }
+#btnProcessAll { background: #10b981; color: white; min-width: 130px; font-size: 14px; padding: 12px 22px; }
 #btnProcessAll:hover { background: #059669; }
 #btnProcessAll:pressed { background: #047857; }
 #btnProcessAll:disabled { background: #e2e8f0; color: #94a3b8; }
@@ -1164,7 +1179,7 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnClearAll:hover { background: #fca5a5; color: #991b1b; border: 1px solid #fca5a5; }
 #btnClearAll:pressed { background: #ef4444; }
 #btnClearAll:disabled { background: #f1f5f9; color: #94a3b8; }
-#btnLoadFiles { background: #3b82f6; color: white; min-width: 140px; }
+#btnLoadFiles { background: #3b82f6; color: white; min-width: 120px; }
 #btnLoadFiles:hover { background: #2563eb; }
 #btnLoadFiles:pressed { background: #1d4ed8; }
 #btnLoadFiles:disabled { background: #cbd5e1; color: #94a3b8; }
@@ -1172,11 +1187,11 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnStopLoading:hover { background: #fca5a5; color: #991b1b; }
 #btnStopLoading:pressed { background: #ef4444; }
 #btnStopLoading:disabled { background: #f1f5f9; color: #94a3b8; }
-#btnBatchEdit { background: #f59e0b; color: white; min-width: 140px; }
+#btnBatchEdit { background: #f59e0b; color: white; min-width: 115px; }
 #btnBatchEdit:hover { background: #d97706; }
 #btnBatchEdit:pressed { background: #b45309; }
 #btnBatchEdit:disabled { background: #cbd5e1; color: #94a3b8; }
-#btnFindDuplicates { background: #e0f2fe; color: #0284c7; border: 1px solid #bae6fd; min-width: 140px; }
+#btnFindDuplicates { background: #e0f2fe; color: #0284c7; border: 1px solid #bae6fd; min-width: 105px; }
 #btnFindDuplicates:hover { background: #bae6fd; color: #0369a1; border: 1px solid #7dd3fc; }
 #btnFindDuplicates:pressed { background: #0284c7; }
 #btnFindDuplicates:disabled { background: #f1f5f9; color: #94a3b8; border: 1px solid #cbd5e1; }
@@ -1189,7 +1204,7 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnUndo:hover, #btnRedo:hover { background: #e9d5ff; color: #6b21a8; border: 1px solid #d8b4fe; }
 #btnUndo:pressed, #btnRedo:pressed { background: #7e22ce; }
 #btnUndo:disabled, #btnRedo:disabled { background: #f1f5f9; color: #94a3b8; border: 1px solid #e2e8f0; }
-#btnDelete { background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; min-width: 120px; }
+#btnDelete { background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; min-width: 105px; }
 #btnDelete:hover { background: #fecaca; color: #991b1b; border: 1px solid #fca5a5; }
 #btnDelete:pressed { background: #ef4444; }
 #btnDelete:disabled { background: #f1f5f9; color: #94a3b8; border: 1px solid #e2e8f0; }
@@ -1200,6 +1215,9 @@ QHeaderView::section { background: #f8fafc; color: #475569; font-weight: 700; fo
 QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px; }
 QScrollBar::handle:vertical { background: #cbd5e1; border-radius: 4px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: #94a3b8; }
+QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 4px; }
+QScrollBar::handle:horizontal { background: #cbd5e1; border-radius: 4px; min-width: 30px; }
+QScrollBar::handle:horizontal:hover { background: #94a3b8; }
 QLineEdit { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #6366f1; }
 QComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; min-width: 55px; }
@@ -1228,6 +1246,9 @@ QToolTip { background: #1e293b; color: #f8fafc; border: 1px solid #334155; borde
 QGroupBox { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; margin-top: 12px; padding: 16px 10px 10px 10px; font-size: 13px; font-weight: 600; color: #334155; }
 QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 2px 10px; color: #4338ca; }
 QScrollArea { background: transparent; border: none; }
+/* FIX: see matching rule in DARK_STYLESHEET — prevents stale viewport
+   backgrounds after theme switches */
+QScrollArea > QWidget > QWidget { background: transparent; }
 #btnGlobalMute, #btnSettingsToggle { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; border-radius: 8px; padding: 0px; font-size: 16px; }
 #btnGlobalMute:hover, #btnSettingsToggle:hover { background: #e2e8f0; color: #0f172a; }
 #btnGlobalMute:pressed, #btnSettingsToggle:pressed { background: #cbd5e1; }
@@ -4873,12 +4894,13 @@ class MediaTab(QWidget):
         bottom_row1.addWidget(self.btn_redo)
         bottom_row2 = QHBoxLayout()
         bottom_row2.setContentsMargins(0, 0, 0, 0)
-        bottom_row2.setSpacing(12)
-        self.btn_find_dupes = QPushButton("Find Duplicates")
+        bottom_row2.setSpacing(8)
+        self.btn_find_dupes = QPushButton("Find Dupes")
         self.btn_find_dupes.setObjectName("btnFindDuplicates")
         self.btn_find_dupes.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_find_dupes.setEnabled(False)
         self.btn_find_dupes.setIconSize(QSize(16, 16))
+        self.btn_find_dupes.setToolTip("Scan the current list for exact (MD5) or visual (pHash) duplicates")
         self.dupe_menu = QMenu(self)
         self.header_menu = QMenu(self)
         action_exact = QAction("Exact Duplicates (MD5)", self)
@@ -4888,34 +4910,38 @@ class MediaTab(QWidget):
         action_visual.triggered.connect(self._find_visual_duplicates)
         self.dupe_menu.addAction(action_visual)
         self.btn_find_dupes.setMenu(self.dupe_menu)
-        self.btn_batch_edit = QPushButton("Batch Edit Selected")
+        self.btn_batch_edit = QPushButton("Batch Edit")
         self.btn_batch_edit.setObjectName("btnBatchEdit")
         self.btn_batch_edit.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_batch_edit.clicked.connect(self._on_batch_edit)
         self.btn_batch_edit.setEnabled(False)
+        self.btn_batch_edit.setToolTip("Bulk-edit Name/Rating for selected files")
         self.btn_batch_edit.setIconSize(QSize(16, 16))
         self.btn_batch_tag = QPushButton("🏷️ Batch Tag")
         self.btn_batch_tag.setObjectName("btnBatchTag")
         self.btn_batch_tag.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_batch_tag.clicked.connect(self._on_batch_tag)
         self.btn_batch_tag.setEnabled(False)
-        self.btn_relocate = QPushButton("Relocate Files")
+        self.btn_relocate = QPushButton("Relocate")
         self.btn_relocate.setObjectName("btnBatchEdit")
         self.btn_relocate.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_relocate.clicked.connect(self._on_smart_relocate)
         self.btn_relocate.setEnabled(False)
         self.btn_relocate.setIconSize(QSize(16, 16))
-        self.btn_delete = QPushButton("Delete Selected")
+        self.btn_relocate.setToolTip("Move selected files into folders built from a path template")
+        self.btn_delete = QPushButton("Delete")
         self.btn_delete.setObjectName("btnDelete")
         self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_delete.clicked.connect(self._on_delete_selected)
         self.btn_delete.setEnabled(False)
+        self.btn_delete.setToolTip("Send selected files to the Recycle Bin")
         self.btn_delete.setIconSize(QSize(16, 16))
-        self.btn_process = QPushButton("Process All — Rename Files")
+        self.btn_process = QPushButton("Process All")  # full label lives in tooltip — old text forced the bottom bar to overflow at min window width
         self.btn_process.setObjectName("btnProcessAll")
         self.btn_process.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_process.setEnabled(False)
         self.btn_process.clicked.connect(self._on_process_all)
+        self.btn_process.setToolTip("Process all ready files — applies the naming template and renames them")
         self.btn_process.setIconSize(QSize(18, 18))
         bottom_row2.addWidget(self.btn_find_dupes)
         bottom_row2.addWidget(self.btn_batch_edit)
