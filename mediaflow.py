@@ -1152,8 +1152,10 @@ def _build_vector_icon(name: str, is_dark: bool) -> QIcon:
 
 class EditableCellLineEdit(QLineEdit):
     """Table cell text editor: stays in clean read-only mode with a standard
-    arrow cursor when idle/hovered. Enters active editing mode only on click,
-    retains editing mode across mouse movements, and returns to idle when done."""
+    arrow cursor when idle/hovered. Enters active editing mode only on an
+    explicit click or keyboard Tab navigation — never just from receiving
+    focus, since some window managers grant focus on hover alone, and
+    scrolling can also shuffle focus onto a freshly created cell widget."""
 
     def __init__(self, placeholder: str = "", parent=None):
         super().__init__(parent)
@@ -1169,8 +1171,15 @@ class EditableCellLineEdit(QLineEdit):
         super().mousePressEvent(event)
 
     def focusInEvent(self, event):
-        self.setReadOnly(False)
-        self.setCursor(Qt.CursorShape.IBeamCursor)
+        # Only a deliberate action unlocks editing: an actual click (already
+        # unlocked above by the time this fires) or keyboard Tab navigation.
+        # Any other reason — ambient "focus follows mouse", or focus landing
+        # here incidentally while the table recreates/recycles cell widgets
+        # during scrolling — must NOT flip the field into edit mode just
+        # because the cursor happens to be resting over it.
+        if event.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
+            self.setReadOnly(False)
+            self.setCursor(Qt.CursorShape.IBeamCursor)
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
