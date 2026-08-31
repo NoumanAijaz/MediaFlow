@@ -1150,6 +1150,46 @@ def _build_vector_icon(name: str, is_dark: bool) -> QIcon:
         icon.addPixmap(pixmap)
     return icon
 
+class EditableCellLineEdit(QLineEdit):
+    """Table cell text editor: stays in clean read-only mode with a standard
+    arrow cursor when idle/hovered. Enters active editing mode only on click,
+    retains editing mode across mouse movements, and returns to idle when done."""
+
+    def __init__(self, placeholder: str = "", parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText(placeholder)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setReadOnly(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def mousePressEvent(self, event):
+        if self.isReadOnly():
+            self.setReadOnly(False)
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        super().mousePressEvent(event)
+
+    def focusInEvent(self, event):
+        self.setReadOnly(False)
+        self.setCursor(Qt.CursorShape.IBeamCursor)
+        super().focusInEvent(event)
+
+    def focusOutEvent(self, event):
+        self.setReadOnly(True)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.deselect()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.clearFocus()
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_Escape:
+            self.clearFocus()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
 class NoTextDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         painter.save()
@@ -1337,6 +1377,9 @@ QScrollBar::handle:horizontal { background: rgba(167, 139, 250, 0.35); border-ra
 QScrollBar::handle:horizontal:hover { background: rgba(167, 139, 250, 0.55); }
 QLineEdit { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; padding: 4px 8px; color: #ECECF4; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #22D3EE; background: rgba(42, 37, 84, 0.9); }
+EditableCellLineEdit { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 4px 8px; color: #ECECF4; font-size: 12px; }
+EditableCellLineEdit:hover { background: rgba(255, 255, 255, 0.04); border: 1px dashed rgba(139, 92, 246, 0.35); }
+EditableCellLineEdit:focus { background: rgba(42, 37, 84, 0.9); border: 1px solid #22D3EE; color: #ffffff; }
 QComboBox { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; padding: 4px 8px; color: #ECECF4; font-size: 12px; min-width: 55px; }
 #searchComboBox { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; }
 #searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #ECECF4; font-size: 12px; }
@@ -1477,6 +1520,9 @@ QScrollBar::handle:horizontal { background: #cbd5e1; border-radius: 4px; min-wid
 QScrollBar::handle:horizontal:hover { background: #94a3b8; }
 QLineEdit { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; }
 QLineEdit:focus { border: 1px solid #6366f1; }
+EditableCellLineEdit { background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; }
+EditableCellLineEdit:hover { background: rgba(0, 0, 0, 0.03); border: 1px dashed rgba(99, 102, 241, 0.35); }
+EditableCellLineEdit:focus { background: #ffffff; border: 1px solid #6366f1; color: #0f172a; }
 QComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 8px; color: #0f172a; font-size: 12px; min-width: 55px; }
 #searchComboBox { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; }
 #searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #0f172a; font-size: 12px; }
@@ -6740,12 +6786,6 @@ class MediaTab(QWidget):
                 info = watched.property("media_info")
                 if info and info.media_type == 'video' and info.is_valid:
                     self._stop_hover_timer()
-        elif isinstance(watched, QLineEdit) and watched.focusPolicy() == Qt.FocusPolicy.ClickFocus:
-            if event.type() == QEvent.Type.FocusIn:
-                watched.setCursor(Qt.CursorShape.IBeamCursor)
-            elif event.type() == QEvent.Type.FocusOut:
-                watched.setCursor(Qt.CursorShape.ArrowCursor)
-                watched.deselect()
         return super().eventFilter(watched, event)
 
     def _start_hover_timer(self, info, global_rect):
@@ -6755,6 +6795,9 @@ class MediaTab(QWidget):
         if main_win and hasattr(main_win, 'hover_overlay') and main_win.hover_overlay.isVisible():
             return
         if info == self._dismissed_info:
+            return
+        focus_w = QApplication.focusWidget()
+        if isinstance(focus_w, EditableCellLineEdit) and focus_w.hasFocus():
             return
         self._hovered_info = info
         self._hovered_global_rect = global_rect
@@ -6823,12 +6866,8 @@ class MediaTab(QWidget):
             artist_item = self.table.item(row, self.COL_ARTIST)
             val = artist_item.text().strip() if artist_item else ""
             if not val: val = info.parsed_artist
-            artist_input = QLineEdit()
-            artist_input.setPlaceholderText("Enter name…")
+            artist_input = EditableCellLineEdit("Enter name…")
             artist_input.setMaxLength(100)
-            artist_input.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-            artist_input.setCursor(Qt.CursorShape.ArrowCursor)
-            artist_input.installEventFilter(self)
             if val: artist_input.setText(val)
             artist_input.textChanged.connect(self._on_input_changed_sender)
             artist_input.editingFinished.connect(self._on_artist_editing_finished)
@@ -6856,11 +6895,7 @@ class MediaTab(QWidget):
             val = tags_item.text().strip() if tags_item else ""
             if not val and hasattr(info, 'tags') and info.tags:
                 val = ", ".join(info.tags)
-            tag_input = QLineEdit()
-            tag_input.setPlaceholderText("e.g. nature, 4k, favorite")
-            tag_input.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-            tag_input.setCursor(Qt.CursorShape.ArrowCursor)
-            tag_input.installEventFilter(self)
+            tag_input = EditableCellLineEdit("e.g. nature, 4k, favorite")
             if val: tag_input.setText(val)
             tag_input.editingFinished.connect(self._on_tags_edited)
             self.table.setCellWidget(row, self.COL_TAGS, tag_input)
