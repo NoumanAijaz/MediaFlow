@@ -47,6 +47,71 @@ elif sys.platform == "darwin":
 else:
     BASE_FONT_FAMILY = "Ubuntu"
 
+# ─── Nebula design tokens ────────────────────────────────────────────────────
+# Single source of truth for the futuristic skin. Same hues as before, but
+# deeper backgrounds, higher-contrast text and an electric cyan "live" accent.
+class Nebula:
+    BG0 = "#07060F"      # window abyss (dark)
+    BG1 = "#0B0918"      # sidebar / layer 1 (dark)
+    BG2 = "#15122B"      # glass panel base (dark)
+    ACCENT = "#8B5CF6"   # violet — primary actions
+    ACCENT2 = "#22D3EE"  # electric cyan — active/live states (watch, focus, selection stripe)
+    TEXT = "#ECECF4"     # primary text (dark) — better contrast than the old #e0e0e0
+    TEXT_DIM = "#8E8AA8"
+    ACCENT_L = "#6D28D9"   # violet (light theme)
+    ACCENT2_L = "#0891B2"  # cyan (light theme)
+    TEXT_L = "#0F172A"
+    TEXT_DIM_L = "#64748B"
+
+
+def apply_glow(widget, color=None, radius=20, alpha=110):
+    """Attach a soft neon glow to a widget (QGraphicsDropShadowEffect).
+
+    Pass color=None to remove. Kept subtle on purpose — glow marks ACTIVE or
+    PRIMARY things only; everything glowing means nothing glows.
+    """
+    if color is None:
+        try:
+            widget.setGraphicsEffect(None)
+        except RuntimeError:
+            pass
+        return None
+    try:
+        eff = QGraphicsDropShadowEffect(widget)
+        eff.setBlurRadius(radius)
+        eff.setOffset(0, 0)
+        c = QColor(color)
+        c.setAlpha(alpha)
+        eff.setColor(c)
+        widget.setGraphicsEffect(eff)
+        return eff
+    except RuntimeError:
+        return None
+
+
+def _safe_int(val, default=0):
+    """int() that tolerates ffprobe's 'N/A' / None / missing values."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val, default=0.0):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _mono_font(point=9, bold=True):
+    """Monospace font for data columns (duration/size/dates) so digits align."""
+    f = QFont()
+    f.setFamilies(["Consolas", "Cascadia Mono", "JetBrains Mono", "DejaVu Sans Mono", "monospace"])
+    f.setPointSize(point)
+    f.setBold(bold)
+    return f
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QFileDialog, QTableWidget, QTableWidgetItem,
@@ -54,7 +119,8 @@ from PyQt6.QtWidgets import (
     QFrame, QAbstractItemView, QMenu, QCheckBox, QDialog, QDialogButtonBox, QRadioButton,
     QFormLayout, QGroupBox, QStackedWidget, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QSlider, QScrollArea, QStyle, QSpinBox, QDoubleSpinBox,
-    QSplitter, QSizePolicy, QInputDialog, QTableWidgetSelectionRange, QDateEdit
+    QSplitter, QSizePolicy, QInputDialog, QTableWidgetSelectionRange, QDateEdit,
+    QGraphicsDropShadowEffect
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, pyqtSlot, QPropertyAnimation, QEasingCurve,
@@ -97,12 +163,6 @@ AUDIO_EXTENSIONS = {
 }
 PDF_EXTENSIONS = {
     '.pdf'
-}
-
-IGNORED_EXTENSIONLESS_NAMES = {
-    'readme', 'license', 'licence', 'copying', 'notice', 'authors', 'changelog',
-    'makefile', 'dockerfile', 'vagrantfile', 'gemfile', 'procfile', 'cmakelists.txt',
-    '.gitignore', '.gitattributes', '.ds_store', 'thumbs.db', 'desktop.ini'
 }
 
 def get_extensions_for_type(media_type: str) -> set[str]:
@@ -261,7 +321,9 @@ def calculate_file_hash(filepath: str, head_only: bool = False) -> str | None:
                 for chunk in iter(lambda: f.read(65536), b''):
                     hasher.update(chunk)
         return hasher.hexdigest()
-    except Exception: return None
+    except Exception as e:
+        logger.debug("calculate_file_hash failed for %s: %s", filepath, e)
+        return None
 
 def calculate_perceptual_hash(filepath: str, media_type: str) -> str | None:
     try:
@@ -283,7 +345,14 @@ def calculate_perceptual_hash(filepath: str, media_type: str) -> str | None:
                         if ret: img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             finally:
                 if cap is not None:
-                    cap.release()
+                    try:
+                        with _CV_LOCK:
+                            cap.release()
+                    except Exception:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
         if img is None: return None
         with _CV_LOCK:
             resized = cv2.resize(img, (9, 8), interpolation=cv2.INTER_AREA)
@@ -300,7 +369,9 @@ def hamming_distance(h1: str, h2: str) -> int:
         val1 = int(h1, 16)
         val2 = int(h2, 16)
         return bin(val1 ^ val2).count('1')
-    except Exception: return 999
+    except Exception as e:
+        logger.debug("hamming_distance failed for %s/%s: %s", h1, h2, e)
+        return 999
 
 def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> bool:
     if not query_str: return True
@@ -436,16 +507,9 @@ def get_file_deep_metadata(filepath: str, ffprobe_path: str = None) -> dict | No
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', startupinfo=startupinfo, timeout=10)
         if result.returncode == 0 and result.stdout:
             return parse_ffprobe_json(json.loads(result.stdout))
-    except Exception: pass
+    except Exception as e:
+        logger.debug("get_file_deep_metadata failed for %s: %s", filepath, e)
     return None
-
-def _safe_int(val, default: int = 0) -> int:
-    try: return int(val)
-    except (ValueError, TypeError): return default
-
-def _safe_float(val, default: float = 0.0) -> float:
-    try: return float(val)
-    except (ValueError, TypeError): return default
 
 def parse_ffprobe_json(data: dict) -> dict:
     parsed = {'format': '', 'size_bytes': 0, 'duration_seconds': 0.0, 'bitrate_kbps': 0, 'video': None, 'audio': None, 'hdr_type': 'SDR'}
@@ -457,21 +521,14 @@ def parse_ffprobe_json(data: dict) -> dict:
     for stream in data.get('streams', []):
         codec_type = stream.get('codec_type')
         if codec_type == 'video' and not parsed['video']:
-            v_info = {
-                'codec': str(stream.get('codec_name', '')).upper(),
-                'profile': stream.get('profile', ''),
-                'width': _safe_int(stream.get('width', 0)),
-                'height': _safe_int(stream.get('height', 0)),
-                'fps': 0.0,
-                'bitrate_kbps': _safe_int(stream.get('bit_rate', 0)) // 1000,
-                'pix_fmt': stream.get('pix_fmt', '')
-            }
-            fps_str = str(stream.get('r_frame_rate', ''))
+            v_info = {'codec': stream.get('codec_name', '').upper(), 'profile': stream.get('profile', ''), 'width': _safe_int(stream.get('width', 0)), 'height': _safe_int(stream.get('height', 0)), 'fps': 0.0, 'bitrate_kbps': 0, 'pix_fmt': stream.get('pix_fmt', '')}
+            fps_str = stream.get('r_frame_rate', '')
             if '/' in fps_str:
                 try:
                     num, den = map(float, fps_str.split('/'))
                     if den > 0: v_info['fps'] = round(num / den, 2)
                 except ValueError: pass
+            v_info['bitrate_kbps'] = _safe_int(stream.get('bit_rate', 0)) // 1000
             parsed['video'] = v_info
             for sd in stream.get('side_data_list', []):
                 sd_type = sd.get('side_data_type', '')
@@ -484,13 +541,8 @@ def parse_ffprobe_json(data: dict) -> dict:
                     parsed['hdr_type'] = 'Dolby Vision' if codec_tag in ['dvh1', 'dvhe'] else 'HDR10'
                 elif color_transfer == 'arib-std-b67': parsed['hdr_type'] = 'HLG'
         elif codec_type == 'audio' and not parsed['audio']:
-            a_info = {
-                'codec': str(stream.get('codec_name', '')).upper(),
-                'sample_rate_hz': _safe_int(stream.get('sample_rate', 0)),
-                'channels': _safe_int(stream.get('channels', 0)),
-                'channel_layout': stream.get('channel_layout', ''),
-                'bitrate_kbps': _safe_int(stream.get('bit_rate', 0)) // 1000
-            }
+            a_info = {'codec': stream.get('codec_name', '').upper(), 'sample_rate_hz': _safe_int(stream.get('sample_rate', 0)), 'channels': _safe_int(stream.get('channels', 0)), 'channel_layout': stream.get('channel_layout', ''), 'bitrate_kbps': 0}
+            a_info['bitrate_kbps'] = _safe_int(stream.get('bit_rate', 0)) // 1000
             ch = a_info['channels']
             if ch == 1: a_info['channel_layout'] = 'Mono'
             elif ch == 2: a_info['channel_layout'] = 'Stereo'
@@ -543,7 +595,14 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
                         ret, frame = cap.read()
             finally:
                 if cap is not None:
-                    cap.release()
+                    try:
+                        with _CV_LOCK:
+                            cap.release()
+                    except Exception:
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
         else:
             with _CV_LOCK:
                 frame = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -669,7 +728,8 @@ def _exif_datetime_original(filepath: str) -> datetime | None:
             raw = got.get(0x9003) or got.get(0x9004) or got.get(0x0132)
             if raw:
                 return datetime.strptime(raw.strip()[:19], "%Y:%m:%d %H:%M:%S")
-    except Exception:
+    except Exception as e:
+        logger.debug("_exif_datetime_original failed for %s: %s", filepath, e)
         return None
     return None
 
@@ -731,9 +791,18 @@ def send_to_recycle_bin(path: str) -> bool:
             logger.warning("send2trash failed for %s: %s", path, e)
             return False
 
+_ICON_COLOR_OVERRIDE = None  # per-theme accent for vector icons (set by apply_theme)
+
+
+def set_icon_accent(color_hex):
+    """Point vector icons at the active theme's accent color (None = default violet)."""
+    global _ICON_COLOR_OVERRIDE
+    _ICON_COLOR_OVERRIDE = color_hex
+
+
 def get_vector_icon(name: str, is_dark: bool) -> QIcon:
     # Cache icons to avoid rebuilding 6 sizes x ~20 icons on every theme toggle
-    cache_key = (name, is_dark)
+    cache_key = (name, is_dark, _ICON_COLOR_OVERRIDE)
     if cache_key in _ICON_CACHE:
         return _ICON_CACHE[cache_key]
     icon = _build_vector_icon(name, is_dark)
@@ -742,14 +811,15 @@ def get_vector_icon(name: str, is_dark: bool) -> QIcon:
 
 
 def _build_vector_icon(name: str, is_dark: bool) -> QIcon:
+    accent = _ICON_COLOR_OVERRIDE
     if name in ['delete', 'clear', 'mute', 'stop', 'close', 'btnSettingsRemove']:
         color_hex = '#f87171' if is_dark else '#dc2626'
     elif name in ['process', 'play', 'pause', 'valid']:
         color_hex = '#34d399' if is_dark else '#059669'
     elif name in ['video', 'image', 'audio', 'star', 'save', 'plus', 'pdf', 'relocate']:
-        color_hex = '#a78bfa' if is_dark else '#6366f1'
+        color_hex = accent or ('#a78bfa' if is_dark else '#6366f1')
     else:
-        color_hex = '#c4b5fd' if is_dark else '#4338ca'
+        color_hex = accent or ('#c4b5fd' if is_dark else '#4338ca')
 
     icon = QIcon()
     color = QColor(color_hex)
@@ -1093,6 +1163,9 @@ class NoTextDelegate(QStyledItemDelegate):
         if option.state & QStyle.StateFlag.State_Selected:
             bg_color = QColor(99, 102, 241, 64) if is_dark else QColor(99, 102, 241, 45)
             painter.fillRect(option.rect, bg_color)
+            # Nebula: cyan edge stripe marks the active row
+            stripe = QColor(Nebula.ACCENT2) if is_dark else QColor(Nebula.ACCENT2_L)
+            painter.fillRect(option.rect.x(), option.rect.y(), 3, option.rect.height(), stripe)
         elif option.state & QStyle.StateFlag.State_MouseOver:
             bg_color = QColor(255, 255, 255, 12) if is_dark else QColor(0, 0, 0, 10)
             painter.fillRect(option.rect, bg_color)
@@ -1124,6 +1197,9 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         if opt.state & QStyle.StateFlag.State_Selected:
             bg_color = QColor(99, 102, 241, 46) if is_dark else QColor(99, 102, 241, 30)
             painter.fillRect(opt.rect, bg_color)
+            # Nebula: cyan edge stripe marks the active row
+            stripe = QColor(Nebula.ACCENT2) if is_dark else QColor(Nebula.ACCENT2_L)
+            painter.fillRect(opt.rect.x(), opt.rect.y(), 3, opt.rect.height(), stripe)
         elif opt.state & QStyle.StateFlag.State_MouseOver:
             bg_color = QColor(255, 255, 255, 12) if is_dark else QColor(0, 0, 0, 10)
             painter.fillRect(opt.rect, bg_color)
@@ -1157,10 +1233,15 @@ class StatusBadgeDelegate(QStyledItemDelegate):
         painter.setBrush(badge_bg)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(QRectF(badge_rect), 6, 6)
-        
+
         painter.setFont(QFont(BASE_FONT_FAMILY, 9, QFont.Weight.Bold))
+        # Nebula: status dot — state readable at a glance, even skimming
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(badge_fg)
+        painter.drawEllipse(QRectF(badge_rect.x() + 9, badge_rect.center().y() - 3.0, 6.0, 6.0))
         painter.setPen(badge_fg)
-        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
+        text_rect = QRect(badge_rect.x() + 20, badge_rect.y(), badge_rect.width() - 22, badge_rect.height())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
         painter.restore()
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -1180,19 +1261,19 @@ class NumericTableWidgetItem(QTableWidgetItem):
 # ─── Theme Manager ──────────────────────────────────────────────────────────────
 
 DARK_STYLESHEET = """
-QMainWindow { background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0f0c29, stop:0.5 #302b63, stop:1 #24243e); }
-QWidget { color: #e0e0e0; font-family: 'Segoe UI', 'Inter', sans-serif; }
-#sidebar { background: #09071c; border-right: 1px solid rgba(167, 139, 250, 0.15); min-width: 220px; max-width: 220px; }
+QMainWindow { background: #07060F; }
+QWidget { color: #ECECF4; font-family: 'Segoe UI', 'Inter', sans-serif; }
+#sidebar { background: #0B0918; border-right: 1px solid #1E1A3A; min-width: 220px; max-width: 220px; }
 #titleLabel { font-size: 20px; font-weight: 800; color: #ffffff; letter-spacing: 2px; margin-top: 10px; }
 #subtitleLabel { font-size: 10px; font-weight: 600; color: #a78bfa; letter-spacing: 1.5px; text-transform: uppercase; margin-top: 2px; }
 #smartSidebarTitle { font-size: 11px; font-weight: 700; color: #7c7c9a; letter-spacing: 1.5px; text-transform: uppercase; margin-left: 12px; }
 #navButton { background: transparent; color: #9ca3af; text-align: left; padding: 12px 24px; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; border-radius: 8px; margin: 4px 16px; border: 1px solid transparent; }
 #navButton:hover { background: rgba(139, 92, 246, 0.08); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.15); }
-#navButton[active="true"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #8b5cf6); color: #ffffff; border: 1px solid rgba(124, 58, 237, 0.3); font-weight: 700; }
-#controlPanel { background: rgba(30, 27, 75, 0.65); border: 1px solid rgba(167, 139, 250, 0.2); border-radius: 16px; padding: 16px 20px; }
-#filterPanel { background: rgba(30, 27, 75, 0.50); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
-#advancedFilterPanel { background: rgba(30, 27, 75, 0.50); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
-#statsPanel { background: rgba(30, 27, 75, 0.60); border: 1px solid rgba(167, 139, 250, 0.2); border-left: 4px solid #8b5cf6; border-radius: 8px; padding: 0px; }
+#navButton[active="true"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6D28D9, stop:1 #8B5CF6); color: #ffffff; border: 1px solid rgba(124, 58, 237, 0.3); border-left: 3px solid #22D3EE; font-weight: 700; }
+#controlPanel { background: rgba(21, 18, 43, 0.78); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 16px; padding: 16px 20px; }
+#filterPanel { background: rgba(21, 18, 43, 0.60); border: 1px solid rgba(139, 92, 246, 0.20); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
+#advancedFilterPanel { background: rgba(21, 18, 43, 0.60); border: 1px solid rgba(139, 92, 246, 0.20); border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
+#statsPanel { background: rgba(21, 18, 43, 0.85); border: 1px solid rgba(139, 92, 246, 0.25); border-left: 4px solid #8B5CF6; border-radius: 8px; padding: 0px; }
 #statValue { font-size: 18px; font-weight: 800; color: #ffffff; }
 #statLabel { font-size: 9px; color: #a78bfa; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }
 QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; }
@@ -1243,21 +1324,22 @@ QPushButton { border: none; border-radius: 8px; padding: 10px 24px; font-size: 1
 #btnDelete:hover { background: rgba(239, 68, 68, 0.25); color: #ffffff; border: 1px solid #ef4444; }
 #btnDelete:pressed { background: #b91c1c; }
 #btnDelete:disabled { background: transparent; color: rgba(255, 255, 255, 0.15); border: 1px solid rgba(255, 255, 255, 0.05); }
-QTableWidget { background: rgba(15, 12, 41, 0.7); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 14px; gridline-color: rgba(167, 139, 250, 0.08); selection-background-color: rgba(99, 102, 241, 0.25); font-size: 12px; outline: none; }
-QTableWidget::item { padding: 6px 10px; border-bottom: 1px solid rgba(167, 139, 250, 0.06); }
+QTableWidget { background: rgba(16, 13, 34, 0.72); border: 1px solid rgba(139, 92, 246, 0.18); border-radius: 14px; gridline-color: rgba(139, 92, 246, 0.07); selection-background-color: rgba(99, 102, 241, 0.25); font-size: 12px; outline: none; }
+QTableWidget::item { padding: 6px 10px; border-bottom: 1px solid rgba(139, 92, 246, 0.06); }
 QTableWidget::item:selected { background: rgba(99, 102, 241, 0.18); }
-QHeaderView::section { background: #151233; color: #a78bfa; font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; padding: 12px 14px; border: none; border-bottom: 2px solid rgba(167, 139, 250, 0.3); border-right: 1px solid rgba(167, 139, 250, 0.08); }
+QTableWidget::item:hover { background: rgba(34, 211, 238, 0.05); }
+QHeaderView::section { background: #0F0D20; color: #8E8AA8; font-weight: 700; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; padding: 12px 14px; border: none; border-bottom: 2px solid rgba(139, 92, 246, 0.35); border-right: 1px solid rgba(139, 92, 246, 0.08); }
 QScrollBar:vertical { background: transparent; width: 8px; margin: 4px 2px; }
 QScrollBar::handle:vertical { background: rgba(167, 139, 250, 0.35); border-radius: 4px; min-height: 30px; }
 QScrollBar::handle:vertical:hover { background: rgba(167, 139, 250, 0.55); }
 QScrollBar:horizontal { background: transparent; height: 8px; margin: 2px 4px; }
 QScrollBar::handle:horizontal { background: rgba(167, 139, 250, 0.35); border-radius: 4px; min-width: 30px; }
 QScrollBar::handle:horizontal:hover { background: rgba(167, 139, 250, 0.55); }
-QLineEdit { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; }
-QLineEdit:focus { border: 1px solid #8b5cf6; background: rgba(55, 48, 110, 0.9); }
-QComboBox { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; padding: 4px 8px; color: #e0e0e0; font-size: 12px; min-width: 55px; }
-#searchComboBox { background: rgba(45, 40, 90, 0.8); border: 1px solid rgba(167, 139, 250, 0.25); border-radius: 6px; }
-#searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #e0e0e0; font-size: 12px; }
+QLineEdit { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; padding: 4px 8px; color: #ECECF4; font-size: 12px; }
+QLineEdit:focus { border: 1px solid #22D3EE; background: rgba(42, 37, 84, 0.9); }
+QComboBox { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; padding: 4px 8px; color: #ECECF4; font-size: 12px; min-width: 55px; }
+#searchComboBox { background: rgba(34, 30, 68, 0.8); border: 1px solid rgba(139, 92, 246, 0.28); border-radius: 6px; }
+#searchComboBox QLineEdit { background: transparent; border: none; padding: 4px 8px; color: #ECECF4; font-size: 12px; }
 QComboBox QAbstractItemView { background: #1e1b4b; border: 1px solid rgba(167, 139, 250, 0.3); border-radius: 6px; selection-background-color: rgba(99, 102, 241, 0.4); color: #e0e0e0; }
 QProgressBar { background: rgba(30, 27, 75, 0.6); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 8px; text-align: center; color: #a78bfa; font-size: 11px; font-weight: 600; height: 18px; }
 QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #6366f1, stop:1 #a78bfa); border-radius: 7px; }
@@ -1313,6 +1395,13 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 #btnClearVP:pressed, #btnClearIO:pressed, #btnClearAP:pressed, #btnClearFF:pressed { background: #b91c1c; }
 #appPathLabel { font-size: 13px; color: #ffffff; font-weight: 600; }
 QLabel[heading="true"] { font-size: 12px; font-weight: 700; color: #a78bfa; text-transform: uppercase; letter-spacing: 1px; margin-top: 6px; }
+
+/* ── Nebula additions (dark) ── */
+QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus { border: 1px solid #22D3EE; }
+QComboBox:focus { border: 1px solid #22D3EE; }
+#emptyTitle { font-size: 24px; font-weight: 800; color: #ECECF4; letter-spacing: 0.5px; }
+#emptySub { color: #8E8AA8; font-size: 13px; }
+#emptySteps { color: #6E6A8C; font-size: 12px; }
 """
 
 LIGHT_STYLESHEET = """
@@ -1324,7 +1413,7 @@ QWidget { color: #0f172a; font-family: 'Segoe UI', 'Inter', sans-serif; }
 #smartSidebarTitle { font-size: 11px; font-weight: 700; color: #64748b; letter-spacing: 1.5px; text-transform: uppercase; margin-left: 12px; }
 #navButton { background: transparent; color: #475569; text-align: left; padding: 12px 24px; font-size: 13px; font-weight: 600; letter-spacing: 0.5px; border-radius: 8px; margin: 4px 16px; border: 1px solid transparent; }
 #navButton:hover { background: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1; }
-#navButton[active="true"] { background: #e0e7ff; color: #4338ca; border: 1px solid #c7d2fe; font-weight: 700; }
+#navButton[active="true"] { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #EDE9FE, stop:1 #E0E7FF); color: #4338CA; border: 1px solid #C7D2FE; border-left: 3px solid #0891B2; font-weight: 700; }
 #controlPanel { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px 20px; }
 #filterPanel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
 #advancedFilterPanel { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 10px 16px; margin-bottom: 8px; }
@@ -1443,7 +1532,270 @@ QScrollArea > QWidget > QWidget { background: transparent; }
 #btnClearVP:pressed, #btnClearIO:pressed, #btnClearAP:pressed, #btnClearFF:pressed { background: #ef4444; }
 #appPathLabel { font-size: 13px; color: #0f172a; font-weight: 600; }
 QLabel[heading="true"] { font-size: 12px; font-weight: 700; color: #4338ca; text-transform: uppercase; letter-spacing: 1px; margin-top: 6px; }
+
+/* ── Nebula additions (light) ── */
+QTableWidget::item:hover { background: rgba(2, 132, 199, 0.05); }
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus { border: 1px solid #0891B2; }
+#emptyTitle { font-size: 24px; font-weight: 800; color: #0F172A; letter-spacing: 0.5px; }
+#emptySub { color: #64748B; font-size: 13px; }
+#emptySteps { color: #94A3B8; font-size: 12px; }
 """
+
+# Nebula: honor the cross-platform base font instead of hardcoding Segoe UI
+# (macOS/Linux fell back arbitrarily; this routes both themes through
+# BASE_FONT_FAMILY resolved at startup).
+_NEBULA_FAM = f"'{BASE_FONT_FAMILY}', 'Inter', sans-serif"
+DARK_STYLESHEET = DARK_STYLESHEET.replace("'Segoe UI', 'Inter', sans-serif", _NEBULA_FAM)
+LIGHT_STYLESHEET = LIGHT_STYLESHEET.replace("'Segoe UI', 'Inter', sans-serif", _NEBULA_FAM)
+
+def _remap_css(css: str, mapping: dict) -> str:
+    # Case-insensitive token replacement: stylesheets mix #8b5cf6 / #8B5CF6
+    # forms of the same color, both must remap.
+    for old, new in mapping.items():
+        css = re.sub(re.escape(old), lambda _m: new, css, flags=re.IGNORECASE)
+    return css
+
+# ─── Color Accent Mapping Dictionaries ──────────────────────────────────────
+
+# Dark mode accent maps (remap DARK_STYLESHEET base violet & cyan tokens)
+_DARK_DEEP_SPACE_MAP = {
+    '#8b5cf6': '#22d3ee', '#a78bfa': '#67e8f9', '#c4b5fd': '#a5f3fc',
+    '#6366f1': '#0891b2', '#6d28d9': '#0e7490', '#4f46e5': '#0e7490',
+    '#7c3aed': '#06b6d4', '#4338ca': '#155e75', '#3730a3': '#164e63',
+    '#07060f': '#020617', '#0b0918': '#050b1a', '#1e1a3a': '#13233f',
+    '#1e1b4b': '#0b1b33', '#0f0d20': '#050d1c', '#6e6a8c': '#5c6f8c',
+    '139, 92, 246': '34, 211, 238', '167, 139, 250': '103, 232, 249',
+    '99, 102, 241': '8, 145, 178', '124, 58, 237': '6, 182, 212',
+    '21, 18, 43': '8, 20, 40', '16, 13, 34': '6, 14, 30',
+    '34, 30, 68': '12, 26, 48', '42, 37, 84': '16, 34, 60',
+    '30, 27, 75': '8, 18, 36', '15, 12, 41': '5, 12, 26',
+    '45, 40, 90': '12, 24, 46',
+}
+
+_DARK_ORANGE_MAP = {
+    '#8b5cf6': '#f59e0b', '#a78bfa': '#fbbf24', '#c4b5fd': '#fde68a',
+    '#6366f1': '#d97706', '#6d28d9': '#b45309', '#4f46e5': '#b45309',
+    '#7c3aed': '#d97706', '#4338ca': '#92400e', '#3730a3': '#78350f',
+    '#22d3ee': '#fb923c',
+    '139, 92, 246': '245, 158, 11', '167, 139, 250': '251, 191, 36',
+    '99, 102, 241': '217, 119, 6', '124, 58, 237': '217, 119, 6',
+    '34, 211, 238': '251, 146, 60',
+}
+
+_DARK_RED_MAP = {
+    '#8b5cf6': '#ef4444', '#a78bfa': '#f87171', '#c4b5fd': '#fecaca',
+    '#6366f1': '#dc2626', '#6d28d9': '#b91c1c', '#4f46e5': '#b91c1c',
+    '#7c3aed': '#dc2626', '#4338ca': '#991b1b', '#3730a3': '#7f1d1d',
+    '#22d3ee': '#f43f5e',
+    '139, 92, 246': '239, 68, 68', '167, 139, 250': '248, 113, 113',
+    '99, 102, 241': '220, 38, 38', '124, 58, 237': '220, 38, 38',
+    '34, 211, 238': '244, 63, 94',
+}
+
+_DARK_BLUE_MAP = {
+    '#8b5cf6': '#3b82f6', '#a78bfa': '#60a5fa', '#c4b5fd': '#bfdbfe',
+    '#6366f1': '#2563eb', '#6d28d9': '#1d4ed8', '#4f46e5': '#1d4ed8',
+    '#7c3aed': '#2563eb', '#4338ca': '#1e40af', '#3730a3': '#1e3a8a',
+    '#22d3ee': '#38bdf8',
+    '139, 92, 246': '59, 130, 246', '167, 139, 250': '96, 165, 250',
+    '99, 102, 241': '37, 99, 235', '124, 58, 237': '37, 99, 235',
+    '34, 211, 238': '56, 189, 248',
+}
+
+_DARK_EMERALD_MAP = {
+    '#8b5cf6': '#10b981', '#a78bfa': '#34d399', '#c4b5fd': '#a7f3d0',
+    '#6366f1': '#059669', '#6d28d9': '#047857', '#4f46e5': '#047857',
+    '#7c3aed': '#059669', '#4338ca': '#065f46', '#3730a3': '#064e3b',
+    '#22d3ee': '#2dd4bf', '#6e6a8c': '#6b8a7c',
+    '#07060f': '#03110d', '#0b0918': '#061511', '#1e1a3a': '#14332a',
+    '#1e1b4b': '#0c2119', '#0f0d20': '#06130e',
+    '139, 92, 246': '16, 185, 129', '167, 139, 250': '52, 211, 153',
+    '99, 102, 241': '5, 150, 105', '124, 58, 237': '5, 150, 105',
+    '34, 211, 238': '45, 212, 191',
+    '21, 18, 43': '6, 24, 20', '16, 13, 34': '5, 18, 15',
+    '34, 30, 68': '10, 30, 25', '42, 37, 84': '12, 36, 30',
+    '30, 27, 75': '6, 22, 18', '15, 12, 41': '4, 15, 12',
+    '45, 40, 90': '10, 28, 23',
+}
+
+# Light mode accent maps (remap LIGHT_STYLESHEET base indigo tokens)
+_LIGHT_DEEP_SPACE_MAP = {
+    '#6366f1': '#0891b2', '#4f46e5': '#0e7490', '#4338ca': '#155e75', '#3730a3': '#164e63',
+    '#7e22ce': '#0e7490', '#6b21a8': '#155e75', '#0891b2': '#0891b2',
+    '#ede9fe': '#e0f2fe', '#e0e7ff': '#ccfbf1', '#c7d2fe': '#a5f3fc',
+    '#e9d5ff': '#a5f3fc', '#f3e8ff': '#e0f2fe', '#d8b4fe': '#67e8f9',
+    '99, 102, 241': '8, 145, 178', '2, 132, 199': '8, 145, 178',
+}
+
+_LIGHT_ORANGE_MAP = {
+    '#6366f1': '#d97706', '#4f46e5': '#b45309', '#4338ca': '#92400e', '#3730a3': '#78350f',
+    '#7e22ce': '#b45309', '#6b21a8': '#92400e', '#0891b2': '#ea580c',
+    '#ede9fe': '#fef3c7', '#e0e7ff': '#ffedd5', '#c7d2fe': '#fed7aa',
+    '#e9d5ff': '#fed7aa', '#f3e8ff': '#fef3c7', '#d8b4fe': '#fcd34d',
+    '99, 102, 241': '217, 119, 6', '2, 132, 199': '234, 88, 12',
+}
+
+_LIGHT_RED_MAP = {
+    '#6366f1': '#dc2626', '#4f46e5': '#b91c1c', '#4338ca': '#991b1b', '#3730a3': '#7f1d1d',
+    '#7e22ce': '#b91c1c', '#6b21a8': '#991b1b', '#0891b2': '#e11d48',
+    '#ede9fe': '#ffe4e6', '#e0e7ff': '#fee2e2', '#c7d2fe': '#fecaca',
+    '#e9d5ff': '#fecaca', '#f3e8ff': '#ffe4e6', '#d8b4fe': '#fda4af',
+    '99, 102, 241': '220, 38, 38', '2, 132, 199': '225, 29, 72',
+}
+
+_LIGHT_BLUE_MAP = {
+    '#6366f1': '#2563eb', '#4f46e5': '#1d4ed8', '#4338ca': '#1e40af', '#3730a3': '#1e3a8a',
+    '#7e22ce': '#1d4ed8', '#6b21a8': '#1e40af', '#0891b2': '#0284c7',
+    '#ede9fe': '#e0f2fe', '#e0e7ff': '#dbeafe', '#c7d2fe': '#bfdbfe',
+    '#e9d5ff': '#bfdbfe', '#f3e8ff': '#e0f2fe', '#d8b4fe': '#93c5fd',
+    '99, 102, 241': '37, 99, 235', '2, 132, 199': '2, 132, 199',
+}
+
+_LIGHT_EMERALD_MAP = {
+    '#6366f1': '#059669', '#4f46e5': '#047857', '#4338ca': '#065f46', '#3730a3': '#064e3b',
+    '#7e22ce': '#047857', '#6b21a8': '#065f46', '#0891b2': '#0d9488',
+    '#ede9fe': '#ecfdf5', '#e0e7ff': '#d1fae5', '#c7d2fe': '#a7f3d0',
+    '#e9d5ff': '#a7f3d0', '#f3e8ff': '#ecfdf5', '#d8b4fe': '#6ee7b7',
+    '99, 102, 241': '5, 150, 105', '2, 132, 199': '13, 148, 136',
+}
+
+def _theme_palette(spec: dict) -> QPalette:
+    """Build a QPalette from a role-name → hex dict."""
+    roles = {
+        'window': QPalette.ColorRole.Window, 'window_text': QPalette.ColorRole.WindowText,
+        'base': QPalette.ColorRole.Base, 'alt': QPalette.ColorRole.AlternateBase,
+        'tip_base': QPalette.ColorRole.ToolTipBase, 'tip_text': QPalette.ColorRole.ToolTipText,
+        'text': QPalette.ColorRole.Text, 'button': QPalette.ColorRole.Button,
+        'button_text': QPalette.ColorRole.ButtonText, 'bright': QPalette.ColorRole.BrightText,
+        'highlight': QPalette.ColorRole.Highlight, 'highlight_text': QPalette.ColorRole.HighlightedText,
+        'link': QPalette.ColorRole.Link,
+    }
+    pal = QPalette()
+    for key, role in roles.items():
+        if key in spec:
+            pal.setColor(role, QColor(spec[key]))
+    return pal
+
+THEME_BASES = {
+    'dark': {
+        'dark': True,
+        'css': DARK_STYLESHEET,
+        'palette': {
+            'window': '#07060F', 'window_text': '#ECECF4', 'base': '#07060F',
+            'alt': '#15122B', 'tip_base': '#15122B', 'tip_text': '#ECECF4',
+            'text': '#ECECF4', 'button': '#15122B', 'button_text': '#ECECF4',
+            'bright': '#a78bfa', 'highlight': '#6366f1',
+            'highlight_text': '#ffffff', 'link': '#22D3EE'
+        }
+    },
+    'light': {
+        'dark': False,
+        'css': LIGHT_STYLESHEET,
+        'palette': {
+            'window': '#f8fafc', 'window_text': '#0f172a', 'base': '#ffffff',
+            'alt': '#f1f5f9', 'tip_base': '#ffffff', 'tip_text': '#0f172a',
+            'text': '#0f172a', 'button': '#ffffff', 'button_text': '#0f172a',
+            'bright': '#dc2626', 'highlight': '#6366f1',
+            'highlight_text': '#ffffff', 'link': '#2563eb'
+        }
+    }
+}
+
+ACCENTS = {
+    "Deep Space": {
+        'dark': {
+            'accent': '#22D3EE', 'accent2': '#818CF8',
+            'icon_dark': '#67e8f9', 'icon_light': '#0891b2',
+            'remap': _DARK_DEEP_SPACE_MAP,
+            'palette_highlight': '#0891B2', 'palette_bright': '#67E8F9',
+        },
+        'light': {
+            'accent': '#0891B2', 'accent2': '#0284C7',
+            'icon_dark': '#67e8f9', 'icon_light': '#0891b2',
+            'remap': _LIGHT_DEEP_SPACE_MAP,
+            'palette_highlight': '#0891B2', 'palette_bright': '#0891B2',
+        }
+    },
+    "Orange": {
+        'dark': {
+            'accent': '#F59E0B', 'accent2': '#FB923C',
+            'icon_dark': '#FBBF24', 'icon_light': '#D97706',
+            'remap': _DARK_ORANGE_MAP,
+            'palette_highlight': '#D97706', 'palette_bright': '#FBBF24',
+        },
+        'light': {
+            'accent': '#D97706', 'accent2': '#EA580C',
+            'icon_dark': '#FBBF24', 'icon_light': '#D97706',
+            'remap': _LIGHT_ORANGE_MAP,
+            'palette_highlight': '#D97706', 'palette_bright': '#D97706',
+        }
+    },
+    "Red": {
+        'dark': {
+            'accent': '#EF4444', 'accent2': '#F43F5E',
+            'icon_dark': '#F87171', 'icon_light': '#DC2626',
+            'remap': _DARK_RED_MAP,
+            'palette_highlight': '#DC2626', 'palette_bright': '#F87171',
+        },
+        'light': {
+            'accent': '#DC2626', 'accent2': '#E11D48',
+            'icon_dark': '#F87171', 'icon_light': '#DC2626',
+            'remap': _LIGHT_RED_MAP,
+            'palette_highlight': '#DC2626', 'palette_bright': '#DC2626',
+        }
+    },
+    "Blue": {
+        'dark': {
+            'accent': '#3B82F6', 'accent2': '#38BDF8',
+            'icon_dark': '#60A5FA', 'icon_light': '#2563EB',
+            'remap': _DARK_BLUE_MAP,
+            'palette_highlight': '#2563EB', 'palette_bright': '#60A5FA',
+        },
+        'light': {
+            'accent': '#2563EB', 'accent2': '#0284C7',
+            'icon_dark': '#60A5FA', 'icon_light': '#2563EB',
+            'remap': _LIGHT_BLUE_MAP,
+            'palette_highlight': '#2563EB', 'palette_bright': '#2563EB',
+        }
+    },
+    "Violet": {
+        'dark': {
+            'accent': Nebula.ACCENT, 'accent2': Nebula.ACCENT2,
+            'icon_dark': '#a78bfa', 'icon_light': '#6366f1',
+            'remap': {},
+            'palette_highlight': '#6366f1', 'palette_bright': '#a78bfa',
+        },
+        'light': {
+            'accent': Nebula.ACCENT_L, 'accent2': Nebula.ACCENT2_L,
+            'icon_dark': '#a78bfa', 'icon_light': '#6366f1',
+            'remap': {},
+            'palette_highlight': '#6366f1', 'palette_bright': '#6366f1',
+        }
+    },
+    "Emerald": {
+        'dark': {
+            'accent': '#10B981', 'accent2': '#2DD4BF',
+            'icon_dark': '#34D399', 'icon_light': '#059669',
+            'remap': _DARK_EMERALD_MAP,
+            'palette_highlight': '#059669', 'palette_bright': '#34D399',
+        },
+        'light': {
+            'accent': '#059669', 'accent2': '#0D9488',
+            'icon_dark': '#34D399', 'icon_light': '#059669',
+            'remap': _LIGHT_EMERALD_MAP,
+            'palette_highlight': '#059669', 'palette_bright': '#059669',
+        }
+    },
+}
+
+# Legacy alias dictionary for backwards compatibility
+THEMES = {
+    "Dark Mode": {'dark': True, 'accent': ACCENTS['Deep Space']['dark']['accent'], 'accent2': ACCENTS['Deep Space']['dark']['accent2']},
+    "Light Mode": {'dark': False, 'accent': ACCENTS['Deep Space']['light']['accent'], 'accent2': ACCENTS['Deep Space']['light']['accent2']},
+    "Deep Space": {'dark': True, 'accent': ACCENTS['Deep Space']['dark']['accent'], 'accent2': ACCENTS['Deep Space']['dark']['accent2']},
+    "Aurora": {'dark': True, 'accent': ACCENTS['Emerald']['dark']['accent'], 'accent2': ACCENTS['Emerald']['dark']['accent2']},
+    "Glass Morph": {'dark': False, 'accent': ACCENTS['Deep Space']['light']['accent'], 'accent2': ACCENTS['Deep Space']['light']['accent2']},
+}
 
 def scale_stylesheet(css: str, scale: float) -> str:
     """Scale every explicit font-size in a stylesheet.
@@ -1477,51 +1829,68 @@ class ThemeManager:
         return "light"
 
     @staticmethod
-    def apply_theme(window, theme_choice, ui_scale=None):
+    def apply_theme(window, theme_choice="System (Auto)", accent_choice=None, ui_scale=None):
         app = QApplication.instance()
+        
+        # 1. Resolve mode
         if theme_choice == "System (Auto)":
-            actual_theme = ThemeManager.get_system_theme()
+            family = ThemeManager.get_system_theme()
+            mode_name = "System (Auto)"
+        elif str(theme_choice).lower() in ("light", "light mode"):
+            family = "light"
+            mode_name = "Light"
+        elif str(theme_choice).lower() in ("dark", "dark mode"):
+            family = "dark"
+            mode_name = "Dark"
+        elif theme_choice == "Deep Space" or theme_choice == "Aurora":
+            family = "dark"
+            mode_name = "Dark"
+            if accent_choice is None:
+                accent_choice = "Deep Space" if theme_choice == "Deep Space" else "Emerald"
+        elif theme_choice == "Glass Morph":
+            family = "light"
+            mode_name = "Light"
+            if accent_choice is None:
+                accent_choice = "Deep Space"
         else:
-            actual_theme = "dark" if "Dark" in theme_choice else "light"
+            family = ThemeManager.get_system_theme()
+            mode_name = "System (Auto)"
 
-        window.current_theme = actual_theme
-        is_dark = (actual_theme == "dark")
+        # 2. Resolve accent
+        if accent_choice is None:
+            accent_choice = getattr(window, 'current_accent', 'Deep Space')
+        if accent_choice not in ACCENTS:
+            accent_choice = 'Deep Space'
+
+        base = THEME_BASES[family]
+        accent_data = ACCENTS[accent_choice][family]
+        is_dark = base['dark']
+
+        window.current_theme = 'dark' if is_dark else 'light'
+        window.current_theme_mode = mode_name
+        window.current_accent = accent_choice
+        window.current_theme_name = f"{'Dark' if is_dark else 'Light'} ({accent_choice})"
+        window.theme_accent = accent_data['accent']
+        window.theme_accent2 = accent_data['accent2']
+
+        # 3. Generate stylesheet
+        css = base['css']
+        if accent_data.get('remap'):
+            css = _remap_css(css, accent_data['remap'])
+
         scale = ui_scale if ui_scale is not None else float(getattr(window, 'ui_scale', 1.0) or 1.0)
+        app.setStyleSheet(scale_stylesheet(css, scale))
 
-        app.setStyleSheet(scale_stylesheet(DARK_STYLESHEET if is_dark else LIGHT_STYLESHEET, scale))
-        
-        palette = QPalette()
-        if is_dark:
-            palette.setColor(QPalette.ColorRole.Window, QColor("#0f0c29"))
-            palette.setColor(QPalette.ColorRole.WindowText, QColor("#e0e0e0"))
-            palette.setColor(QPalette.ColorRole.Base, QColor("#0f0c29"))
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#1e1b4b"))
-            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1e1b4b"))
-            palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#e0e0e0"))
-            palette.setColor(QPalette.ColorRole.Text, QColor("#e0e0e0"))
-            palette.setColor(QPalette.ColorRole.Button, QColor("#1e1b4b"))
-            palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e0e0e0"))
-            palette.setColor(QPalette.ColorRole.BrightText, QColor("#a78bfa"))
-            palette.setColor(QPalette.ColorRole.Highlight, QColor("#6366f1"))
-            palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-            palette.setColor(QPalette.ColorRole.Link, QColor("#6dd5ed"))
-        else:
-            palette.setColor(QPalette.ColorRole.Window, QColor("#f8fafc"))
-            palette.setColor(QPalette.ColorRole.WindowText, QColor("#0f172a"))
-            palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
-            palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#f1f5f9"))
-            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
-            palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#0f172a"))
-            palette.setColor(QPalette.ColorRole.Text, QColor("#0f172a"))
-            palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
-            palette.setColor(QPalette.ColorRole.ButtonText, QColor("#0f172a"))
-            palette.setColor(QPalette.ColorRole.BrightText, QColor("#dc2626"))
-            palette.setColor(QPalette.ColorRole.Highlight, QColor("#6366f1"))
-            palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
-            palette.setColor(QPalette.ColorRole.Link, QColor("#2563eb"))
-        app.setPalette(palette)
-        
-        # Regenerate Vector Icons dynamically to match theme colors:
+        # 4. Set Palette
+        pal_spec = dict(base['palette'])
+        pal_spec['highlight'] = accent_data['palette_highlight']
+        pal_spec['bright'] = accent_data['palette_bright']
+        app.setPalette(_theme_palette(pal_spec))
+
+        # 5. Set vector icon color override
+        set_icon_accent(accent_data['icon_dark'] if is_dark else accent_data['icon_light'])
+
+        # 6. Regenerate Vector Icons dynamically
         if hasattr(window, 'btn_nav_videos') and window.btn_nav_videos:
             window.btn_nav_videos.setIcon(get_vector_icon('video', is_dark))
         if hasattr(window, 'btn_nav_images') and window.btn_nav_images:
@@ -1595,20 +1964,15 @@ class ThemeManager:
                 btn = getattr(window, btn_attr)
                 if btn: btn.setIcon(get_vector_icon(icon_name, is_dark))
         
-        ThemeManager._update_inline_styles(window, is_dark)
+        ThemeManager._update_inline_styles(window, is_dark, accent_data)
         if hasattr(window, 'hover_overlay') and window.hover_overlay:
             window.hover_overlay.update_theme()
         
         window.ensurePolished()
-        # NOTE: Removed the O(all-widgets) unpolish/polish loop — setStyleSheet
-        # above already triggers a style refresh on every widget. The global
-        # loop caused UI freezes of 0.3-2s on populated windows and could
-        # re-enter apply_theme via processEvents().
-        # Also removed app.processEvents() for the same re-entrancy reason.
 
     @staticmethod
-    def _update_inline_styles(window, is_dark):
-        grid_style = """
+    def _update_inline_styles(window, is_dark, accent_data=None):
+        base_grid = """
             QListWidget { background: rgba(15, 12, 41, 0.5); border: 1px solid rgba(167, 139, 250, 0.15); border-radius: 12px; padding: 12px; color: #e0e0e0; }
             QListWidget::item { background: rgba(30, 27, 75, 0.4); border: 1px solid rgba(167, 139, 250, 0.1); border-radius: 8px; padding: 8px; margin: 4px; }
             QListWidget::item:hover { background: rgba(99, 102, 241, 0.15); border: 1px solid rgba(99, 102, 241, 0.3); }
@@ -1620,7 +1984,7 @@ class ThemeManager:
             QListWidget::item:selected { background: #e0e7ff; border: 1px solid #c7d2fe; color: #0f172a; }
         """
         
-        menu_style = """
+        base_menu = """
             QMenu { background-color: #1e1b4b; color: #e0e0e0; border: 1px solid rgba(99, 102, 241, 0.4); border-radius: 8px; padding: 4px; }
             QMenu::item { padding: 6px 20px; border-radius: 4px; }
             QMenu::item:selected { background-color: rgba(99, 102, 241, 0.4); color: #ffffff; }
@@ -1630,11 +1994,24 @@ class ThemeManager:
             QMenu::item:selected { background-color: #e0e7ff; color: #0f172a; }
         """
 
+        remap = accent_data.get('remap', {}) if accent_data else {}
+        grid_style = _remap_css(base_grid, remap) if remap else base_grid
+        menu_style = _remap_css(base_menu, remap) if remap else base_menu
+
         tabs = [window.video_tab, window.image_tab, window.audio_tab, window.pdf_tab] + list(getattr(window, 'smart_folder_tabs', {}).values())
         for tab in tabs:
             if hasattr(tab, 'grid_view'): tab.grid_view.setStyleSheet(grid_style)
             if hasattr(tab, 'dupe_menu'): tab.dupe_menu.setStyleSheet(menu_style)
             if hasattr(tab, 'header_menu'): tab.header_menu.setStyleSheet(menu_style)
+            if hasattr(tab, 'empty_state') and tab.empty_state:
+                tab.empty_state.update_theme(is_dark)
+            if hasattr(tab, 'btn_process') and tab.btn_process:
+                apply_glow(tab.btn_process, getattr(window, 'theme_accent', None) or Nebula.ACCENT, 20, 100)
+            if hasattr(tab, 'btn_watch') and tab.btn_watch:
+                if getattr(tab, '_watch_enabled', False):
+                    apply_glow(tab.btn_watch, getattr(window, 'theme_accent2', None) or Nebula.ACCENT2, 16, 140)
+                else:
+                    apply_glow(tab.btn_watch, None)
             if hasattr(tab, 'table'):
                 for row in range(tab.table.rowCount()):
                     rating_widget = tab.table.cellWidget(row, tab.COL_RATING)
@@ -1703,7 +2080,8 @@ class MediaInfo:
                     elif self.size_bytes >= 1024**2: self.size_formatted = f"{self.size_bytes / (1024**2):.1f} MB"
                     elif self.size_bytes >= 1024: self.size_formatted = f"{self.size_bytes / 1024:.0f} KB"
                     else: self.size_formatted = f"{self.size_bytes} B"
-            except Exception: pass
+            except Exception as e:
+                logger.debug("stat failed for %s: %s", filepath, e)
             self._extract_metadata()
 
     def _extract_metadata(self):
@@ -1730,7 +2108,14 @@ class MediaInfo:
                             return
                 finally:
                     if cap is not None:
-                        cap.release()
+                        try:
+                            with _CV_LOCK:
+                                cap.release()
+                        except Exception:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
                 self.duration_compact = format_duration_compact(self.duration_seconds)
                 total_sec = int(round(self.duration_seconds))
                 h = total_sec // 3600; m = (total_sec % 3600) // 60; s = total_sec % 60
@@ -1750,21 +2135,30 @@ class MediaInfo:
                                 self.duration_seconds = frame_count / fps; duration_ok = True
                 finally:
                     if cap is not None:
-                        cap.release()
+                        try:
+                            with _CV_LOCK:
+                                cap.release()
+                        except Exception:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
                 if not duration_ok and self.extension == '.wav':
                     try:
                         import wave
                         with wave.open(self.filepath, 'rb') as f:
                             frames = f.getnframes(); rate = f.getframerate()
-                            if rate > 0: self.duration_seconds = frames / float(rate); duration_ok = True
-                    except Exception: pass
+                            if rate > 0 and frames > 0: self.duration_seconds = frames / float(rate); duration_ok = True
+                    except Exception as e:
+                        logger.debug("wave fallback failed for %s: %s", self.filepath, e)
                 # Try ffprobe for audio duration (more accurate than file-size heuristics)
                 if not duration_ok:
                     try:
                         deep = get_file_deep_metadata(self.filepath)
                         if deep and deep.get('duration_seconds', 0) > 0:
                             self.duration_seconds = deep['duration_seconds']; duration_ok = True
-                    except Exception: pass
+                    except Exception as e:
+                        logger.debug("ffprobe audio duration fallback failed for %s: %s", self.filepath, e)
                 # Try mutagen for MP3/FLAC/OGG/M4A as a fallback
                 if not duration_ok:
                     try:
@@ -1774,8 +2168,8 @@ class MediaInfo:
                             self.duration_seconds = float(mfile.info.length); duration_ok = True
                     except ImportError:
                         pass  # mutagen not installed
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("mutagen fallback failed for %s: %s", self.filepath, e)
                 if not duration_ok:
                     # Do NOT fabricate a duration from file size — that produces wildly
                     # wrong numbers (the old code assumed a 24 kbps constant bitrate).
@@ -1903,12 +2297,8 @@ class ScannerThread(QThread):
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             ext = os.path.splitext(entry.name)[1].lower()
-                            is_valid = ext in valid_exts
-                            if not is_valid and ext == '':
-                                name_lower = entry.name.lower()
-                                if not name_lower.startswith('.') and name_lower not in IGNORED_EXTENSIONLESS_NAMES:
-                                    is_valid = True
-                            if is_valid:
+                            # Include files without extensions as requested
+                            if ext in valid_exts or ext == '':
                                 full_path = os.path.normpath(entry.path)
                                 if full_path not in seen_paths:
                                     if not self._should_exclude(full_path):
@@ -1930,8 +2320,8 @@ class ScannerThread(QThread):
             if os.path.exists(cache_path):
                 with open(cache_path, 'r', encoding='utf-8') as f:
                     cache = json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("scan_cache.json load failed (%s): %s — starting with empty cache", cache_path, e)
 
         new_entries = {}
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2258,19 +2648,19 @@ class BatchEditDialog(QDialog):
         return artist, rating
 
 class SmartRelocateDialog(QDialog):
-    def __init__(self, media_infos: list, selected_infos: list, parent=None):
+    def __init__(self, selected_infos: list, all_infos: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Smart Relocate Files")
         self.setMinimumSize(600, 450)
-        self.media_infos = media_infos
-        self.selected_infos = selected_infos
+        self.media_infos = all_infos
+        self.selected_infos = list(selected_infos)
         
         layout = QVBoxLayout(self)
         
         # 1. Source Selection
         source_group = QGroupBox("1. What to Move?")
         source_layout = QVBoxLayout(source_group)
-        self.radio_selected = QRadioButton(f"Move Selected Files ({len(selected_infos)} files)")
+        self.radio_selected = QRadioButton(f"Move Selected Files ({len(self.selected_infos)} files)")
         self.radio_query = QRadioButton("Move by Smart Query")
         self.radio_selected.setChecked(True)
         
@@ -2325,10 +2715,11 @@ class SmartRelocateDialog(QDialog):
         btn_row.addWidget(self.btn_execute)
         layout.addLayout(btn_row)
         
-        # Fallback to user home if media_infos is empty (was "" which produced
+        # Fallback to user home if no candidate files exist (was "" which produced
         # relative paths that could land in CWD — e.g. System32 when elevated)
-        if media_infos:
-            base_dir = os.path.dirname(media_infos[0].filepath)
+        first = self.selected_infos[0] if self.selected_infos else (self.media_infos[0] if self.media_infos else None)
+        if first:
+            base_dir = os.path.dirname(first.filepath)
         else:
             base_dir = os.path.expanduser("~")
             # Disable execute button to prevent acting on an empty selection
@@ -2359,6 +2750,8 @@ class SmartRelocateDialog(QDialog):
 
     def _get_target_infos(self) -> list:
         if self.radio_selected.isChecked():
+            # FIX: resolve infos by OBJECT (row indices drifted from media_infos
+            # order after sorting/removals — the dialog used to move the WRONG files)
             return list(self.selected_infos)
         else:
             query = self.query_input.text().strip()
@@ -2579,42 +2972,49 @@ class TrimExportWorker(QThread):
     # an incompatible signature (fragile/undefined behavior in PyQt).
     trim_finished = pyqtSignal(bool, str, str)  # success, output_path, error_msg
 
-    def __init__(self, filepath: str, in_sec: float, out_sec: float, output_path: str, custom_ffmpeg: str = None, parent=None):
+    def __init__(self, filepath: str, in_sec: float, out_sec: float, output_path: str, custom_ffmpeg: str = None, cut_mode: str = 'precise', parent=None):
         super().__init__(parent)
         self.filepath = filepath
         self.in_sec = in_sec
         self.out_sec = out_sec
         self.output_path = output_path
         self.custom_ffmpeg = custom_ffmpeg
-        self._proc = None
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-        if self._proc is not None:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
+        self.cut_mode = cut_mode if cut_mode in ('precise', 'fast') else 'precise'
 
     def run(self):
-        if self._is_cancelled:
-            return
         ffmpeg_cmd = get_ffmpeg_command(self.custom_ffmpeg)
         if not ffmpeg_cmd:
             self.trim_finished.emit(False, "", "FFmpeg executable not found. Please ensure FFmpeg is installed.")
             return
 
-        cmd = [
-            ffmpeg_cmd,
-            "-y",
-            "-ss", f"{self.in_sec:.3f}",
-            "-to", f"{self.out_sec:.3f}",
-            "-i", os.path.abspath(self.filepath),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            os.path.abspath(self.output_path)
-        ]
+        src = os.path.abspath(self.filepath)
+        if self.cut_mode == 'fast':
+            # Stream copy: instant, but cuts snap to the nearest keyframe
+            cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-ss", f"{self.in_sec:.3f}",
+                "-to", f"{self.out_sec:.3f}",
+                "-i", src,
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                os.path.abspath(self.output_path)
+            ]
+        else:
+            # Precise (default): fast input-side seek + veryfast re-encode —
+            # the clip starts exactly on the previewed IN point instead of the
+            # preceding keyframe.
+            cmd = [
+                ffmpeg_cmd,
+                "-y",
+                "-ss", f"{self.in_sec:.3f}",
+                "-to", f"{self.out_sec:.3f}",
+                "-i", src,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "copy",
+                "-avoid_negative_ts", "make_zero",
+                os.path.abspath(self.output_path)
+            ]
 
         startupinfo = None
         if sys.platform == "win32":
@@ -2622,28 +3022,14 @@ class TrimExportWorker(QThread):
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                startupinfo=startupinfo
-            )
-            stdout, stderr = self._proc.communicate(timeout=120)
-            if self._is_cancelled:
-                if os.path.exists(self.output_path):
-                    try: os.remove(self.output_path)
-                    except Exception: pass
-                return
-            if self._proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', startupinfo=startupinfo, timeout=120)
+            if proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
                 self.trim_finished.emit(True, self.output_path, "")
             else:
-                err = stderr or "FFmpeg failed with unknown error."
+                err = proc.stderr or "FFmpeg failed with unknown error."
                 self.trim_finished.emit(False, "", err)
         except Exception as e:
-            if not self._is_cancelled:
-                self.trim_finished.emit(False, "", str(e))
+            self.trim_finished.emit(False, "", str(e))
 
 
 class QuickTrimDialog(QDialog):
@@ -2796,6 +3182,20 @@ class QuickTrimDialog(QDialog):
         out_layout.addWidget(btn_browse)
         layout.addLayout(out_layout)
 
+        # Cut mode — frame-exact by default, stream copy for instant results
+        mode_row = QHBoxLayout()
+        mode_lbl = QLabel("Cut Mode:")
+        self.cut_mode_combo = QComboBox()
+        self.cut_mode_combo.addItem("Precise — frame-exact (re-encode)")
+        self.cut_mode_combo.addItem("Fast — instant (keyframe copy)")
+        self.cut_mode_combo.setToolTip(
+            "Precise re-encodes the clip so it starts exactly on your IN point (a few seconds).\n"
+            "Fast copies streams without re-encoding (instant) but the cut snaps to the nearest keyframe."
+        )
+        mode_row.addWidget(mode_lbl)
+        mode_row.addWidget(self.cut_mode_combo, 1)
+        layout.addLayout(mode_row)
+
         # Action buttons
         btn_box = QHBoxLayout()
         btn_box.addStretch()
@@ -2845,16 +3245,18 @@ class QuickTrimDialog(QDialog):
                 secs = int(secs_parts[0])
                 ms = int(secs_parts[1].ljust(3, '0')[:3]) if len(secs_parts) > 1 else 0
                 return (mins * 60 + secs) * 1000 + ms
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("_str_to_ms parse failed for '%s': %s", s, e)
         return None
 
     def _on_duration_changed(self, dur: int):
         if dur > 0:
-            is_initial = (self.duration_ms == 0)
+            first_duration = self.duration_ms <= 0
             self.duration_ms = dur
             self.range_slider.set_range(0, dur)
-            if is_initial:
+            if first_duration:
+                # Only default the OUT point on the FIRST real duration —
+                # late duration updates must not wipe the user's trim selection.
                 self.out_ms = dur
                 self.range_slider.set_out_pos(dur)
                 self.out_edit.setText(self._ms_to_str(dur))
@@ -2963,6 +3365,9 @@ class QuickTrimDialog(QDialog):
         if new_path:
             self.output_edit.setText(new_path)
 
+    def _cut_mode(self) -> str:
+        return 'fast' if self.cut_mode_combo.currentIndex() == 1 else 'precise'
+
     def _start_export(self):
         output_path = self.output_edit.text().strip()
         if not output_path:
@@ -2982,9 +3387,15 @@ class QuickTrimDialog(QDialog):
         self.btn_export.setEnabled(False)
         self.btn_export.setText("⏳ Trimming clip...")
 
-        self.worker = TrimExportWorker(self.filepath, in_sec, out_sec, output_path, parent=None)
-        self.worker.trim_finished.connect(self._on_export_finished)
-        self.worker.start()
+        # FIX (crash): the worker used to be parented to this dialog — closing
+        # the dialog mid-export destroyed a running QThread (hard abort). It is
+        # now unparented and parked on the main window until it finishes.
+        worker = TrimExportWorker(self.filepath, in_sec, out_sec, output_path, cut_mode=self._cut_mode())
+        worker.trim_finished.connect(self._on_export_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._park_trim_worker(worker)
+        self.worker = worker
+        worker.start()
 
     def _on_export_finished(self, success: bool, output_path: str, err: str):
         if getattr(self, '_suppress_export_result', False):
@@ -3018,6 +3429,22 @@ class QuickTrimDialog(QDialog):
         else:
             QMessageBox.critical(self, "Export Failed", f"Failed to trim video:\n\n{err}")
 
+    def _park_trim_worker(self, worker):
+        """Keep running export workers alive on the main window (not this dialog)
+        so closing the dialog can't destroy a running QThread."""
+        main_win = self.window()
+        if main_win is None:
+            return
+        pool = getattr(main_win, '_orphaned_trim_workers', None)
+        if pool is None:
+            pool = []
+            main_win._orphaned_trim_workers = pool
+        try:
+            pool[:] = [w for w in pool if w.isRunning()]
+        except RuntimeError:
+            pool[:] = []
+        pool.append(worker)
+
     def _release_player(self):
         """Release media sources so the file handle isn't locked after close.
 
@@ -3031,20 +3458,15 @@ class QuickTrimDialog(QDialog):
     def done(self, result):
         # accept()/reject() funnel through here; release before hiding
         self._release_player()
+        # If the export worker is still running when the dialog closes, drop its
+        # late result instead of popping dialogs/toasts on a hidden window.
         worker = getattr(self, 'worker', None)
         if worker is not None and worker.isRunning():
             self._suppress_export_result = True
-            worker.cancel()
-            worker.wait(1000)
         super().done(result)
 
     def closeEvent(self, event):
         self._release_player()
-        worker = getattr(self, 'worker', None)
-        if worker is not None and worker.isRunning():
-            self._suppress_export_result = True
-            worker.cancel()
-            worker.wait(1000)
         super().closeEvent(event)
 
 
@@ -3157,7 +3579,7 @@ class SmartFolderNavItem(QWidget):
 
 class DeepMetadataWorker(QThread):
     """Background worker for ffprobe — prevents UI freezes up to 10s."""
-    metadata_ready = pyqtSignal(object)
+    metadata_ready = pyqtSignal(object)  # dict or None ('dict or None' was a truthy-expression bug)
 
     def __init__(self, filepath: str, ffprobe_path: str = None, parent=None):
         super().__init__(parent)
@@ -3313,9 +3735,29 @@ class DetailedInfoDialog(QDialog):
         # Cache theme colors for the populate step
         self._theme = (accent_color, text_color, sub_text_color)
         # Start background worker (was: blocking call up to 10s on UI thread)
-        self._worker = DeepMetadataWorker(filepath, custom_ffprobe_path, parent=self)
+        # Unparented so dialog close cannot destroy a running QThread (was parent=self)
+        self._worker = DeepMetadataWorker(filepath, custom_ffprobe_path, parent=None)
         self._worker.metadata_ready.connect(self._on_metadata_ready)
+        self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
+
+    def closeEvent(self, event):
+        w = getattr(self, '_worker', None)
+        if w is not None and w.isRunning():
+            try:
+                w.wait(800)
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
+
+    def done(self, result):
+        w = getattr(self, '_worker', None)
+        if w is not None and w.isRunning():
+            try:
+                w.wait(800)
+            except RuntimeError:
+                pass
+        super().done(result)
 
     def _on_metadata_ready(self, meta):
         # Remove loading placeholder
@@ -3378,7 +3820,8 @@ class DetailedInfoDialog(QDialog):
                 elif sb >= 1024: size_str = f"{sb/1024:.0f} KB"
                 else: size_str = f"{sb} B"
                 fallback_layout.addRow(self._make_label("Size:", sub_text_color), self._make_value(size_str, text_color))
-            except Exception: pass
+            except Exception as e:
+                logger.debug("DetailedInfo fallback size failed for %s: %s", filepath, e)
             ext = os.path.splitext(filepath)[1].lower()
             if ext in ['.mp4', '.mkv', '.avi', '.mov', '.wmv']:
                 cap = None
@@ -3395,10 +3838,18 @@ class DetailedInfoDialog(QDialog):
                             if fps > 0 and fc > 0:
                                 ds = int(fc / fps)
                                 fallback_layout.addRow(self._make_label("Duration:", sub_text_color), self._make_value(f"{ds // 60}m {ds % 60}s", text_color))
-                except Exception: pass
+                except Exception as e:
+                    logger.debug("DetailedInfo cv2 fallback failed for %s: %s", filepath, e)
                 finally:
                     if cap is not None:
-                        cap.release()
+                        try:
+                            with _CV_LOCK:
+                                cap.release()
+                        except Exception:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
             self.scroll_layout.addWidget(fallback_group)
 
     def _make_label(self, text: str, color: str) -> QLabel:
@@ -3541,7 +3992,7 @@ class HoverPreviewOverlay(QWidget):
             try:
                 if active_tab.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                     active_tab.player.pause()
-            except Exception:
+            except RuntimeError:
                 pass
 
         self.info = info
@@ -3641,8 +4092,8 @@ class ToastNotification(QWidget):
         self.setStyleSheet(f"""
             ToastNotification {{
                 background-color: {bg_color};
-                border-radius: 10px;
-                border: 1px solid rgba(255, 255, 255, 0.2);
+                border-radius: 12px;
+                border: 1px solid rgba(255, 255, 255, 0.22);
             }}
         """)
         
@@ -4493,7 +4944,7 @@ class _ComparisonPane(QWidget):
             slider_row = QHBoxLayout()
             self.seek_slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self)
             self.seek_slider.setRange(0, 1000)
-            self.seek_slider.valueChanged.connect(self._on_seek)
+            self.seek_slider.valueChanged.connect(self._on_seek)  # FIX: sliderMoved never fires for click-to-seek
             slider_row.addWidget(self.seek_slider, 1)
 
             self.time_label = QLabel("00:00 / 00:00")
@@ -4905,6 +5356,139 @@ class _MediaInfoRunnable(QRunnable):
         except RuntimeError:
             pass
 
+class SkeletonThumbLabel(QLabel):
+    """Thumbnail placeholder with a subtle shimmer sweep while loading.
+
+    Falls back to a static block under reduced-motion; renders normally
+    once a real pixmap is set (timer self-stops).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self._shimmer_timer = QTimer(self)
+        self._shimmer_timer.setInterval(50)
+        self._shimmer_timer.timeout.connect(self._advance)
+
+    def _advance(self):
+        pm = self.pixmap()
+        if pm is not None and not pm.isNull():
+            self._shimmer_timer.stop()
+            return
+        self._phase = (self._phase + 0.045) % 1.0
+        self.update()
+
+    def start_shimmer(self):
+        w = self.window()
+        reduced = bool(getattr(w, 'reduced_motion', False)) if w is not None else False
+        if reduced:
+            # Accessibility: static placeholder, no animation
+            if not self.text():
+                self.setText(self.property("emoji") or "…")
+            return
+        self._shimmer_timer.start()
+
+    def paintEvent(self, event):
+        pm = self.pixmap()
+        if pm is not None and not pm.isNull():
+            super().paintEvent(event)
+            return
+        if self.text():
+            super().paintEvent(event)
+            return
+        w = self.window()
+        is_dark = True
+        if w is not None and hasattr(w, 'current_theme'):
+            is_dark = (w.current_theme == 'dark')
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect().adjusted(1, 1, -1, -1))
+        painter.setPen(Qt.PenStyle.NoPen)
+        base = QColor("#1A1734") if is_dark else QColor("#E7E9F2")
+        painter.setBrush(base)
+        painter.drawRoundedRect(rect, 8, 8)
+        # Moving highlight sweep
+        sweep_w = max(40.0, rect.width() * 0.35)
+        x = rect.left() - sweep_w + self._phase * (rect.width() + 2 * sweep_w)
+        grad = QLinearGradient(x, 0.0, x + sweep_w, 0.0)
+        _acc = getattr(w, 'theme_accent', None)
+        if _acc:
+            hi = QColor(_acc)
+            hi.setAlpha(42 if is_dark else 30)
+        else:
+            hi = QColor(139, 92, 246, 42) if is_dark else QColor(99, 102, 241, 30)
+        grad.setColorAt(0.0, QColor(0, 0, 0, 0))
+        grad.setColorAt(0.5, hi)
+        grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setBrush(QBrush(grad))
+        painter.drawRoundedRect(rect, 8, 8)
+        painter.end()
+
+
+class EmptyStateWidget(QWidget):
+    """Beginner-friendly empty state: what to do next + one glowing CTA.
+
+    Shown as view-stack page 2 whenever a tab has no rows.
+    """
+
+    ADD_METHODS = {'video': '_add_video_folder', 'image': '_add_image_folder',
+                   'audio': '_add_audio_folder', 'pdf': '_add_pdf_folder'}
+
+    def __init__(self, media_type: str, parent=None):
+        super().__init__(parent)
+        self.media_type = media_type
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.setSpacing(10)
+
+        icon_lbl = QLabel()
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon = get_vector_icon('folder', True)
+        icon_lbl.setPixmap(icon.pixmap(128, 128))
+        lay.addWidget(icon_lbl)
+        lay.addSpacing(8)
+
+        self.title_lbl = QLabel("Your library is empty")
+        self.title_lbl.setObjectName("emptyTitle")
+        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.title_lbl)
+
+        self.sub_lbl = QLabel("Drop a folder anywhere in the window, or click below to add one.")
+        self.sub_lbl.setObjectName("emptySub")
+        self.sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.sub_lbl)
+
+        self.cta_btn = QPushButton("＋  Add Folder")
+        self.cta_btn.setObjectName("btnSelectFolder")
+        self.cta_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cta_btn.setFixedHeight(44)
+        self.cta_btn.setMinimumWidth(200)
+        method = self.ADD_METHODS.get(media_type)
+        if method:
+            self.cta_btn.clicked.connect(lambda: self._trigger(method))
+        lay.addWidget(self.cta_btn, 0, Qt.AlignmentFlag.AlignCenter)
+        lay.addSpacing(6)
+
+        self.steps_lbl = QLabel("1. Add folder    →    2. Edit Name / Rating    →    3. Process All   (Ctrl+Z undoes everything)")
+        self.steps_lbl.setObjectName("emptySteps")
+        self.steps_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.steps_lbl)
+
+    def _trigger(self, method_name: str):
+        w = self.window()
+        if w is not None:
+            fn = getattr(w, method_name, None)
+            if callable(fn):
+                fn()
+
+    def update_theme(self, is_dark: bool):
+        w = self.window()
+        accent = getattr(w, 'theme_accent', None) if w is not None else None
+        if not accent:
+            accent = Nebula.ACCENT if is_dark else Nebula.ACCENT_L
+        apply_glow(self.cta_btn, accent, 26, 90)
+
+
 class MediaTab(QWidget):
     COL_THUMB      = 0
     COL_STATUS     = 1
@@ -4916,8 +5500,8 @@ class MediaTab(QWidget):
     COL_RATING     = 7
     COL_TAGS       = 8
     COL_PREVIEW    = 9
-    COL_DATE_MOD   = 10   # optional â€” hidden by default, toggle via header menu
-    COL_DATE_CREATED = 11 # optional â€” hidden by default
+    COL_DATE_MOD   = 10   # optional — hidden by default, toggle via header menu
+    COL_DATE_CREATED = 11 # optional — hidden by default
     NUM_COLS       = 12
     HEADERS = ["Preview", "Status", "File Name", "Size", "Resolution", "Duration", "Name", "Rating", "Tags", "New Name Preview", "Modified", "Created"]
 
@@ -5205,7 +5789,7 @@ class MediaTab(QWidget):
         self.table.setColumnWidth(self.COL_DATE_MOD, 140)
         header.setSectionResizeMode(self.COL_DATE_CREATED, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(self.COL_DATE_CREATED, 140)
-        # Optional metadata columns â€” off until the user enables them
+        # Optional metadata columns — off until the user enables them
         self.table.setColumnHidden(self.COL_DATE_MOD, True)
         self.table.setColumnHidden(self.COL_DATE_CREATED, True)
         header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -5244,6 +5828,10 @@ class MediaTab(QWidget):
         self.grid_view.setMouseTracking(True)
         self.grid_view.viewport().installEventFilter(self)
         self.view_stack.addWidget(self.grid_view)
+        # Nebula: page 2 = beginner empty state (title + glowing Add Folder CTA)
+        self.empty_state = EmptyStateWidget(self.media_type, self)
+        self.view_stack.addWidget(self.empty_state)
+        self.view_stack.setCurrentIndex(2)
         self.content_layout = QHBoxLayout()
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(12)
@@ -5331,6 +5919,7 @@ class MediaTab(QWidget):
         self.btn_process.clicked.connect(self._on_process_all)
         self.btn_process.setToolTip("Process all ready files — applies the naming template and renames them")
         self.btn_process.setIconSize(QSize(18, 18))
+        apply_glow(self.btn_process, getattr(self.window(), 'theme_accent', None) or Nebula.ACCENT, 20, 100)  # Nebula: primary CTA glow (theme accent)
         bottom_row2.addWidget(self.btn_find_dupes)
         bottom_row2.addWidget(self.btn_batch_edit)
         bottom_row2.addWidget(self.btn_batch_tag)
@@ -5428,24 +6017,6 @@ class MediaTab(QWidget):
         # keeps resetting. Only when they pause for 250ms does _apply_filter run.
         self._filter_timer.start()
 
-    def _get_grid_item(self, info: MediaInfo | None) -> QListWidgetItem | None:
-        if not info: return None
-        if not hasattr(info, 'grid_items'):
-            info.grid_items = {}
-            if hasattr(info, 'grid_item') and info.grid_item:
-                info.grid_items[id(self)] = info.grid_item
-        return info.grid_items.get(id(self))
-
-    def _set_grid_item(self, info: MediaInfo | None, item: QListWidgetItem | None):
-        if not info: return
-        if not hasattr(info, 'grid_items'):
-            info.grid_items = {}
-        if item is not None:
-            info.grid_items[id(self)] = item
-        else:
-            info.grid_items.pop(id(self), None)
-        info.grid_item = item
-
     def _apply_filter(self):
         text = self.search_input.currentText() if hasattr(self.search_input, 'currentText') else self.search_input.text()
         search_lower = text.lower().strip()
@@ -5453,11 +6024,11 @@ class MediaTab(QWidget):
         for row in range(self.table.rowCount()):
             info = self._get_row_info(row)
             if not info: continue
-            grid = self._get_grid_item(info)
             if self.is_smart_folder:
                 if not matches_query(info, self.smart_query):
                     self.table.setRowHidden(row, True)
-                    if grid: grid.setHidden(True)
+                    _gi = self._grid_item(info)
+                    if _gi: _gi.setHidden(True)
                     continue
             filename = self.table.item(row, self.COL_FILENAME).text().lower()
             artist_item = self.table.item(row, self.COL_ARTIST)
@@ -5469,10 +6040,12 @@ class MediaTab(QWidget):
             if not search_lower or matches_query(info, search_lower, preview):
                 self.filtered_rows.add(row)
                 self.table.setRowHidden(row, False)
-                if grid: grid.setHidden(False)
+                _gi = self._grid_item(info)
+                if _gi: _gi.setHidden(False)
             else:
                 self.table.setRowHidden(row, True)
-                if grid: grid.setHidden(True)
+                _gi = self._grid_item(info)
+                if _gi: _gi.setHidden(True)
         self._apply_advanced_filters()
         self._update_stats()
         self._load_visible_widgets()
@@ -5518,21 +6091,21 @@ class MediaTab(QWidget):
             
             keep = True
             
-            # Resolution (uses min(w,h) to correctly classify portrait phone videos and photos)
+            # Resolution — use the SHORTER side so portrait media classifies
+            # correctly (a 1080×1920 portrait video is 1080p, not "Below 480p")
             if res_idx > 0:
-                w = getattr(info, 'width', 0)
-                h = getattr(info, 'height', 0)
-                lesser = min(w, h) if (w > 0 and h > 0) else (h or w)
-                if lesser > 0:
-                    if res_idx == 1 and lesser < 4320: keep = False # 8K+
-                    elif res_idx == 2 and (lesser < 2160 or lesser >= 4320): keep = False # 4K
-                    elif res_idx == 3 and (lesser < 1440 or lesser >= 2160): keep = False # 1440p
-                    elif res_idx == 4 and (lesser < 1080 or lesser >= 1440): keep = False # 1080p
-                    elif res_idx == 5 and (lesser < 720 or lesser >= 1080): keep = False # 720p
-                    elif res_idx == 6 and (lesser < 480 or lesser >= 720): keep = False # 480p
-                    elif res_idx == 7 and lesser >= 480: keep = False # Below 480p
-                else:
-                    keep = False
+                w_ = int(getattr(info, 'width', 0) or 0)
+                h_ = int(getattr(info, 'height', 0) or 0)
+                dims = [d for d in (w_, h_) if d > 0]
+                h = min(dims) if dims else 0
+                if h > 0:
+                    if res_idx == 1 and h < 4320: keep = False # 8K+
+                    elif res_idx == 2 and (h < 2160 or h >= 4320): keep = False # 4K
+                    elif res_idx == 3 and (h < 1440 or h >= 2160): keep = False # 1440p
+                    elif res_idx == 4 and (h < 1080 or h >= 1440): keep = False # 1080p
+                    elif res_idx == 5 and (h < 720 or h >= 1080): keep = False # 720p
+                    elif res_idx == 6 and (h < 480 or h >= 720): keep = False # 480p
+                    elif res_idx == 7 and h >= 480: keep = False # Below 480p
 
             # Duration
             if keep and dur_max > 0:
@@ -5579,8 +6152,8 @@ class MediaTab(QWidget):
             if not keep:
                 rows_to_remove.append(row)
                 self.table.setRowHidden(row, True)
-                grid = self._get_grid_item(info)
-                if grid: grid.setHidden(True)
+                _gi = self._grid_item(info)
+                if _gi: _gi.setHidden(True)
 
         for row in rows_to_remove:
             self.filtered_rows.remove(row)
@@ -5645,11 +6218,6 @@ class MediaTab(QWidget):
                 if not hasattr(self, '_orphaned_scanners'):
                     self._orphaned_scanners = []
                 self._orphaned_scanners.append(old)
-                def _cleanup_old(target=old):
-                    if hasattr(self, '_orphaned_scanners') and target in self._orphaned_scanners:
-                        try: self._orphaned_scanners.remove(target)
-                        except ValueError: pass
-                old.finished.connect(_cleanup_old)
                 old.finished.connect(old.deleteLater)
                 
         was_watch = getattr(self, '_watch_enabled', False)
@@ -5687,9 +6255,11 @@ class MediaTab(QWidget):
         if checked:
             self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
             self._watch_timer.start(3000)
+            apply_glow(self.btn_watch, getattr(self.window(), 'theme_accent2', None) or Nebula.ACCENT2, 16, 140)  # "live" glow (theme accent)
             self._show_toast(f"👁️ Watching {len(self.directories)} folder(s)...", 'success')
         else:
             self._watch_timer.stop()
+            apply_glow(self.btn_watch, None)
             self._show_toast("Watch folder disabled.", 'info')
 
     def _check_for_changes(self):
@@ -5719,20 +6289,18 @@ class MediaTab(QWidget):
                                 stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=False):
                                 ext = os.path.splitext(entry.name)[1].lower()
-                                is_valid = ext in valid_exts
-                                if not is_valid and ext == '':
-                                    name_lower = entry.name.lower()
-                                    if not name_lower.startswith('.') and name_lower not in IGNORED_EXTENSIONLESS_NAMES:
-                                        is_valid = True
-                                if is_valid:
+                                # Match ScannerThread semantics: known extensions
+                                # plus extensionless files only ('all' already
+                                # unions every supported set).
+                                if ext == '' or ext in valid_exts:
                                     full_path = os.path.normpath(entry.path)
                                     norm_case = os.path.normcase(full_path)
                                     if not self._should_exclude(full_path):
                                         current_files[norm_case] = full_path
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except OSError as e:
+                            logger.debug("watch entry failed for %s: %s", getattr(entry, 'path', current_dir), e)
+                except OSError as e:
+                    logger.debug("watch scandir failed for %s: %s", current_dir, e)
 
         if not hasattr(self, '_known_files') or not isinstance(self._known_files, dict):
             self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
@@ -5770,7 +6338,7 @@ class MediaTab(QWidget):
             for k in added_keys:
                 runnable = _MediaInfoRunnable(current_files[k], self.media_type, self)
                 # Cross-thread queued connection — handler runs on main thread
-                runnable.signals.ready.connect(self._on_watch_info_ready)
+                runnable.signals.ready.connect(self._on_watch_info_ready, Qt.ConnectionType.QueuedConnection)
                 self._watch_info_pool.start(runnable)
 
         self._known_files = current_files
@@ -5831,6 +6399,7 @@ class MediaTab(QWidget):
         self.grid_view.clear()
         self.media_infos.clear()
         self.filtered_rows.clear()
+        self.view_stack.setCurrentIndex(2)  # empty state
         if self.directories: self.btn_load.setEnabled(True)
         else: self.btn_load.setEnabled(False)
         self.btn_clear.setVisible(False)
@@ -5969,12 +6538,11 @@ class MediaTab(QWidget):
             self.table.setRowHidden(row, True)
         self.grid_view.addItem(grid_item)
         if info.is_valid:
-            thumb_label = QLabel()
+            thumb_label = SkeletonThumbLabel()
             thumb_label.setObjectName("thumbnailLabel")
             thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             emoji_txt = "🎬" if info.media_type == 'video' else ("🎵" if info.media_type == 'audio' else ("📄" if info.media_type == 'pdf' else "🖼️"))
             thumb_label.setProperty("emoji", emoji_txt)
-            thumb_label.setText(emoji_txt)
             lw, lh = self._thumb_dims()
             thumb_label.setFixedSize(lw, lh)
             self.table.setCellWidget(row, self.COL_THUMB, thumb_label)
@@ -5999,6 +6567,7 @@ class MediaTab(QWidget):
         
         meta_font = QFont(BASE_FONT_FAMILY, 9, QFont.Weight.Light)
         bold_meta_font = QFont(BASE_FONT_FAMILY, 9, QFont.Weight.Bold)
+        mono_meta_font = _mono_font(9, True)  # Nebula: aligned digits in data columns
         
         fname_item = NumericTableWidgetItem(info.filename)
         fname_item.setData(Qt.ItemDataRole.UserRole, info)
@@ -6010,7 +6579,7 @@ class MediaTab(QWidget):
         size_item = NumericTableWidgetItem(info.size_formatted, sort_key=info.size_bytes)
         size_item.setFlags(size_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         size_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        size_item.setFont(bold_meta_font)
+        size_item.setFont(mono_meta_font)
         size_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
         self.table.setItem(row, self.COL_SIZE, size_item)
         
@@ -6023,7 +6592,7 @@ class MediaTab(QWidget):
         res_item = NumericTableWidgetItem(res_text, sort_key=res_key)
         res_item.setFlags(res_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         res_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        res_item.setFont(bold_meta_font)
+        res_item.setFont(mono_meta_font)
         res_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
         self.table.setItem(row, self.COL_RESOLUTION, res_item)
         
@@ -6036,7 +6605,7 @@ class MediaTab(QWidget):
         dur_item = NumericTableWidgetItem(dur_text, sort_key=dur_key)
         dur_item.setFlags(dur_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        dur_item.setFont(bold_meta_font)
+        dur_item.setFont(mono_meta_font)
         dur_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
         self.table.setItem(row, self.COL_DURATION, dur_item)
 
@@ -6045,7 +6614,7 @@ class MediaTab(QWidget):
             dt_item = NumericTableWidgetItem(format_timestamp(ts), sort_key=ts)
             dt_item.setFlags(dt_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             dt_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            dt_item.setFont(bold_meta_font)
+            dt_item.setFont(mono_meta_font)
             dt_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
             self.table.setItem(row, col, dt_item)
         parsed_artist, parsed_rating = parse_naming_format(info.filename)
@@ -6093,6 +6662,9 @@ class MediaTab(QWidget):
         _, row_h = self._thumb_dims()
         self.table.setRowHeight(row, row_h + 8)
         self._updating_table = False
+        if self.view_stack.currentIndex() == 2:
+            # Leave the empty state as soon as the first file appears
+            self.view_stack.setCurrentIndex(1 if self.btn_view_mode.isChecked() else 0)
         self._update_row_preview(row)
 
     def _generate_thumbnail_async(self, row: int, info: MediaInfo, label: QLabel):
@@ -6107,7 +6679,7 @@ class MediaTab(QWidget):
             self._thumb_pool.setMaxThreadCount(4)
         runnable = _ThumbnailRunnable(row, info, label, self)
         # Cross-thread queued connection — _on_thumbnail_ready runs on main thread
-        runnable.signals.finished.connect(self._on_thumbnail_ready)
+        runnable.signals.finished.connect(self._on_thumbnail_ready, Qt.ConnectionType.QueuedConnection)
         self._thumb_pool.start(runnable)
 
     def _on_thumbnail_ready(self, row: int, info: MediaInfo, label: QLabel, image):
@@ -6121,8 +6693,8 @@ class MediaTab(QWidget):
                 cw, ch = self._thumb_dims()
                 label.setFixedSize(cw, ch)
                 label.setPixmap(pixmap.scaled(cw, ch, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            grid = self._get_grid_item(info)
-            if grid: grid.setIcon(QIcon(pixmap))
+            _gi = self._grid_item(info)
+            if _gi: _gi.setIcon(QIcon(pixmap))
 
     @property
     def progress_bar(self):
@@ -6168,6 +6740,12 @@ class MediaTab(QWidget):
                 info = watched.property("media_info")
                 if info and info.media_type == 'video' and info.is_valid:
                     self._stop_hover_timer()
+        elif isinstance(watched, QLineEdit) and watched.focusPolicy() == Qt.FocusPolicy.ClickFocus:
+            if event.type() == QEvent.Type.FocusIn:
+                watched.setCursor(Qt.CursorShape.IBeamCursor)
+            elif event.type() == QEvent.Type.FocusOut:
+                watched.setCursor(Qt.CursorShape.ArrowCursor)
+                watched.deselect()
         return super().eventFilter(watched, event)
 
     def _start_hover_timer(self, info, global_rect):
@@ -6207,6 +6785,8 @@ class MediaTab(QWidget):
         self.grid_view.setUpdatesEnabled(True)
         self.table.setSortingEnabled(True)
         loaded = len(self.media_infos)
+        if loaded == 0:
+            self.view_stack.setCurrentIndex(2)  # empty state
         if self.media_type == 'video': media_word = "video"
         elif self.media_type == 'audio': media_word = "audio"
         else: media_word = "image"
@@ -6234,6 +6814,8 @@ class MediaTab(QWidget):
             thumb_label = self.table.cellWidget(row, self.COL_THUMB)
             if thumb_label and thumb_label.objectName() == "thumbnailLabel":
                 self._generate_thumbnail_async(row, info, thumb_label)
+                if hasattr(thumb_label, 'start_shimmer'):
+                    thumb_label.start_shimmer()
                 
 
         # Artist widget
@@ -6244,6 +6826,9 @@ class MediaTab(QWidget):
             artist_input = QLineEdit()
             artist_input.setPlaceholderText("Enter name…")
             artist_input.setMaxLength(100)
+            artist_input.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            artist_input.setCursor(Qt.CursorShape.ArrowCursor)
+            artist_input.installEventFilter(self)
             if val: artist_input.setText(val)
             artist_input.textChanged.connect(self._on_input_changed_sender)
             artist_input.editingFinished.connect(self._on_artist_editing_finished)
@@ -6273,6 +6858,9 @@ class MediaTab(QWidget):
                 val = ", ".join(info.tags)
             tag_input = QLineEdit()
             tag_input.setPlaceholderText("e.g. nature, 4k, favorite")
+            tag_input.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+            tag_input.setCursor(Qt.CursorShape.ArrowCursor)
+            tag_input.installEventFilter(self)
             if val: tag_input.setText(val)
             tag_input.editingFinished.connect(self._on_tags_edited)
             self.table.setCellWidget(row, self.COL_TAGS, tag_input)
@@ -6281,6 +6869,17 @@ class MediaTab(QWidget):
         """Inner thumbnail label size derived from the thumb_size setting."""
         w = int(getattr(self, 'thumb_size', 130))
         return w, max(50, round(w * 0.567))
+
+    def _set_grid_item(self, info, item):
+        """FIX: per-tab grid item storage. MediaInfo objects are shared across
+        smart-folder tabs; a single info.grid_item attribute clobbered the
+        other tab's card (wrong thumbnails, broken selection, stale paths)."""
+        if not hasattr(info, 'grid_items'):
+            info.grid_items = {}
+        info.grid_items[id(self)] = item
+
+    def _grid_item(self, info):
+        return getattr(info, 'grid_items', {}).get(id(self))
 
     def apply_thumbnail_size(self, size: int):
         """Resize thumbnails across table + grid and re-render visible ones."""
@@ -6459,11 +7058,7 @@ class MediaTab(QWidget):
                 continue
             if config_key == "name":
                 if artist:
-                    clean_artist = sanitize_folder_name(artist)
-                    if clean_artist and clean_artist != "Unknown":
-                        parts.append(clean_artist)
-                    elif artist.strip():
-                        parts.append(re.sub(r'[\\/*?:"<>|]', '', artist).strip())
+                    parts.append(sanitize_folder_name(artist))  # FIX: strip characters illegal in filenames
             elif config_key == "duration":
                 if self.media_type != 'image' and info.duration_compact and info.duration_compact != "—":
                     parts.append(info.duration_compact)
@@ -6472,24 +7067,16 @@ class MediaTab(QWidget):
                     parts.append(info.resolution_tag)
             elif config_key == "rating":
                 if rating and rating != "—":
-                    clean_rating = re.sub(r'[\\/*?:"<>|]', '', rating).strip()
-                    if clean_rating:
-                        parts.append(clean_rating)
+                    parts.append(sanitize_folder_name(rating))
             elif config_key == "tags":
                 tags = getattr(info, 'tags', [])
                 if tags:
-                    clean_tags = [re.sub(r'[\\/*?:"<>|]', '', t).strip() for t in tags if t.strip()]
-                    if clean_tags:
-                        parts.append(" ".join(clean_tags))
+                    parts.append(sanitize_folder_name(" ".join(tags)))
             elif config_key in ("date_taken", "ym"):
                 dt = get_media_datetime(info)
                 if dt is not None:
                     parts.append(dt.strftime("%Y-%m-%d") if config_key == "date_taken" else dt.strftime("%Y%m"))
-        result = separator.join(parts).strip()
-        result = re.sub(r'[\\/*?:"<>|]', '', result).strip()
-        if sys.platform == "win32":
-            result = result.rstrip(".")
-        return result
+        return separator.join(parts)
 
     def _is_naming_data_complete(self, artist: str, rating: str, info=None) -> bool:
         main_win = self.window()
@@ -6534,17 +7121,18 @@ class MediaTab(QWidget):
         target_display = new_name + (info.extension if keep_ext else "") if new_name else ""
         
         is_dark = getattr(self.window(), 'current_theme', 'dark') == 'dark'
-        grid = self._get_grid_item(info)
         if not is_complete or not new_name or target_display == current_display_name:
             preview_item.setText("—")
             preview_item.setFont(QFont(BASE_FONT_FAMILY, 10, QFont.Weight.Normal))
             preview_item.setForeground(QColor("#7c7c9a") if is_dark else QColor("#64748b"))
-            if grid: grid.setToolTip("")
+            _gi = self._grid_item(info)
+            if _gi: _gi.setToolTip("")
         else:
             preview_item.setText(f"➜  {target_display}")
             preview_item.setFont(QFont(BASE_FONT_FAMILY, 10, QFont.Weight.Bold))
             preview_item.setForeground(QColor("#34d399") if is_dark else QColor("#059669"))
-            if grid: grid.setToolTip(f"Rename to: {target_display}")
+            _gi = self._grid_item(info)
+            if _gi: _gi.setToolTip(f"Rename to: {target_display}")
         self._update_stats()
 
     def _on_selection_changed(self):
@@ -6558,8 +7146,8 @@ class MediaTab(QWidget):
             self.grid_view.clearSelection()
             for row in selected_rows:
                 info = self._get_row_info(row)
-                grid = self._get_grid_item(info)
-                if grid: grid.setSelected(True)
+                _gi = self._grid_item(info) if info else None
+                if _gi: _gi.setSelected(True)
             self.grid_view.blockSignals(False)
         finally:
             self._syncing_selection = False
@@ -6631,12 +7219,13 @@ class MediaTab(QWidget):
                     tags_item = self.table.item(row, self.COL_TAGS)
                     if tags_item:
                         tags_item.setText(tags_text)
+                    tags_widget = self.table.cellWidget(row, self.COL_TAGS)
                     if tags_widget and tags_widget.text() != tags_text:
                         tags_widget.setText(tags_text)
-                    grid = self._get_grid_item(info)
-                    if grid:
+                    _gi = self._grid_item(info)
+                    if _gi:
                         tag_str = tags_text if new_tags else ""
-                        grid.setToolTip(f"{info.filename}\nTags: {tag_str}" if tag_str else info.filename)
+                        _gi.setToolTip(f"{info.filename}\nTags: {tag_str}" if tag_str else info.filename)
             finally:
                 self._updating_table = False
                 self.table.setSortingEnabled(was_sorting)
@@ -6675,18 +7264,16 @@ class MediaTab(QWidget):
 
     def _on_smart_relocate(self):
         """Opens the Smart Relocate Dialog and executes the move."""
-        selected_rows = set()
+        if getattr(self, '_relocating', False):
+            return
+        selected_infos = []
         for rng in self.table.selectedRanges():
             for row in range(rng.topRow(), rng.bottomRow() + 1):
-                selected_rows.add(row)
+                info = self._get_row_info(row)
+                if info is not None and info not in selected_infos:
+                    selected_infos.append(info)
 
-        selected_infos = []
-        for r in sorted(selected_rows):
-            info = self._get_row_info(r)
-            if info and info.is_valid:
-                selected_infos.append(info)
-
-        dialog = SmartRelocateDialog(self.media_infos, selected_infos, self)
+        dialog = SmartRelocateDialog(selected_infos, self.media_infos, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -6704,119 +7291,149 @@ class MediaTab(QWidget):
             return
 
         # Compute the allowed root (everything before the first {variable})
+        # so we can validate each resolved dest_dir stays inside it.
         first_var = template.find('{')
-        allowed_root = os.path.normcase(os.path.abspath(template[:first_var])) if first_var > 0 else None
+        if first_var > 0:
+            try:
+                allowed_root = os.path.normcase(os.path.realpath(os.path.abspath(template[:first_var])))
+            except Exception:
+                allowed_root = os.path.normcase(os.path.abspath(template[:first_var]))
+        elif first_var == -1:
+            # No variable — template is a literal directory; anchor to it
+            try:
+                allowed_root = os.path.normcase(os.path.realpath(os.path.abspath(template)))
+            except Exception:
+                allowed_root = os.path.normcase(os.path.abspath(template))
+        else:
+            # Template starts with a variable — no literal prefix to anchor to.
+            # Fall back to the first source file's parent as the allowed root,
+            # or home directory if unavailable. This prevents CWD-relative escapes.
+            _fallback_base = os.path.dirname(target_infos[0].filepath) if target_infos else os.path.expanduser("~")
+            try:
+                allowed_root = os.path.normcase(os.path.realpath(os.path.abspath(_fallback_base)))
+            except Exception:
+                allowed_root = os.path.normcase(os.path.abspath(_fallback_base))
 
         success_count = 0
         error_count = 0
-        error_details = []
+        error_details = []  # capture for the completion dialog
 
         was_sorting = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
         self._updating_table = True
+        # FIX: re-entrancy guard — processEvents() below used to let the user
+        # fire Process All / Delete mid-move and corrupt table state.
+        self._relocating = True
+        for _b in (self.btn_process, self.btn_relocate, self.btn_delete,
+                   self.btn_batch_edit, self.btn_batch_tag, self.btn_find_dupes):
+            _b.setEnabled(False)
 
-        # Disable buttons to prevent re-entrancy during processEvents()
-        buttons_to_toggle = [
-            getattr(self, 'btn_process', None), getattr(self, 'btn_relocate', None),
-            getattr(self, 'btn_batch_edit', None), getattr(self, 'btn_batch_tag', None),
-            getattr(self, 'btn_delete', None), getattr(self, 'btn_load', None),
-            getattr(self, 'btn_clear', None), getattr(self, 'btn_find_dupes', None),
-            getattr(self, 'btn_undo', None), getattr(self, 'btn_redo', None)
-        ]
-        btn_states = {btn: btn.isEnabled() for btn in buttons_to_toggle if btn is not None}
-        for btn in btn_states:
-            btn.setEnabled(False)
+        # Build id(info) -> row map ONCE for O(1) lookup (was O(N·M))
+        id_to_row = {}
+        for r in range(self.table.rowCount()):
+            ri = self._get_row_info(r)
+            if ri is not None:
+                id_to_row[id(ri)] = r
 
-        try:
-            # Build id(info) -> row map ONCE for O(1) lookup
-            id_to_row = {}
-            for r in range(self.table.rowCount()):
-                ri = self._get_row_info(r)
-                if ri is not None:
-                    id_to_row[id(ri)] = r
+        # Show a progress dialog so the user can see what's happening during
+        # long cross-filesystem moves (which can take seconds per GB).
+        progress = QProgressDialog("Moving files…", "Cancel", 0, len(target_infos), self)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
 
-            progress = QProgressDialog("Moving files…", "Cancel", 0, len(target_infos), self)
-            progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
+        for idx, info in enumerate(target_infos):
+            if progress.wasCanceled():
+                error_details.append(f"Cancelled by user after {success_count} files moved.")
+                break
+            src = info.filepath
+            tags = getattr(info, 'tags', [])
+            dest_dir = parse_destination_template(template, info, tags)
 
-            for idx, info in enumerate(target_infos):
-                if progress.wasCanceled():
-                    error_details.append(f"Cancelled by user after {success_count} files moved.")
-                    break
-                src = info.filepath
-                tags = getattr(info, 'tags', [])
-                dest_dir = parse_destination_template(template, info, tags)
-
-                if allowed_root:
-                    abs_dest = os.path.normcase(os.path.abspath(dest_dir))
-                    try:
-                        if os.path.commonpath([allowed_root, abs_dest]) != allowed_root:
-                            error_count += 1
-                            error_details.append(f"{info.filename}: destination escapes allowed root")
-                            continue
-                    except ValueError:
-                        error_count += 1
-                        error_details.append(f"{info.filename}: cannot validate destination path")
-                        continue
-
-                try:
-                    os.makedirs(dest_dir, exist_ok=True)
-
-                    dest_file = os.path.join(dest_dir, info.filename)
-                    same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
-                    if os.path.exists(dest_file) and not same_file:
-                        base, ext = os.path.splitext(info.filename)
-                        counter = 1
-                        while os.path.exists(dest_file):
-                            dest_file = os.path.join(dest_dir, f"{base}_{counter}{ext}")
-                            counter += 1
-
-                    shutil.move(src, dest_file)
-
-                    info.filepath = dest_file
-                    info.filename = os.path.basename(dest_file)
-
-                    row_idx = id_to_row.get(id(info), -1)
-
-                    moved_extra = self._move_sidecars(src, dest_file)
-                    self._refresh_row_dates(info)
-                    if row_idx >= 0:
-                        fname_item = self.table.item(row_idx, self.COL_FILENAME)
-                        if fname_item:
-                            fname_item.setText(info.filename)
-                            fname_item.setToolTip(dest_file)
-                        grid_item = self._get_grid_item(info)
-                        if grid_item:
-                            grid_item.setText(info.filename)
-                            grid_item.setToolTip(dest_file)
-                        self._update_date_items(row_idx, info)
-                    self._add_to_history(src, dest_file, row_idx, extra=moved_extra)
-
-                    success_count += 1
-
-                except Exception as e:
+            # Path-traversal safety: ensure resolved dest_dir stays under allowed_root
+            # (now always set — even templates starting with a variable anchor to source parent/home)
+            try:
+                abs_dest = os.path.normcase(os.path.realpath(os.path.abspath(dest_dir)))
+            except Exception:
+                abs_dest = os.path.normcase(os.path.abspath(dest_dir))
+            # Reject non-absolute or empty destinations
+            if not os.path.isabs(dest_dir) and not os.path.isabs(abs_dest):
+                error_count += 1
+                error_details.append(f"{info.filename}: destination is not an absolute path — use a base folder in the template")
+                continue
+            try:
+                if os.path.commonpath([allowed_root, abs_dest]) != allowed_root:
                     error_count += 1
-                    error_details.append(f"{info.filename}: {e}")
-                    logger.exception("Failed to move %s", info.filename)
+                    error_details.append(f"{info.filename}: destination escapes allowed root")
+                    continue
+            except ValueError:
+                error_count += 1
+                error_details.append(f"{info.filename}: cannot validate destination path")
+                continue
 
-                progress.setValue(idx + 1)
-                QApplication.processEvents()
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
 
-            progress.close()
+                dest_file = os.path.join(dest_dir, info.filename)
+                same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
+                if os.path.exists(dest_file) and not same_file:
+                    base, ext = os.path.splitext(info.filename)
+                    counter = 1
+                    while os.path.exists(dest_file):
+                        dest_file = os.path.join(dest_dir, f"{base}_{counter}{ext}")
+                        counter += 1
 
-        finally:
-            self._updating_table = False
-            self.table.setSortingEnabled(was_sorting)
-            if success_count > 0:
-                self._known_files_dirty = True
+                shutil.move(src, dest_file)
 
-            for btn, state in btn_states.items():
-                btn.setEnabled(state)
+                # Update info and matching table items
+                info.filepath = dest_file
+                info.filename = os.path.basename(dest_file)
 
-            self.table.viewport().update()
-            self.btn_undo.setEnabled(len(self._rename_history) > 0)
+                row_idx = id_to_row.get(id(info), -1)
 
+                # Sidecars + dates + history must happen even when row_idx==-1
+                # (cross-tab source, stale id_to_row) — disk state already moved
+                moved_extra = self._move_sidecars(src, dest_file)
+                self._refresh_row_dates(info)
+                if row_idx >= 0:
+                    fname_item = self.table.item(row_idx, self.COL_FILENAME)
+                    if fname_item:
+                        fname_item.setText(info.filename)
+                        fname_item.setToolTip(dest_file)
+                    # Keep the grid card in sync (was stale until next rescan)
+                    _gi = self._grid_item(info)
+                    if _gi:
+                        _gi.setText(info.filename)
+                        _gi.setToolTip(dest_file)
+                    self._update_date_items(row_idx, info)
+                self._add_to_history(src, dest_file, row_idx, extra=moved_extra)
+
+                success_count += 1
+
+            except Exception as e:
+                error_count += 1
+                error_details.append(f"{info.filename}: {e}")
+                logger.exception("Failed to move %s", info.filename)
+
+            progress.setValue(idx + 1)
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+        progress.close()
+
+        self._updating_table = False
+        self.table.setSortingEnabled(was_sorting)
+        self._relocating = False
+        for _b in (self.btn_process, self.btn_relocate, self.btn_delete,
+                   self.btn_batch_edit, self.btn_batch_tag, self.btn_find_dupes):
+            _b.setEnabled(True)
+        if success_count > 0:
+            self._known_files_dirty = True
+
+        self.table.viewport().update()
+        self.btn_undo.setEnabled(len(self._rename_history) > 0)
+
+        # Include error details in the completion dialog so users can diagnose
+        # why specific files failed (was: just a count via silent print()).
         msg = f"Relocation complete.\nSuccess: {success_count}\nFailed: {error_count}"
         if error_details:
             msg += "\n\nErrors (first 10):\n" + "\n".join(error_details[:10])
@@ -7238,11 +7855,10 @@ class MediaTab(QWidget):
         if info:
             self.media_infos = [v for v in self.media_infos if v.filepath != info.filepath]
             self.table.removeRow(row)
-            grid = self._get_grid_item(info)
-            if grid:
-                row_item = self.grid_view.row(grid)
+            _gi = self._grid_item(info)
+            if _gi:
+                row_item = self.grid_view.row(_gi)
                 if row_item >= 0: self.grid_view.takeItem(row_item)
-                self._set_grid_item(info, None)
             # Keep filtered_rows consistent: every index above the removed row
             # shifts down by one (prevents later bulk ops targeting stale rows).
             self.filtered_rows.discard(row)
@@ -7355,10 +7971,10 @@ class MediaTab(QWidget):
             self._updating_table = True
             item.setText(info.filename)
             self._updating_table = False
-            grid = self._get_grid_item(info)
-            if grid:
-                grid.setText(info.filename)
-                grid.setToolTip(dst)
+            _gi = self._grid_item(info)
+            if _gi:
+                _gi.setText(info.filename)
+                _gi.setToolTip(dst)
             self._known_files_dirty = True
             moved_extra = self._move_sidecars(src, dst)
             self._refresh_row_dates(info)
@@ -7425,8 +8041,8 @@ class MediaTab(QWidget):
                     status_item.setText("✓ Renamed")
                     status_item.setForeground(QColor("#6dd5ed"))
                     self._updating_table = False
-                    grid = self._get_grid_item(info)
-                    if grid: grid.setText(info.filename)
+                    _gi = self._grid_item(info)
+                    if _gi: _gi.setText(info.filename)
                     moved_extra = self._move_sidecars(src, dst)
                     self._refresh_row_dates(info)
                     self._update_date_items(row, info)
@@ -7501,8 +8117,8 @@ class MediaTab(QWidget):
                             self.table.item(row, self.COL_FILENAME).setToolTip(src)
                             self.table.item(row, self.COL_STATUS).setText("✓ Valid")
                             self.table.item(row, self.COL_STATUS).setForeground(QColor("#34d399"))
-                            grid = self._get_grid_item(info)
-                            if grid: grid.setText(info.filename)
+                            _gi = self._grid_item(info)
+                            if _gi: _gi.setText(info.filename)
                 except Exception as te:
                     # Table update failed after successful move — attempt to roll
                     # back the move so disk state and table state stay in sync.
@@ -7569,8 +8185,8 @@ class MediaTab(QWidget):
                             self.table.item(row, self.COL_FILENAME).setToolTip(dst)
                             self.table.item(row, self.COL_STATUS).setText("✓ Renamed")
                             self.table.item(row, self.COL_STATUS).setForeground(QColor("#6dd5ed"))
-                            grid = self._get_grid_item(info)
-                            if grid: grid.setText(info.filename)
+                            _gi = self._grid_item(info)
+                            if _gi: _gi.setText(info.filename)
                 except Exception as te:
                     # Table update failed after successful move — roll the move
                     # back so disk state and table state stay in sync (mirrors
@@ -7745,8 +8361,8 @@ class MediaTab(QWidget):
             for row in range(self.table.rowCount()):
                 self.table.setRowHidden(row, False)
                 info = self._get_row_info(row)
-                grid = self._get_grid_item(info)
-                if grid: grid.setHidden(False)
+                _gi = self._grid_item(info) if info else None
+                if _gi: _gi.setHidden(False)
             self._update_stats()
             return
         was_sorting = self.table.isSortingEnabled()
@@ -7755,8 +8371,8 @@ class MediaTab(QWidget):
         for row in range(self.table.rowCount()):
             self.table.setRowHidden(row, True)
             info = self._get_row_info(row)
-            grid = self._get_grid_item(info)
-            if grid: grid.setHidden(True)
+            _gi = self._grid_item(info) if info else None
+            if _gi: _gi.setHidden(True)
         total_dupes = 0
         for group_idx, grp in enumerate(groups):
             bg_color = QColor(239, 68, 68, 38) if group_idx % 2 == 0 else QColor(245, 158, 11, 38)
@@ -7767,8 +8383,8 @@ class MediaTab(QWidget):
                 self.filtered_rows.add(row)
                 self.table.setRowHidden(row, False)
                 info = self._get_row_info(row)
-                grid = self._get_grid_item(info)
-                if grid: grid.setHidden(False)
+                _gi = self._grid_item(info) if info else None
+                if _gi: _gi.setHidden(False)
                 status_item = self.table.item(row, self.COL_STATUS)
                 if status_item:
                     status_item.setText(f"⚠️ Dup Group {group_idx + 1}")
@@ -7799,11 +8415,15 @@ class MediaTab(QWidget):
                     if item: item.setBackground(QBrush(Qt.BrushStyle.NoBrush))
 
     def _toggle_view_mode(self, checked):
-        if checked:
+        if self.table.rowCount() == 0:
+            self.view_stack.setCurrentIndex(2)  # empty state
+        elif checked:
             self.view_stack.setCurrentIndex(1)
-            self.btn_view_mode.setText("List View")
         else:
             self.view_stack.setCurrentIndex(0)
+        if checked:
+            self.btn_view_mode.setText("List View")
+        else:
             self.btn_view_mode.setText("Grid View")
 
     def _toggle_preview(self, checked):
@@ -8022,8 +8642,8 @@ class MediaTab(QWidget):
         btn_layout.addWidget(self.time_label)
         controls_layout.addLayout(btn_layout)
         preview_layout.addWidget(self.preview_controls)
-        self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
         self.player.positionChanged.connect(self._on_player_position_changed)
@@ -8061,7 +8681,7 @@ class MediaTab(QWidget):
                             if info_r: paths.add(info_r.filepath)
                             if target_set is None or (paths & target_set):
                                 player_win.close()
-                    except Exception:
+                    except RuntimeError:
                         pass
 
     def _update_preview_pane(self):
@@ -8146,11 +8766,12 @@ class MediaTab(QWidget):
             selected_items = self.grid_view.selectedItems()
             for row in range(self.table.rowCount()):
                 info = self._get_row_info(row)
-                grid = self._get_grid_item(info)
-                if grid and grid in selected_items:
-                    for col in range(self.table.columnCount()):
-                        item = self.table.item(row, col)
-                        if item: item.setSelected(True)
+                if info is not None:
+                    _gi = self._grid_item(info)
+                    if _gi and _gi in selected_items:
+                        for col in range(self.table.columnCount()):
+                            item = self.table.item(row, col)
+                            if item: item.setSelected(True)
             self.table.blockSignals(False)
         finally:
             self._syncing_selection = False
@@ -8323,7 +8944,79 @@ class MediaTab(QWidget):
                 return
         super().keyPressEvent(event)
 
-# ─── Main App Window ─────────────────────────────────────────────────────────────
+# ─── Main App Window ─────────────────────────────────────────────────────────
+
+class NebulaProgressBar(QProgressBar):
+    """Gradient progress bar with an animated shimmer sweep (cyan → violet).
+
+    Animations stop while hidden and are disabled under reduced-motion.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._shimmer_pos = 0.0
+        self._anim = QTimer(self)
+        self._anim.setInterval(40)
+        self._anim.timeout.connect(self._tick)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        w = self.window()
+        reduced = bool(getattr(w, 'reduced_motion', False)) if w is not None else False
+        if not reduced:
+            self._anim.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._anim.stop()
+
+    def _tick(self):
+        self._shimmer_pos = (self._shimmer_pos + 0.03) % 1.2
+        self.update()
+
+    def paintEvent(self, event):
+        w = self.window()
+        is_dark = True
+        if w is not None and hasattr(w, 'current_theme'):
+            is_dark = (w.current_theme == 'dark')
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect().adjusted(2, 2, -2, -2))
+        h = rect.height()
+        painter.setPen(Qt.PenStyle.NoPen)
+        track = QColor("#16132E") if is_dark else QColor("#E2E8F0")
+        painter.setBrush(track)
+        painter.drawRoundedRect(rect, h / 2, h / 2)
+        lo, hi = self.minimum(), self.maximum()
+        if hi > lo:
+            frac = max(0.0, min(1.0, (self.value() - lo) / (hi - lo)))
+            if frac > 0.0:
+                fill_w = rect.width() * frac
+                # Theme accents (cyan→violet on Dark; per-theme on new skins)
+                _acc = getattr(w, 'theme_accent', None)
+                _acc2 = getattr(w, 'theme_accent2', None)
+                fill = QLinearGradient(rect.left(), 0.0, rect.left() + max(fill_w, h), 0.0)
+                fill.setColorAt(0.0, QColor(_acc2 or "#22D3EE"))
+                fill.setColorAt(1.0, QColor(_acc or "#8B5CF6"))
+                painter.setBrush(QBrush(fill))
+                painter.drawRoundedRect(QRectF(rect.left(), rect.top(), max(fill_w, h), h), h / 2, h / 2)
+                if self._anim.isActive():
+                    sweep = rect.width() * 0.15
+                    x = rect.left() - sweep + self._shimmer_pos * (rect.width() + sweep)
+                    painter.setClipRect(QRectF(rect.left(), rect.top(), fill_w, h))
+                    shine = QLinearGradient(x, 0.0, x + sweep, 0.0)
+                    shine.setColorAt(0.0, QColor(255, 255, 255, 0))
+                    shine.setColorAt(0.5, QColor(255, 255, 255, 70))
+                    shine.setColorAt(1.0, QColor(255, 255, 255, 0))
+                    painter.setBrush(QBrush(shine))
+                    painter.drawRoundedRect(QRectF(rect.left(), rect.top(), max(fill_w, h), h), h / 2, h / 2)
+                    painter.setClipping(False)
+        if self.isTextVisible():
+            painter.setPen(QColor("#ECECF4") if is_dark else QColor("#0F172A"))
+            painter.setFont(self.font())
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
+
 
 def prune_native_players(main_win):
     """Drop closed player windows from the tracked list, safely.
@@ -8386,7 +9079,9 @@ class MediaFlowWindow(QMainWindow):
             if t.isVisible():
                 start_y -= t.height() + 10
                 
-        target_pos = QPoint(self.width() - toast.width() - 20, start_y)
+        # FIX: sizeHint() — toast.width() is unreliable before show() (stacked
+        # toasts could overlap horizontally)
+        target_pos = QPoint(self.width() - toast.sizeHint().width() - 20, start_y)
         
         toast.destroyed.connect(lambda: self._active_toasts.remove(toast) if toast in self._active_toasts else None)
         toast.show_toast(target_pos)
@@ -8513,7 +9208,8 @@ class MediaFlowWindow(QMainWindow):
         self.btn_settings.setIconSize(QSize(20, 20))
         header_layout.addWidget(self.page_title)
         header_layout.addSpacing(20)
-        self.progress_bar = QProgressBar()
+        self.progress_bar = NebulaProgressBar()
+        self.progress_bar.setFixedHeight(18)
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setMinimumWidth(250)
@@ -8569,13 +9265,24 @@ class MediaFlowWindow(QMainWindow):
         appearance_sec = QGroupBox("🎨  Appearance")
         appearance_sec_layout = QVBoxLayout(appearance_sec)
         theme_row = QHBoxLayout()
-        theme_lbl = QLabel("Theme:")
+        theme_lbl = QLabel("Theme Mode:")
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["System (Auto)", "Dark Mode", "Light Mode"])
+        self.theme_combo.addItems(["System (Auto)", "Light", "Dark"])
+        self.theme_combo.setToolTip("System (Auto): matches OS preference · Light: clean light theme · Dark: futuristic dark theme")
         self.theme_combo.currentTextChanged.connect(self._on_theme_changed)
         theme_row.addWidget(theme_lbl)
         theme_row.addWidget(self.theme_combo, 1)
         appearance_sec_layout.addLayout(theme_row)
+
+        accent_row = QHBoxLayout()
+        accent_lbl = QLabel("Color Accent:")
+        self.accent_combo = QComboBox()
+        self.accent_combo.addItems(["Deep Space", "Orange", "Red", "Blue", "Violet", "Emerald"])
+        self.accent_combo.setToolTip("Customizes primary neon accent and highlight glows across all tabs and controls")
+        self.accent_combo.currentTextChanged.connect(self._on_theme_changed)
+        accent_row.addWidget(accent_lbl)
+        accent_row.addWidget(self.accent_combo, 1)
+        appearance_sec_layout.addLayout(accent_row)
 
         # UI size (accessibility) — scales all stylesheet font sizes
         size_row = QHBoxLayout()
@@ -8971,8 +9678,10 @@ class MediaFlowWindow(QMainWindow):
         dialog = AboutDialog(self)
         dialog.exec()
 
-    def _on_theme_changed(self, text):
-        ThemeManager.apply_theme(self, text)
+    def _on_theme_changed(self, _text=None):
+        mode = self.theme_combo.currentText()
+        accent = self.accent_combo.currentText()
+        ThemeManager.apply_theme(self, mode, accent)
         self._save_state()
 
     UI_SCALES = {"Compact": 0.85, "Normal": 1.0, "Large": 1.2}
@@ -8980,7 +9689,7 @@ class MediaFlowWindow(QMainWindow):
     def _on_ui_size_changed(self, text):
         if getattr(self, '_ui_size_syncing', False): return
         self.ui_scale = self.UI_SCALES.get(text, 1.0)
-        ThemeManager.apply_theme(self, self.theme_combo.currentText())
+        ThemeManager.apply_theme(self, self.theme_combo.currentText(), self.accent_combo.currentText())
         self._save_state()
 
     def _on_reduced_motion_changed(self, checked: bool):
@@ -9433,7 +10142,15 @@ class MediaFlowWindow(QMainWindow):
                     logger.warning("Skipping unknown naming field in template editor: %s", text)
         self.naming_all_fields_ordered = all_ordered
         self.naming_fields = checked_fields
-        self.naming_separator = self.separator_input.text()
+        sep_text = self.separator_input.text()
+        if any(ch in sep_text for ch in '\\/:*?"<>|'):
+            # FIX: an illegal separator would poison every generated filename
+            sep_text = re.sub(r'[\\/:*?"<>|]', '', sep_text) or ' '
+            self.separator_input.blockSignals(True)
+            self.separator_input.setText(sep_text)
+            self.separator_input.blockSignals(False)
+            self.show_toast("Separator can't contain characters illegal in filenames — removed.", 'warning')
+        self.naming_separator = sep_text
         self.naming_keep_extension = self.keep_extension_checkbox.isChecked()
         self._update_template_preview()
         self._debounced_save_state()
@@ -9489,6 +10206,7 @@ class MediaFlowWindow(QMainWindow):
                 'video_tab': self.video_tab.get_state_dict(), 'image_tab': self.image_tab.get_state_dict(), 'audio_tab': self.audio_tab.get_state_dict(), 'pdf_tab': self.pdf_tab.get_state_dict(),
                 'smart_folders': getattr(self, 'smart_folders_config', []),
                 'theme': self.theme_combo.currentText(),
+                'theme_accent': self.accent_combo.currentText(),
                 # FIX: global mute was never persisted — every launch reset it
                 'global_mute': bool(getattr(self, 'global_mute', False)),
                 'ui_scale': float(getattr(self, 'ui_scale', 1.0)),
@@ -9530,7 +10248,7 @@ class MediaFlowWindow(QMainWindow):
         """
         self._load_failed = False
         if not os.path.exists(CONFIG_FILE):
-            ThemeManager.apply_theme(self, "System (Auto)")
+            ThemeManager.apply_theme(self, "System (Auto)", "Deep Space")
             return
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f: state = json.load(f)
@@ -9539,12 +10257,12 @@ class MediaFlowWindow(QMainWindow):
         except json.JSONDecodeError as e:
             logger.warning("Corrupt config file (%s); starting fresh: %s", CONFIG_FILE, e)
             self._load_failed = True
-            ThemeManager.apply_theme(self, "System (Auto)")
+            ThemeManager.apply_theme(self, "System (Auto)", "Deep Space")
             return
         except OSError as e:
             logger.warning("Could not read config %s; starting fresh: %s", CONFIG_FILE, e)
             self._load_failed = True
-            ThemeManager.apply_theme(self, "System (Auto)")
+            ThemeManager.apply_theme(self, "System (Auto)", "Deep Space")
             return
 
         def run_section(label, fn, destructive=True):
@@ -9596,18 +10314,53 @@ class MediaFlowWindow(QMainWindow):
 
         # ── Theme (non-destructive) ──
         def _theme():
-            theme = state.get('theme', 'System (Auto)')
-            # Validate against combo items — setCurrentText() is a silent no-op
-            # for unknown values but apply_theme() still maps them, desyncing
-            # the UI from the applied theme.
-            items = [self.theme_combo.itemText(i) for i in range(self.theme_combo.count())]
-            if theme not in items:
-                logger.warning("Unknown saved theme %r; using System (Auto)", theme)
-                theme = 'System (Auto)'
+            saved_theme = state.get('theme', 'System (Auto)')
+            saved_accent = state.get('theme_accent', None)
+
+            # Backwards compatibility: migrate legacy combined skin names
+            if saved_accent is None:
+                if saved_theme == "Deep Space":
+                    saved_theme = "Dark"
+                    saved_accent = "Deep Space"
+                elif saved_theme == "Aurora":
+                    saved_theme = "Dark"
+                    saved_accent = "Emerald"
+                elif saved_theme == "Glass Morph":
+                    saved_theme = "Light"
+                    saved_accent = "Deep Space"
+                elif saved_theme == "Dark Mode":
+                    saved_theme = "Dark"
+                    saved_accent = "Deep Space"
+                elif saved_theme == "Light Mode":
+                    saved_theme = "Light"
+                    saved_accent = "Deep Space"
+                else:
+                    saved_accent = "Deep Space"
+
+            # Normalize mode
+            valid_modes = [self.theme_combo.itemText(i) for i in range(self.theme_combo.count())]
+            if saved_theme not in valid_modes:
+                if "light" in str(saved_theme).lower():
+                    saved_theme = "Light"
+                elif "dark" in str(saved_theme).lower():
+                    saved_theme = "Dark"
+                else:
+                    saved_theme = "System (Auto)"
+
+            # Normalize accent
+            valid_accents = [self.accent_combo.itemText(i) for i in range(self.accent_combo.count())]
+            if saved_accent not in valid_accents:
+                saved_accent = "Deep Space"
+
             self.theme_combo.blockSignals(True)
-            self.theme_combo.setCurrentText(theme)
+            self.theme_combo.setCurrentText(saved_theme)
             self.theme_combo.blockSignals(False)
-            ThemeManager.apply_theme(self, theme)
+
+            self.accent_combo.blockSignals(True)
+            self.accent_combo.setCurrentText(saved_accent)
+            self.accent_combo.blockSignals(False)
+
+            ThemeManager.apply_theme(self, saved_theme, saved_accent)
         run_section('theme', _theme, destructive=False)
 
         # ── Custom Naming Template ──
@@ -9831,6 +10584,66 @@ class MediaFlowWindow(QMainWindow):
         # Stop any pending debounced save so it can't fire during teardown
         if hasattr(self, '_save_state_timer'):
             self._save_state_timer.stop()
+        # Stop watch timers and request interruption for any running scanners
+        for tab in list(getattr(self, 'smart_folder_tabs', {}).values()) + [getattr(self, n, None) for n in ('video_tab','image_tab','audio_tab','pdf_tab')]:
+            if tab is None:
+                continue
+            try:
+                if hasattr(tab, '_watch_timer') and tab._watch_timer.isActive():
+                    tab._watch_timer.stop()
+                st = getattr(tab, 'scanner_thread', None)
+                if st is not None and st.isRunning():
+                    st.requestInterruption()
+                for ow in list(getattr(tab, '_orphaned_scanners', [])):
+                    try:
+                        if ow.isRunning():
+                            ow.requestInterruption()
+                    except RuntimeError:
+                        pass
+            except RuntimeError:
+                pass
+        # Give scanners a brief grace period to exit cleanly
+        for tab in list(getattr(self, 'smart_folder_tabs', {}).values()) + [getattr(self, n, None) for n in ('video_tab','image_tab','audio_tab','pdf_tab')]:
+            if tab is None:
+                continue
+            try:
+                st = getattr(tab, 'scanner_thread', None)
+                if st is not None and st.isRunning():
+                    st.wait(1800)
+                for ow in list(getattr(tab, '_orphaned_scanners', [])):
+                    try:
+                        if ow.isRunning():
+                            ow.wait(1200)
+                    except RuntimeError:
+                        pass
+                # Release file handles held by preview players before teardown
+                if hasattr(tab, '_release_file_locks'):
+                    try:
+                        tab._release_file_locks()
+                    except Exception:
+                        pass
+                if hasattr(tab, '_thumb_pool'):
+                    try:
+                        tab._thumb_pool.clear()
+                        tab._thumb_pool.waitForDone(400)
+                    except RuntimeError:
+                        pass
+                if hasattr(tab, '_watch_info_pool'):
+                    try:
+                        tab._watch_info_pool.clear()
+                        tab._watch_info_pool.waitForDone(400)
+                    except RuntimeError:
+                        pass
+            except RuntimeError:
+                pass
+        # FIX: give still-running trim exports a brief grace period so parked
+        # QThreads aren't destroyed mid-run at teardown (hard abort).
+        for _w in list(getattr(self, '_orphaned_trim_workers', [])):
+            try:
+                if _w.isRunning():
+                    _w.wait(2000)
+            except RuntimeError:
+                pass
         # FIX: never overwrite a config we failed to load — a half-initialized
         # session would replace recoverable on-disk state with near-empty data.
         if getattr(self, '_load_failed', False):
