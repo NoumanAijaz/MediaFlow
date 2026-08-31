@@ -1153,9 +1153,17 @@ def _build_vector_icon(name: str, is_dark: bool) -> QIcon:
 class EditableCellLineEdit(QLineEdit):
     """Table cell text editor: stays in clean read-only mode with a standard
     arrow cursor when idle/hovered. Enters active editing mode only on an
-    explicit click or keyboard Tab navigation — never just from receiving
-    focus, since some window managers grant focus on hover alone, and
-    scrolling can also shuffle focus onto a freshly created cell widget."""
+    explicit click or keyboard Tab navigation.
+
+    Some window managers use "focus follows mouse" / sloppy focus, which
+    hands Qt a real QFocusEvent (reason MouseFocusReason) purely because the
+    pointer drifted over the widget — with no mouse button ever pressed.
+    That can (a) unlock editing just from hovering, and (b) yank focus away
+    from a box you're actively typing in the moment the pointer drifts onto
+    a different cell. Both are guarded against below by checking whether a
+    mouse button is actually down: a real click always has one; a hover-only
+    focus change never does.
+    """
 
     def __init__(self, placeholder: str = "", parent=None):
         super().__init__(parent)
@@ -1163,37 +1171,70 @@ class EditableCellLineEdit(QLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setReadOnly(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
+        self._editing_active = False
+
+    @staticmethod
+    def _is_genuine_mouse_focus_change() -> bool:
+        return QApplication.mouseButtons() != Qt.MouseButton.NoButton
 
     def mousePressEvent(self, event):
         if self.isReadOnly():
             self.setReadOnly(False)
             self.setCursor(Qt.CursorShape.IBeamCursor)
+        self._editing_active = True
         super().mousePressEvent(event)
 
     def focusInEvent(self, event):
-        # Only a deliberate action unlocks editing: an actual click (already
-        # unlocked above by the time this fires) or keyboard Tab navigation.
-        # Any other reason — ambient "focus follows mouse", or focus landing
-        # here incidentally while the table recreates/recycles cell widgets
-        # during scrolling — must NOT flip the field into edit mode just
-        # because the cursor happens to be resting over it.
-        if event.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
+        reason = event.reason()
+        if reason in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
             self.setReadOnly(False)
             self.setCursor(Qt.CursorShape.IBeamCursor)
+            self._editing_active = True
+        elif reason == Qt.FocusReason.MouseFocusReason and self._is_genuine_mouse_focus_change():
+            self.setReadOnly(False)
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+            self._editing_active = True
+        # Any other reason (hover-only sloppy focus, programmatic focus,
+        # widget recycling during scroll, etc.) leaves the field read-only.
         super().focusInEvent(event)
 
     def focusOutEvent(self, event):
+        reason = event.reason()
+        if (self._editing_active and reason == Qt.FocusReason.MouseFocusReason
+                and not self._is_genuine_mouse_focus_change()):
+            # Pointer merely drifted onto another cell under a focus-follows-
+            # mouse WM — don't commit/exit edit mode. Reclaim focus so the
+            # keystrokes you're mid-typing keep landing here.
+            QTimer.singleShot(0, self._reclaim_focus_if_still_editing)
+            event.ignore()
+            return
+        self._editing_active = False
         self.setReadOnly(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.deselect()
         super().focusOutEvent(event)
 
+    def _reclaim_focus_if_still_editing(self):
+        try:
+            if self._editing_active and self.isVisible():
+                self.setFocus(Qt.FocusReason.OtherFocusReason)
+        except RuntimeError:
+            pass  # widget was torn down (row removed / table cleared) in the meantime
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._editing_active = False
+            self.setReadOnly(True)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.deselect()
             self.clearFocus()
             event.accept()
             return
         elif event.key() == Qt.Key.Key_Escape:
+            self._editing_active = False
+            self.setReadOnly(True)
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.deselect()
             self.clearFocus()
             event.accept()
             return
