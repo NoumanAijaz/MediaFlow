@@ -2,9 +2,9 @@
 
 
 a = Analysis(
-    ['f:/Dev/MediaFlow/mediaflow.py'],
+    ['F:/Dev/MediaFlow/mediaflow.py'],
     pathex=[],
-    binaries=[('f:/Dev/MediaFlow/mediaflow-core.exe', '.')],
+    binaries=[('F:/Dev/MediaFlow/mediaflow-core.exe', '.')],
     datas=[('logo.png', '.'), ('logo.ico', '.')],
     hiddenimports=[],
     hookspath=[],

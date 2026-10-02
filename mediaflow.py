@@ -2711,6 +2711,56 @@ class ThemeManager:
         for nav_item in getattr(window, 'smart_folder_nav_items', {}).values():
             nav_item.update_theme(is_dark)
 
+def sniff_media_type_from_file(filepath: str) -> Optional[str]:
+    """Inspect magic bytes to determine media type for extensionless files."""
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(32)
+        if len(header) < 4:
+            return None
+        # PNG
+        if header.startswith(b'\x89PNG\r\n\x1a\n'):
+            return 'image'
+        # JPEG
+        if header.startswith(b'\xff\xd8\xff'):
+            return 'image'
+        # GIF
+        if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
+            return 'image'
+        # BMP
+        if header.startswith(b'BM'):
+            return 'image'
+        # PDF
+        if header.startswith(b'%PDF'):
+            return 'pdf'
+        # RIFF (WEBP, AVI, WAVE)
+        if header.startswith(b'RIFF') and len(header) >= 12:
+            tag = header[8:12]
+            if tag == b'WEBP':
+                return 'image'
+            elif tag == b'AVI ':
+                return 'video'
+            elif tag == b'WAVE':
+                return 'audio'
+        # MP4 / MOV (offset 4 'ftyp')
+        if len(header) >= 8 and header[4:8] == b'ftyp':
+            return 'video'
+        # Matroska / WebM
+        if header.startswith(b'\x1a\x45\xdf\xa3'):
+            return 'video'
+        # FLAC
+        if header.startswith(b'fLaC'):
+            return 'audio'
+        # OGG
+        if header.startswith(b'OggS'):
+            return 'audio'
+        # MP3 (ID3 tag or sync frame)
+        if header.startswith(b'ID3') or (header[0] == 0xFF and (header[1] & 0xE0) == 0xE0):
+            return 'audio'
+    except Exception:
+        pass
+    return None
+
 # ─── Media Metadata Extraction ──────────────────────────────────────────────────
 
 class MediaInfo:
@@ -2719,7 +2769,13 @@ class MediaInfo:
         self.filename = os.path.basename(filepath)
         self.extension = os.path.splitext(filepath)[1].lower()
         self.media_type = media_type
-        if media_type == 'all':
+        if not self.extension:
+            sniffed = sniff_media_type_from_file(filepath)
+            if sniffed:
+                self.media_type = sniffed
+            elif media_type == 'all':
+                self.media_type = 'video'
+        elif media_type == 'all':
             if self.extension in VIDEO_EXTENSIONS: self.media_type = 'video'
             elif self.extension in AUDIO_EXTENSIONS: self.media_type = 'audio'
             elif self.extension in PDF_EXTENSIONS: self.media_type = 'pdf'
@@ -2763,8 +2819,11 @@ class MediaInfo:
             self.mtime = 0.0
             self.ctime = 0.0
             if self.media_type == 'unknown':
-                self.error_message = "Unsupported media format"
-                return
+                if not self.extension:
+                    self.media_type = 'video'
+                else:
+                    self.error_message = "Unsupported media format"
+                    return
             try:
                 if os.path.exists(filepath):
                     st_ = os.stat(filepath)
@@ -2825,6 +2884,12 @@ class MediaInfo:
                     except Exception as e:
                         logger.debug("ffprobe video fallback failed for %s: %s", self.filepath, e)
                 if not video_ok and not (self.width > 0 and self.height > 0):
+                    if not self.extension:
+                        self.resolution_tag = "—"
+                        self.duration_compact = ""
+                        self.duration_formatted = "—"
+                        self.is_valid = True
+                        return
                     self.error_message = "Cannot open video file"
                     return
                 if self.duration_seconds > 0:
@@ -2873,6 +2938,12 @@ class MediaInfo:
                     except Exception as e:
                         logger.debug("mutagen fallback failed for %s: %s", self.filepath, e)
                 if not duration_ok:
+                    if not self.extension:
+                        self.resolution_tag = ""
+                        self.duration_compact = ""
+                        self.duration_formatted = "—"
+                        self.is_valid = True
+                        return
                     # Do NOT fabricate a duration from file size — that produces wildly
                     # wrong numbers (the old code assumed a 24 kbps constant bitrate).
                     self.error_message = "Cannot determine audio duration (install mutagen or ffprobe for accurate duration)"
@@ -2900,11 +2971,23 @@ class MediaInfo:
                     with _CV_LOCK:
                         img = cv2.imdecode(np.fromfile(self.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
                     if img is None:
+                        if not self.extension:
+                            self.resolution_tag = "—"
+                            self.duration_compact = ""
+                            self.duration_formatted = "—"
+                            self.is_valid = True
+                            return
                         self.error_message = "Cannot open image file"
                         return
                     self.height, self.width = img.shape[:2]
                 self.duration_seconds = 0.0; self.duration_compact = ""; self.duration_formatted = "—"
             else:
+                if not self.extension:
+                    self.resolution_tag = "—"
+                    self.duration_compact = ""
+                    self.duration_formatted = "—"
+                    self.is_valid = True
+                    return
                 self.is_valid = False
                 self.error_message = "Unsupported media format"
                 return
@@ -3039,7 +3122,7 @@ class ScannerThread(QThread):
 
                     if new_entries:
                         try:
-                            update_metadata_cache(new_entries, scan_started_time=scan_started)
+                            update_metadata_cache(new_entries, not_before_ts=scan_started)
                         except Exception as e:
                             logger.warning("update_metadata_cache failed: %s", e)
 
@@ -10903,8 +10986,9 @@ class MediaTab(QWidget):
         size_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
         self.table.setItem(row, self.COL_SIZE, size_item)
         
-        if info.is_valid:
-            res_text = f"{info.width}×{info.height}\n({info.resolution_tag})"
+        if info.is_valid and info.width > 0 and info.height > 0:
+            tag_suffix = f"\n({info.resolution_tag})" if info.resolution_tag else ""
+            res_text = f"{info.width}×{info.height}{tag_suffix}"
             res_key = min(info.width, info.height)
         else:
             res_text = "—"
@@ -12350,11 +12434,14 @@ class MediaTab(QWidget):
             # M4: Resolve media type from file extension rather than tab type,
             # so native player works on smart folder / 'all' tabs.
             ext = os.path.splitext(filepath)[1].lower()
-            if ext in VIDEO_EXTENSIONS:
+            mtype = None
+            if not ext:
+                mtype = sniff_media_type_from_file(filepath)
+            if ext in VIDEO_EXTENSIONS or mtype == 'video':
                 player_win = NativeVideoPlayerWindow(filepath, parent=main_win)
-            elif ext in IMAGE_EXTENSIONS:
+            elif ext in IMAGE_EXTENSIONS or mtype == 'image':
                 player_win = NativeImagePlayerWindow(filepath, parent=main_win)
-            elif ext in AUDIO_EXTENSIONS:
+            elif ext in AUDIO_EXTENSIONS or mtype == 'audio':
                 player_win = NativeAudioPlayerWindow(filepath, parent=main_win)
             else:
                 player_win = None
@@ -15369,7 +15456,15 @@ class MediaFlowWindow(QMainWindow):
                 all_names = os.listdir(d)
                 file_names = [n for n in all_names if os.path.isfile(os.path.join(d, n))][:300]
                 for name in file_names:
-                    exts.add(os.path.splitext(name)[1].lower())
+                    e = os.path.splitext(name)[1].lower()
+                    if e:
+                        exts.add(e)
+                    else:
+                        sniffed = sniff_media_type_from_file(os.path.join(d, name))
+                        if sniffed == 'image': exts.add('.png')
+                        elif sniffed == 'audio': exts.add('.mp3')
+                        elif sniffed == 'pdf': exts.add('.pdf')
+                        elif sniffed == 'video': exts.add('.mp4')
             except OSError:
                 continue
             if exts and (exts & IMAGE_EXTENSIONS) and not (exts & VIDEO_EXTENSIONS):
@@ -16970,7 +17065,15 @@ class MediaFlowWindow(QMainWindow):
                 all_names = os.listdir(d)
                 file_names = [n for n in all_names if os.path.isfile(os.path.join(d, n))][:300]
                 for name in file_names:
-                    exts.add(os.path.splitext(name)[1].lower())
+                    e = os.path.splitext(name)[1].lower()
+                    if e:
+                        exts.add(e)
+                    else:
+                        sniffed = sniff_media_type_from_file(os.path.join(d, name))
+                        if sniffed == 'image': exts.add('.png')
+                        elif sniffed == 'audio': exts.add('.mp3')
+                        elif sniffed == 'pdf': exts.add('.pdf')
+                        elif sniffed == 'video': exts.add('.mp4')
             except OSError:
                 continue
         if exts and (exts & IMAGE_EXTENSIONS) and not (exts & VIDEO_EXTENSIONS): return 1

@@ -89,6 +89,74 @@ pub fn detect_media_type(ext_clean: &str) -> Option<&'static str> {
     }
 }
 
+pub fn sniff_media_type(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = [0u8; 32];
+    let n = file.read(&mut buffer).ok()?;
+    if n < 4 {
+        return None;
+    }
+
+    // Check PNG: 89 50 4E 47
+    if buffer.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Some("image");
+    }
+    // Check JPEG: FF D8 FF
+    if buffer.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image");
+    }
+    // Check GIF: GIF87a or GIF89a
+    if buffer.starts_with(b"GIF8") {
+        return Some("image");
+    }
+    // Check BMP: BM
+    if buffer.starts_with(b"BM") {
+        return Some("image");
+    }
+    // Check PDF: %PDF
+    if buffer.starts_with(b"%PDF") {
+        return Some("pdf");
+    }
+    // Check WebP: RIFF....WEBP
+    if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..12] == b"WEBP" {
+        return Some("image");
+    }
+    // Check AVI: RIFF....AVI
+    if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..11] == b"AVI" {
+        return Some("video");
+    }
+    // Check WAV: RIFF....WAVE
+    if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..12] == b"WAVE" {
+        return Some("audio");
+    }
+    // Check MP4 / MOV / M4V / M4A: ftyp at offset 4
+    if n >= 8 && &buffer[4..8] == b"ftyp" {
+        if n >= 12 && (&buffer[8..12] == b"M4A " || &buffer[8..12] == b"m4a ") {
+            return Some("audio");
+        }
+        return Some("video");
+    }
+    // Check Matroska / WebM: 1A 45 DF A3
+    if buffer.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("video");
+    }
+    // Check FLAC: fLaC
+    if buffer.starts_with(b"fLaC") {
+        return Some("audio");
+    }
+    // Check OGG: OggS
+    if buffer.starts_with(b"OggS") {
+        return Some("audio");
+    }
+    // Check MP3: ID3 or sync bytes FF FB / FF F3 / FF F2
+    if buffer.starts_with(b"ID3") || (buffer[0] == 0xFF && (buffer[1] & 0xE0) == 0xE0) {
+        return Some("audio");
+    }
+
+    None
+}
+
 pub fn run_scan(
     directories: &[PathBuf],
     target_media_type: &str,
@@ -138,14 +206,50 @@ pub fn run_scan(
 
             let ext_clean = ext_with_dot.trim_start_matches('.');
 
-            let detected = detect_media_type(ext_clean);
+            let is_no_ext = ext_clean.is_empty();
+            let mut detected = detect_media_type(ext_clean);
+            if detected.is_none() && is_no_ext {
+                detected = sniff_media_type(path);
+            }
 
-            let accepted_type = match target_type.as_str() {
-                "video" => if detected == Some("video") { Some("video") } else { None },
-                "audio" => if detected == Some("audio") { Some("audio") } else { None },
-                "image" => if detected == Some("image") { Some("image") } else { None },
-                "pdf" => if detected == Some("pdf") { Some("pdf") } else { None },
-                _ => detected.or_else(|| if include_no_ext && ext_clean.is_empty() { Some("unknown") } else { None }),
+            let accepted_type: Option<&str> = match target_type.as_str() {
+                "video" => {
+                    if detected == Some("video") || (include_no_ext && is_no_ext) {
+                        Some(detected.unwrap_or("video"))
+                    } else {
+                        None
+                    }
+                }
+                "audio" => {
+                    if detected == Some("audio") || (include_no_ext && is_no_ext) {
+                        Some(detected.unwrap_or("audio"))
+                    } else {
+                        None
+                    }
+                }
+                "image" => {
+                    if detected == Some("image") || (include_no_ext && is_no_ext) {
+                        Some(detected.unwrap_or("image"))
+                    } else {
+                        None
+                    }
+                }
+                "pdf" => {
+                    if detected == Some("pdf") || (include_no_ext && is_no_ext) {
+                        Some(detected.unwrap_or("pdf"))
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    if let Some(d) = detected {
+                        Some(d)
+                    } else if include_no_ext && is_no_ext {
+                        Some("unknown")
+                    } else {
+                        None
+                    }
+                }
             };
 
             let media_type_str = match accepted_type {
