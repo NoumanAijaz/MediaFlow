@@ -146,7 +146,8 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (
     QFont, QColor, QIcon, QPalette, QPainter,
     QAction, QPixmap, QKeySequence, QImage, QBrush, QGuiApplication,
-    QPen, QPainterPath, QCursor, QImageReader, QPolygon, QLinearGradient
+    QPen, QPainterPath, QCursor, QImageReader, QPolygon, QLinearGradient,
+    QImageIOHandler, QTransform
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -830,6 +831,20 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
                         except Exception:
                             pass
         else:
+            try:
+                reader = QImageReader(filepath)
+                reader.setAutoTransform(True)
+                reader.setDecideFormatFromContent(True)
+                qimg_read = reader.read()
+                if not qimg_read.isNull():
+                    qimg_scaled = qimg_read.scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    canvas = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+                    canvas.fill(QColor("#1e1b4b"))
+                    with QPainter(canvas) as painter:
+                        painter.drawImage((width - qimg_scaled.width()) // 2, (height - qimg_scaled.height()) // 2, qimg_scaled)
+                    return canvas
+            except Exception:
+                pass
             with _CV_LOCK:
                 frame = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
             ret = frame is not None
@@ -2962,10 +2977,22 @@ class MediaInfo:
             elif self.media_type == 'image':
                 reader = QImageReader(self.filepath)
                 reader.setAutoTransform(True)
+                reader.setDecideFormatFromContent(True)
                 sz = reader.size() if reader.canRead() else None
                 if sz is not None and sz.isValid() and sz.width() > 0 and sz.height() > 0:
-                    self.width = sz.width()
-                    self.height = sz.height()
+                    t = reader.transformation()
+                    rot_trans = (
+                        QImageIOHandler.Transformation.TransformationRotate90,
+                        QImageIOHandler.Transformation.TransformationRotate270,
+                        QImageIOHandler.Transformation.TransformationFlipAndRotate90,
+                        QImageIOHandler.Transformation.TransformationMirrorAndRotate90,
+                    )
+                    if any(bool(t & flag) for flag in rot_trans):
+                        self.width = sz.height()
+                        self.height = sz.width()
+                    else:
+                        self.width = sz.width()
+                        self.height = sz.height()
                 else:
                     # OpenCV fallback for WebP/TIFF/unsupported Qt formats
                     with _CV_LOCK:
@@ -5281,57 +5308,265 @@ class DoubleClickVideoWidget(QVideoWidget):
         self.mouse_moved.emit()
 
 
+def load_image_pixmap(filepath: str) -> QPixmap:
+    """Load image into QPixmap respecting EXIF orientation tags and magic bytes."""
+    try:
+        reader = QImageReader(filepath)
+        reader.setAutoTransform(True)
+        reader.setDecideFormatFromContent(True)
+        qimg = reader.read()
+        if not qimg.isNull():
+            return QPixmap.fromImage(qimg)
+    except Exception as e:
+        logger.debug("QImageReader failed for %s: %s", filepath, e)
+
+    # Fallback to OpenCV if QImageReader fails (e.g., unusual formats or extensions)
+    try:
+        with _CV_LOCK:
+            img = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, ch = img.shape
+            qimg = QImage(img.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            return QPixmap.fromImage(qimg)
+    except Exception as e:
+        logger.debug("OpenCV image fallback failed for %s: %s", filepath, e)
+
+    return QPixmap()
+
+
+class ImageDisplayWidget(QWidget):
+    """Flicker-free, responsive image display widget with smooth scaling, zoom, pan, and rotation."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pixmap = QPixmap()
+        self._rotation_deg = 0
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0, 0)
+        self._drag_start = None
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(100, 100)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def setPixmap(self, pixmap: QPixmap):
+        self._pixmap = pixmap
+        self._rotation_deg = 0
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0, 0)
+        self.update()
+
+    def pixmap(self) -> QPixmap:
+        return self._pixmap
+
+    def rotate_clockwise(self):
+        self._rotation_deg = (self._rotation_deg + 90) % 360
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0, 0)
+        self.update()
+
+    def rotate_counter_clockwise(self):
+        self._rotation_deg = (self._rotation_deg - 90) % 360
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0, 0)
+        self.update()
+
+    def reset_zoom(self):
+        self._zoom_factor = 1.0
+        self._pan_offset = QPointF(0, 0)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def zoom_in(self):
+        new_zoom = min(20.0, self._zoom_factor * 1.25)
+        if new_zoom != self._zoom_factor:
+            self._zoom_factor = new_zoom
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom_factor > 1.05 else Qt.CursorShape.ArrowCursor)
+            self.update()
+
+    def zoom_out(self):
+        new_zoom = max(0.2, self._zoom_factor / 1.25)
+        if new_zoom != self._zoom_factor:
+            self._zoom_factor = new_zoom
+            if self._zoom_factor <= 1.05:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self._pan_offset = QPointF(0, 0)
+            self.update()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta != 0:
+            factor = 1.15 if delta > 0 else (1.0 / 1.15)
+            new_zoom = max(0.2, min(20.0, self._zoom_factor * factor))
+            if new_zoom != self._zoom_factor:
+                self._zoom_factor = new_zoom
+                if self._zoom_factor > 1.05:
+                    self.setCursor(Qt.CursorShape.OpenHandCursor)
+                else:
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self._pan_offset = QPointF(0, 0)
+                self.update()
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._zoom_factor > 1.05:
+            self._drag_start = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None:
+            delta = event.position() - self._drag_start
+            self._drag_start = event.position()
+            self._pan_offset += delta
+            self.update()
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            self._drag_start = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor if self._zoom_factor > 1.05 else Qt.CursorShape.ArrowCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.reset_zoom()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if self._pixmap.isNull():
+            painter.setPen(QColor("#9ca3af"))
+            painter.setFont(QFont(BASE_FONT_FAMILY, 12))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Failed to load image.")
+            return
+
+        src_pixmap = self._pixmap
+        if self._rotation_deg != 0:
+            transform = QTransform().rotate(self._rotation_deg)
+            src_pixmap = src_pixmap.transformed(transform, Qt.TransformationMode.SmoothTransformation)
+
+        widget_w = self.width()
+        widget_h = self.height()
+        pix_w = src_pixmap.width()
+        pix_h = src_pixmap.height()
+
+        if pix_w <= 0 or pix_h <= 0 or widget_w <= 0 or widget_h <= 0:
+            return
+
+        aspect = pix_w / pix_h
+        widget_aspect = widget_w / widget_h
+
+        if widget_aspect > aspect:
+            base_h = widget_h
+            base_w = max(1, int(widget_h * aspect))
+        else:
+            base_w = widget_w
+            base_h = max(1, int(widget_w / aspect))
+
+        draw_w = int(base_w * self._zoom_factor)
+        draw_h = int(base_h * self._zoom_factor)
+
+        draw_x = int((widget_w - draw_w) / 2 + self._pan_offset.x())
+        draw_y = int((widget_h - draw_h) / 2 + self._pan_offset.y())
+
+        painter.drawPixmap(draw_x, draw_y, draw_w, draw_h, src_pixmap)
+
+
 class NativeImagePlayerWindow(QMainWindow):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
         self.filepath = filepath
         self.setWindowTitle(f"MediaFlow Image Viewer — {os.path.basename(filepath)}")
-        self.resize(800, 600)
         self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        
+
         is_dark = getattr(parent, 'current_theme', 'dark') == 'dark' if parent else True
-        
-        self._orig_pixmap = QPixmap(filepath)
+
+        # Load image respecting EXIF orientation tags and magic bytes
+        self._orig_pixmap = load_image_pixmap(filepath)
+
+        # Smart initial window sizing matching image aspect ratio
+        init_w, init_h = 800, 600
+        if not self._orig_pixmap.isNull():
+            pw, ph = self._orig_pixmap.width(), self._orig_pixmap.height()
+            screen = QGuiApplication.primaryScreen()
+            if screen:
+                avail = screen.availableGeometry()
+                max_w = int(avail.width() * 0.85)
+                max_h = int(avail.height() * 0.85)
+                scaled = QSize(pw, ph).scaled(QSize(min(max_w, 1400), min(max_h, 900)), Qt.AspectRatioMode.KeepAspectRatio)
+                init_w = max(500, scaled.width())
+                init_h = max(400, scaled.height())
+        self.resize(init_w, init_h)
+
         central = QWidget(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.label = QLabel(central)
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.label, 1)
-        self._update_scaled_image()
-        
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.display = ImageDisplayWidget(central)
+        self.display.setPixmap(self._orig_pixmap)
+        layout.addWidget(self.display, 1)
+
         if is_dark:
-            self.setStyleSheet("QMainWindow { background-color: #0f0c29; } QLabel { color: #f3f4f6; }")
+            self.setStyleSheet("QMainWindow { background-color: #0b091a; }")
         else:
-            self.setStyleSheet("QMainWindow { background-color: #f1f5f9; } QLabel { color: #1e293b; }")
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._update_scaled_image()
-
-    def _update_scaled_image(self):
-        if hasattr(self, '_orig_pixmap') and not self._orig_pixmap.isNull():
-            target_size = self.label.size()
-            if target_size.width() > 10 and target_size.height() > 10:
-                self.label.setPixmap(self._orig_pixmap.scaled(
-                    target_size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        else:
-            self.label.setText("Failed to load image.")
+            self.setStyleSheet("QMainWindow { background-color: #f1f5f9; }")
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape:
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
             self.close()
+        elif key == Qt.Key.Key_R:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self.display.rotate_counter_clockwise()
+                else:
+                    self.display.rotate_clockwise()
+            else:
+                self.display.reset_zoom()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            self.display.zoom_in()
+        elif key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            self.display.zoom_out()
+        elif key == Qt.Key.Key_BracketRight:
+            self.display.rotate_clockwise()
+        elif key == Qt.Key.Key_BracketLeft:
+            self.display.rotate_counter_clockwise()
+        elif key == Qt.Key.Key_0 and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.display.reset_zoom()
         else:
             super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         is_dark = getattr(self.parent(), 'current_theme', 'dark') == 'dark' if self.parent() else True
+
+        act_reset = menu.addAction("Reset Zoom (Double-Click / R)")
+        act_reset.triggered.connect(self.display.reset_zoom)
+
+        act_rot_cw = menu.addAction("Rotate 90° Clockwise (])")
+        act_rot_cw.triggered.connect(self.display.rotate_clockwise)
+
+        act_rot_ccw = menu.addAction("Rotate 90° Counter-Clockwise ([)")
+        act_rot_ccw.triggered.connect(self.display.rotate_counter_clockwise)
+
+        menu.addSeparator()
         act_folder = menu.addAction(get_vector_icon('folder', is_dark), "Open Containing Folder")
         act_folder.triggered.connect(self._open_containing_folder)
+
         menu.exec(event.globalPos())
 
     def _open_containing_folder(self):
@@ -5361,8 +5596,8 @@ class NativeImagePlayerWindow(QMainWindow):
                     subprocess.Popen(["xdg-open", norm_folder])
 
     def closeEvent(self, event):
-        if hasattr(self, 'label') and self.label:
-            self.label.clear()
+        if hasattr(self, 'display') and self.display:
+            self.display.setPixmap(QPixmap())
         super().closeEvent(event)
 
 class NativeAudioPlayerWindow(QMainWindow):
