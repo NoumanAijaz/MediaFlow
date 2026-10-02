@@ -63,6 +63,16 @@
    python mediaflow.py
    ```
 
+### 🦀 Optional: High-Performance Rust Core Engine
+MediaFlow features an optional native Rust core engine (`mediaflow-core`) that accelerates directory scanning and duplicate detection by 10x–50x using multi-threading (Rayon, walkdir, BLAKE3). If the Rust binary is not built, MediaFlow automatically and seamlessly falls back to pure Python routines.
+
+To compile the optional Rust core:
+```bash
+cd mediaflow-core
+cargo build --release
+cp target/release/mediaflow-core.exe ../
+```
+
 ---
 
 ## 🛠️ Building Standalone Executable (.exe)

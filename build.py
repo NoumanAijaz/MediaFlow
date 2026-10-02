@@ -103,6 +103,17 @@ def main():
     # Fail fast if the previous exe is locked instead of failing at the end
     ensure_output_unlocked(script_dir)
 
+    rust_binary = None
+    rust_candidates = [
+        os.path.join(script_dir, "mediaflow-core.exe"),
+        os.path.join(script_dir, "mediaflow-core", "target", "release", "mediaflow-core.exe"),
+        os.path.join(script_dir, "mediaflow-core", "target", "debug", "mediaflow-core.exe"),
+    ]
+    for c in rust_candidates:
+        if os.path.isfile(c):
+            rust_binary = c
+            break
+
     cmd = cmd_prefix + [
         "-m", "PyInstaller",
         "--onefile",
@@ -114,8 +125,14 @@ def main():
         "--exclude-module", "PyQt6.QtWebEngineWidgets",
         "--exclude-module", "PyQt6.QtWebEngineCore",
         "--exclude-module", "PyQt6.QtWebEngine",
-        os.path.join(script_dir, "mediaflow.py"),
     ]
+    if rust_binary:
+        print(f"[INFO] Bundling Rust core engine: {rust_binary}")
+        cmd.extend(["--add-binary", f"{rust_binary}{os.pathsep}."])
+    else:
+        print("[INFO] No compiled mediaflow-core.exe found; building with native Python fallback only.")
+
+    cmd.append(os.path.join(script_dir, "mediaflow.py"))
 
     print("=" * 50)
     print("  MediaFlow — Building .exe")

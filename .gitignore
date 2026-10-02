@@ -25,3 +25,7 @@ scan_cache.json
 rename_audit.csv
 *.log
 *.tmp
+
+# Rust
+mediaflow-core/target/
+mediaflow-core.exe
