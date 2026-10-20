@@ -165,17 +165,17 @@ class NamingTemplateListWidget(QListWidget):
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
 IMAGE_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tiff', '.tif', '.jfif'
+    '.jpg', '.jpeg', '.png', '.bmp', '.webp', '.gif', '.tiff', '.tif', '.jfif',
+    '.ico', '.svg', '.heic', '.heif', '.avif', '.raw', '.cr2', '.nef', '.arw',
 }
 VIDEO_EXTENSIONS = {
-    '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm',
-    '.m4v', '.mpg', '.mpeg', '.3gp', '.3g2', '.ts', '.mts',
-    '.m2ts', '.vob', '.ogv', '.divx', '.f4v', '.rm', '.rmvb',
-    '.asf', '.amv', '.svi'
+    '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg',
+    '.mpeg', '.m2v', '.ts', '.mts', '.m2ts', '.vob', '.3gp', '.3g2', '.ogv',
+    '.f4v', '.f4p', '.divx', '.rm', '.rmvb', '.asf', '.amv', '.svi',
 }
 AUDIO_EXTENSIONS = {
-    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma',
-    '.ape', '.alac', '.opus', '.amr', '.m4b'
+    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.ape', '.alac',
+    '.opus', '.amr', '.m4b', '.aiff', '.aif', '.mid', '.midi', '.mka',
 }
 PDF_EXTENSIONS = {
     '.pdf'
@@ -377,21 +377,22 @@ def parse_naming_format(filename: str, media_type: str = None) -> tuple[str | No
     filename = filename.strip()
     if not filename:
         return None, None
+
     # Match video: Artist Duration Resolution [Rating] [optional trailing tags] (including 'K' for sub-1080p)
-    match = re.match(r"^(.+?)[\s\-_]+(\d+)[\s\-_]+([1-8]K|4K|2K|1K|UHD|HD|SD|K)(?:[\s\-_]+(\d+|—))?(?:[\s\-_]+[^.\n]+)?(?:\..+)?$", filename, re.IGNORECASE)
-    if match:
-        artist = match.group(1).strip()
-        rating = match.group(4)
-        return artist, (None if rating == "—" else rating)
+    if media_type is None or media_type == 'video':
+        match = re.match(r"^(.+?)[\s\-_]+(\d+)[\s\-_]+([1-8]K|4K|2K|1K|UHD|HD|SD|K)(?:[\s\-_]+(\d+|—))?(?:[\s\-_]+[^.\n]+)?(?:\..+)?$", filename, re.IGNORECASE)
+        if match:
+            artist = match.group(1).strip()
+            rating = match.group(4)
+            return artist, (None if rating == "—" else rating)
     
     # Match image: Artist Resolution [Rating] [optional trailing tags]
-    match_img = re.match(r"^(.+?)[\s\-_]+([1-8]K|4K|2K|1K|UHD|HD|SD|K)(?:[\s\-_]+(\d+|—))?(?:[\s\-_]+[^.\n]+)?(?:\..+)?$", filename)
-    if not match_img:
-        match_img = re.match(r"^(.+?)[\s\-_]+([1-8]K|4K|2K|1K|UHD|HD|SD)(?:[\s\-_]+(\d+|—))?(?:[\s\-_]+[^.\n]+)?(?:\..+)?$", filename, re.IGNORECASE)
-    if match_img:
-        artist = match_img.group(1).strip()
-        rating = match_img.group(3)
-        return artist, (None if rating == "—" else rating)
+    if media_type is None or media_type == 'image':
+        match_img = re.match(r"^(.+?)[\s\-_]+([1-8]K|4K|2K|1K|UHD|HD|SD|K)(?:[\s\-_]+(\d+|—))?(?:[\s\-_]+[^.\n]+)?(?:\..+)?$", filename, re.IGNORECASE)
+        if match_img:
+            artist = match_img.group(1).strip()
+            rating = match_img.group(3)
+            return artist, (None if rating == "—" else rating)
         
     # Match audio: Artist Duration [Rating] [optional trailing tags]
     if media_type is None or media_type == 'audio':
@@ -402,6 +403,57 @@ def parse_naming_format(filename: str, media_type: str = None) -> tuple[str | No
             return artist, (None if rating == "—" else rating)
         
     return None, None
+
+
+def _abs_path_key(path: str) -> str:
+    """Absolute, case-insensitive-on-Windows key for path comparisons."""
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _same_file_path(path_a: str, path_b: str) -> bool:
+    """True when both paths refer to the same file.
+
+    os.path.samefile() compares real file identity, so a case-only rename
+    ("Clip.MP4" -> "clip.mp4") is recognised on every platform. os.path.normcase()
+    is a no-op on POSIX, so on macOS (case-insensitive by default) the old
+    comparison treated the two names as different files and the rename was
+    rewritten to "clip_1.mp4" instead of "clip.mp4".
+    """
+    if not path_a or not path_b:
+        return False
+    try:
+        return os.path.samefile(path_a, path_b)
+    except (OSError, ValueError):
+        return _abs_path_key(path_a) == _abs_path_key(path_b)
+
+
+def _renamed_extension(dst: str, current_ext: str) -> str:
+    """Extension to keep on the model after renaming a file to `dst`.
+
+    Renaming never changes the file type, so the known extension wins. A target
+    whose only "extension" comes from an inner dot ("Vol. 2" -> ". 2") must not
+    replace the real extension (".mp4"), otherwise the next rename builds
+    garbage names like "Vol. 2. 2".
+    """
+    current_ext = current_ext or ""
+    dst_ext = os.path.splitext(dst)[1]
+    if dst_ext and dst_ext.lower() == current_ext.lower():
+        return dst_ext
+    return current_ext
+
+
+def _split_target_for_suffix(target_display: str, ext: str) -> tuple[str, str]:
+    """Split a target file name into (stem, extension) for _N collision suffixes.
+
+    The file's known extension is used instead of os.path.splitext() so a name
+    with an inner dot and no extension ("Vol. 2") keeps the suffix at the end
+    ("Vol. 2_1") instead of producing "Vol_1. 2".
+    """
+    ext = ext or ""
+    if ext and target_display.lower().endswith(ext.lower()):
+        return target_display[:-len(ext)], ext
+    return target_display, ""
+
 
 def calculate_file_hash(filepath: str, head_only: bool = False) -> str | None:
     """Compute MD5. If head_only, fingerprint using size + first/last 1MB (fast for large media)."""
@@ -488,22 +540,36 @@ def is_valid_phash(h: str) -> bool:
 
 def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> bool:
     if not query_str: return True
-    # posix=False on Windows so backslashes in paths (name:C:\foo) survive splitting
-    try: terms = shlex.split(query_str.strip(), posix=(os.name != 'nt'))
+    # Split into terms, honouring quoted values ('tag:"big cat"') on every
+    # platform. shlex(posix=False) — used on Windows so backslashes in paths
+    # survive — cannot group quoted values, so the query was split into
+    # 'tag:"big' + 'cat"' and never matched. Backslashes are escaped instead
+    # of relying on POSIX-style escape handling.
+    try:
+        raw = query_str.strip()
+        if os.name == 'nt':
+            raw = raw.replace('\\', '\\\\')
+        terms = shlex.split(raw, posix=True)
     except Exception: terms = query_str.strip().split()
     
     # Prefer user-edited values stored on the info object; fall back to parsing
     # the raw filename only when no edited/parsed values exist yet.
     parsed_artist = getattr(info, 'parsed_artist', None) or ""
     parsed_rating = getattr(info, 'parsed_rating', None) or ""
-    if not parsed_artist and not parsed_rating:
-        parsed_artist, parsed_rating = parse_naming_format(getattr(info, 'filename', '') or "", getattr(info, 'media_type', None))
+    if not parsed_artist or not parsed_rating:
+        fallback_artist, fallback_rating = parse_naming_format(getattr(info, 'filename', '') or "", getattr(info, 'media_type', None))
+        if not parsed_artist and fallback_artist:
+            parsed_artist = fallback_artist
+        if not parsed_rating and fallback_rating:
+            parsed_rating = fallback_rating
     artist = (parsed_artist or "").lower().strip()
     rating = (parsed_rating or "").lower().strip()
     filename = (getattr(info, 'filename', '') or "").lower()
     
     for term in terms:
         term_clean = term.strip('"\'')
+        if not term_clean or term_clean.lower() == 'and':
+            continue
         if ':' in term_clean:
             try: key, val = term_clean.split(':', 1)
             except ValueError: continue
@@ -511,7 +577,9 @@ def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> 
             val = val.lower().strip().strip('"\'')
             
             if key == 'rating':
-                if ',' in val:
+                if val in ('unrated', 'none', '-', '—'):
+                    if rating not in ('', '-', '—'): return False
+                elif ',' in val:
                     if rating not in [x.strip() for x in val.split(',')]: return False
                 elif val.startswith('>=') and val[2:].isdigit():
                     if not rating.isdigit() or int(rating) < int(val[2:]): return False
@@ -523,21 +591,38 @@ def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> 
                     if not rating.isdigit() or int(rating) >= int(val[1:]): return False
                 else:
                     if rating != val: return False
-            elif key in ['tag', 'tags']:
+            elif key in ['tag', 'tags', '-tag', '-tags']:
                 tags = [t.lower().strip() for t in (getattr(info, 'tags', []) or [])]
-                if ',' in val:
-                    query_tags = [x.strip() for x in val.split(',')]
-                    if not any(qt in tags for qt in query_tags): return False
+                is_exclusion = key.startswith('-')
+                val_target = val
+                if not is_exclusion and (val_target.startswith('-') or val_target.startswith('!')):
+                    is_exclusion = True
+                    val_target = val_target[1:].strip()
+
+                if ',' in val_target:
+                    query_tags = [x.strip() for x in val_target.split(',') if x.strip()]
+                    if is_exclusion:
+                        if any(qt in tags for qt in query_tags):
+                            return False
+                    else:
+                        if not any(qt in tags for qt in query_tags):
+                            return False
                 else:
-                    if val not in tags: return False
+                    if is_exclusion:
+                        if val_target in tags:
+                            return False
+                    else:
+                        if val_target not in tags:
+                            return False
             elif key in ['name', 'artist']:
                 # Check both parsed artist name and raw filename
                 if not val or (val not in artist and val not in filename): return False
             elif key in ['res', 'resolution']:
                 res_tag = (getattr(info, 'resolution_tag', '') or '').lower()
                 res_dims = f"{getattr(info, 'width', 0)}x{getattr(info, 'height', 0)}".lower()
-                res_dims_alt = f"{getattr(info, 'width', 0)}×{getattr(info, 'height', 0)}".lower()
-                if val not in res_tag and val not in res_dims and val not in res_dims_alt: return False
+                res_dims_alt = f"{getattr(info, 'height', 0)}x{getattr(info, 'width', 0)}".lower()
+                val_clean = val.rstrip('p') if val.endswith('p') and val[:-1].isdigit() else val
+                if val not in res_tag and val not in res_dims and val not in res_dims_alt and val_clean not in res_tag and val_clean not in res_dims and val_clean not in res_dims_alt: return False
             elif key == 'type':
                 norm_val = {'videos': 'video', 'images': 'image', 'pdfs': 'pdf', 'audios': 'audio'}.get(val, val)
                 if norm_val != (getattr(info, 'media_type', '') or '').lower(): return False
@@ -602,9 +687,9 @@ def parse_destination_template(template: str, info: 'MediaInfo', tags: list[str]
     parsed_artist, parsed_rating = parse_naming_format(getattr(info, 'filename', '') or "", getattr(info, 'media_type', None))
     user_artist = getattr(info, 'parsed_artist', None)
     user_rating = getattr(info, 'parsed_rating', None)
-    if user_rating in (None, "", "—"):
+    if user_rating in (None, "", "—", "-"):
         user_rating = None
-    if parsed_rating in (None, "", "—"):
+    if parsed_rating in (None, "", "—", "-"):
         parsed_rating = None
 
     # Fallback: user edit -> parsed filename -> tags -> default
@@ -623,6 +708,7 @@ def parse_destination_template(template: str, info: 'MediaInfo', tags: list[str]
         'type': _strip_path_traversal(getattr(info, 'media_type', '') or 'unknown'),
         'ext': _strip_path_traversal(ext),
         'name': _strip_path_traversal(sanitize_folder_name(artist)),
+        'artist': _strip_path_traversal(sanitize_folder_name(artist)),
         'filename': _strip_path_traversal(sanitize_folder_name(stem or "Unknown")),
         'rating': _strip_path_traversal(sanitize_folder_name(rating)),
         'resolution': _strip_path_traversal(getattr(info, 'resolution_tag', '') or "Unknown"),
@@ -633,12 +719,11 @@ def parse_destination_template(template: str, info: 'MediaInfo', tags: list[str]
         'ym': _strip_path_traversal(ym_str)
     }
 
-    result = template
-    for key, val in replacements.items():
-        pattern = re.compile(re.escape('{' + key + '}'), re.IGNORECASE)
-        result = pattern.sub(val, result)
+    def _replace_var(match):
+        var_name = match.group(1).lower()
+        return replacements.get(var_name, match.group(0))
 
-    return result
+    return re.sub(r'\{([A-Za-z0-9_]+)\}', _replace_var, template)
 
 _GLOBAL_FFPROBE_PATH = ""
 
@@ -723,19 +808,23 @@ def parse_ffprobe_json(data: dict) -> dict:
         codec_type = stream.get('codec_type')
         if codec_type == 'video' and not parsed['video']:
             v_info = {'codec': (stream.get('codec_name') or '').upper(), 'profile': stream.get('profile') or '', 'width': _safe_int(stream.get('width', 0)), 'height': _safe_int(stream.get('height', 0)), 'fps': 0.0, 'bitrate_kbps': 0, 'pix_fmt': stream.get('pix_fmt') or ''}
-            fps_str = str(stream.get('r_frame_rate') or stream.get('avg_frame_rate') or '')
-            if '/' in fps_str:
+            # r_frame_rate is often "0/0" (unknown, e.g. VFR captures) — it must
+            # not shadow a usable avg_frame_rate. Try each key until one parses
+            # to a positive value.
+            for fps_key in ('r_frame_rate', 'avg_frame_rate'):
+                fps_str = str(stream.get(fps_key) or '')
+                if not fps_str:
+                    continue
                 try:
-                    parts = fps_str.split('/')
-                    if len(parts) == 2:
-                        num, den = float(parts[0]), float(parts[1])
-                        if den > 0: v_info['fps'] = round(num / den, 2)
+                    if '/' in fps_str:
+                        num, den = (float(x) for x in fps_str.split('/', 1))
+                        if den > 0 and num > 0: v_info['fps'] = round(num / den, 2)
+                    else:
+                        val = float(fps_str)
+                        if val > 0: v_info['fps'] = round(val, 2)
                 except (ValueError, ZeroDivisionError): pass
-            elif fps_str:
-                try:
-                    val = float(fps_str)
-                    if val > 0: v_info['fps'] = round(val, 2)
-                except ValueError: pass
+                if v_info['fps'] > 0:
+                    break
             v_info['bitrate_kbps'] = _safe_int(stream.get('bit_rate', 0)) // 1000
             parsed['video'] = v_info
             for sd in (stream.get('side_data_list') or []):
@@ -794,42 +883,54 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
                 painter.drawText(QRect(0, 0, width, height), Qt.AlignmentFlag.AlignCenter, "PDF")
             return img
         if media_type == 'video':
-            cap = None
-            try:
-                # Lock granularity: hold _CV_LOCK around each individual cv2 C++
-                # call (as calculate_perceptual_hash does) instead of across the
-                # whole open+seek+decode sequence. Holding it across decode
-                # serialized all scan workers behind one file and stalled any
-                # GUI-thread cv2 calls for seconds at a time.
-                with _CV_LOCK:
-                    cap = cv2.VideoCapture(filepath)
-                if not cap.isOpened(): return None
-                with _CV_LOCK:
-                    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                # Some playable files (bad index, .ts captures) report
-                # FRAME_COUNT <= 0 or NaN — fall through to frame 0 instead
-                # of giving up on the thumbnail.
-                if math.isfinite(total_frames) and total_frames > 0:
-                    target_frame = int(total_frames * 0.1)
-                else:
-                    target_frame = 0
-                with _CV_LOCK:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                    ret, frame = cap.read()
-                if not ret or frame is None:
+            frame = None
+            def _extract_video_frame():
+                cap = None
+                try:
                     with _CV_LOCK:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
-            finally:
-                if cap is not None:
-                    try:
+                        cap = cv2.VideoCapture(filepath)
+                    if not cap.isOpened():
+                        return None
+                    with _CV_LOCK:
+                        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                    if math.isfinite(total_frames) and total_frames > 0:
+                        target_frame = int(total_frames * 0.1)
+                    else:
+                        target_frame = 0
+                    with _CV_LOCK:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                        ret, f = cap.read()
+                    if not ret or f is None:
                         with _CV_LOCK:
-                            cap.release()
-                    except Exception:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ret, f = cap.read()
+                    return f if ret else None
+                finally:
+                    if cap is not None:
                         try:
-                            cap.release()
+                            with _CV_LOCK:
+                                cap.release()
                         except Exception:
-                            pass
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+
+            # Run with 4.0s timeout to guard against hung/corrupted video containers.
+            # The executor must NOT be used as a context manager: __exit__ calls
+            # shutdown(wait=True), which blocks until the (hung) extraction thread
+            # finishes and defeats the timeout entirely.
+            import concurrent.futures
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            try:
+                fut = executor.submit(_extract_video_frame)
+                frame = fut.result(timeout=4.0)
+            except (concurrent.futures.TimeoutError, Exception) as e:
+                logger.warning("Video frame extraction timed out or failed for %s: %s", filepath, e)
+                frame = None
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            ret = frame is not None
         else:
             try:
                 reader = QImageReader(filepath)
@@ -1046,7 +1147,8 @@ def send_to_recycle_bin(path: str) -> bool:
                     _send2trash(path)
                     return not os.path.exists(path)
                 except ImportError:
-                    logger.warning("Path longer than 240 chars and send2trash not installed; recycling may fail: %s", path)
+                    logger.warning("Path longer than 240 chars and send2trash not installed; refusing to shell-delete: %s", path)
+                    return False
                 except Exception as e:
                     logger.warning("send2trash failed for %s: %s", path, e)
                     return False
@@ -1611,6 +1713,7 @@ class EditableCellLineEdit(QLineEdit):
 
     def _start_editing(self):
         self._editing_active = True
+        self._text_before_edit = self.text()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setReadOnly(False)
         self.setCursor(Qt.CursorShape.IBeamCursor)
@@ -1715,6 +1818,14 @@ class EditableCellLineEdit(QLineEdit):
             event.accept()
             return
         elif event.key() == Qt.Key.Key_Escape:
+            if self._editing_active:
+                original = getattr(self, '_text_before_edit', self.text())
+                changed = self.text() != original
+                self.setText(original)
+                if changed:
+                    # Refresh derived cells (preview/filter) with the reverted
+                    # value; editable-cell handlers resolve by widget identity.
+                    self.editingFinished.emit()
             self._editing_active = False
             self.setReadOnly(True)
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -2726,7 +2837,7 @@ class ThemeManager:
         for nav_item in getattr(window, 'smart_folder_nav_items', {}).values():
             nav_item.update_theme(is_dark)
 
-def sniff_media_type_from_file(filepath: str) -> Optional[str]:
+def sniff_media_type_from_file(filepath: str) -> str | None:
     """Inspect magic bytes to determine media type for extensionless files."""
     try:
         with open(filepath, 'rb') as f:
@@ -2757,8 +2868,13 @@ def sniff_media_type_from_file(filepath: str) -> Optional[str]:
                 return 'video'
             elif tag == b'WAVE':
                 return 'audio'
-        # MP4 / MOV (offset 4 'ftyp')
+        # MP4 / MOV / M4A / M4B / HEIC / AVIF (offset 4 'ftyp')
         if len(header) >= 8 and header[4:8] == b'ftyp':
+            brand = header[8:12] if len(header) >= 12 else b''
+            if brand in (b'M4A ', b'm4a ', b'M4B ', b'm4b '):
+                return 'audio'
+            if brand in (b'heic', b'heix', b'heim', b'heis', b'hevc', b'hevx', b'avif', b'avis'):
+                return 'image'
             return 'video'
         # Matroska / WebM
         if header.startswith(b'\x1a\x45\xdf\xa3'):
@@ -2981,13 +3097,11 @@ class MediaInfo:
                 sz = reader.size() if reader.canRead() else None
                 if sz is not None and sz.isValid() and sz.width() > 0 and sz.height() > 0:
                     t = reader.transformation()
-                    rot_trans = (
-                        QImageIOHandler.Transformation.TransformationRotate90,
-                        QImageIOHandler.Transformation.TransformationRotate270,
-                        QImageIOHandler.Transformation.TransformationFlipAndRotate90,
-                        QImageIOHandler.Transformation.TransformationMirrorAndRotate90,
-                    )
-                    if any(bool(t & flag) for flag in rot_trans):
+                    # Only transformations in the Rotate90 family swap dimensions.
+                    # Transformation values are bit flags (Mirror=1, Flip=2,
+                    # Rotate90=4); Rotate270/MirrorAndRotate90/FlipAndRotate90 all
+                    # contain the Rotate90 bit, while Mirror/Flip/Rotate180 do not.
+                    if bool(t & QImageIOHandler.Transformation.TransformationRotate90):
                         self.width = sz.height()
                         self.height = sz.width()
                     else:
@@ -3100,6 +3214,8 @@ class ScannerThread(QThread):
             except Exception:
                 rust_avail = False
 
+            seen_norm_paths = set()
+
             if rust_avail:
                 try:
                     self.status_update.emit("Scanning directories (Rust Engine)…")
@@ -3123,6 +3239,8 @@ class ScannerThread(QThread):
                         if self.isInterruptionRequested():
                             return
                         fpath = event.get('path')
+                        if fpath:
+                            seen_norm_paths.add(os.path.normcase(os.path.normpath(fpath)))
                         size = event.get('size', 0)
                         mtime = event.get('mtime', 0.0)
                         mtype = event.get('media_type', self.media_type)
@@ -3132,8 +3250,8 @@ class ScannerThread(QThread):
                             new_entries[info.filepath] = entry_data
                         total_emitted += 1
                         self.file_found.emit(info)
-                        if total_emitted % 50 == 0:
-                            self.progress.emit(total_emitted, max(total_emitted, 100))
+                        if total_emitted % 25 == 0:
+                            self.progress.emit(total_emitted, 0)
 
                     def on_progress(count):
                         self.status_update.emit(f"Scanned {count} files (Rust Engine)…")
@@ -3146,6 +3264,10 @@ class ScannerThread(QThread):
                         on_progress=on_progress,
                         is_interrupted=lambda: self.isInterruptionRequested(),
                     )
+
+                    if self.isInterruptionRequested():
+                        self.scan_complete.emit(0)
+                        return
 
                     if new_entries:
                         try:
@@ -3166,7 +3288,6 @@ class ScannerThread(QThread):
             elif self.media_type == 'pdf': valid_exts = PDF_EXTENSIONS
             else: valid_exts = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
             
-            seen_norm_paths = set()
             for directory in self.directories:
                 if not os.path.isdir(directory): continue
                 stack = [directory]
@@ -4436,7 +4557,10 @@ class QuickTrimDialog(QDialog):
                     if is_inside:
                         new_info = MediaInfo(output_path, 'video')
                         if new_info.is_valid:
-                            self.parent_tab._on_file_found(new_info)
+                            new_key = os.path.normcase(os.path.normpath(new_info.filepath))
+                            known = {os.path.normcase(os.path.normpath(v.filepath)) for v in self.parent_tab.media_infos}
+                            if new_key not in known:
+                                self.parent_tab._on_file_found(new_info)
                         break
 
             self._release_player()
@@ -4652,7 +4776,15 @@ class DeepMetadataWorker(QThread):
             creationflags = subprocess.CREATE_NO_WINDOW
         try:
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo, creationflags=creationflags)
-            stdout, stderr = self._proc.communicate(timeout=10)
+            try:
+                stdout, stderr = self._proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._proc.kill()
+                    self._proc.communicate()
+                except Exception:
+                    pass
+                raise
             if not self._cancelled and self._proc.returncode == 0 and stdout:
                 meta = parse_ffprobe_json(json.loads(stdout))
                 self.metadata_ready.emit(meta)
@@ -4706,6 +4838,7 @@ class AudioTagEditorDialog(QDialog):
         self._load_tags()
 
     def _load_tags(self):
+        self._read_error = ""
         try:
             from mutagen import File as MutagenFile
             mfile = MutagenFile(self.filepath, easy=True)
@@ -4717,11 +4850,15 @@ class AudioTagEditorDialog(QDialog):
             self.status_lbl.setText(os.path.basename(self.filepath))
         except ImportError:
             self._mutagen_ok = False
-            self.status_lbl.setText("mutagen is not installed \u2014 run: pip install mutagen")
+            self._read_error = "mutagen is not installed — run: pip install mutagen"
+            self.status_lbl.setText(self._read_error)
             self.status_lbl.setStyleSheet("color: #f87171; font-size: 11px;")
         except Exception as e:
             self._mutagen_ok = False
-            self.status_lbl.setText(f"Could not read tags: {e}")
+            # Keep the real reason: reporting "mutagen is not installed" for a
+            # read failure sent the user off to reinstall a working library.
+            self._read_error = f"Could not read tags: {e}"
+            self.status_lbl.setText(self._read_error)
             self.status_lbl.setStyleSheet("color: #f87171; font-size: 11px;")
 
     def get_values(self) -> dict:
@@ -4729,7 +4866,7 @@ class AudioTagEditorDialog(QDialog):
 
     def save(self):
         if not self._mutagen_ok:
-            raise RuntimeError("mutagen is not installed")
+            raise RuntimeError(getattr(self, '_read_error', '') or "mutagen is not installed")
         from mutagen import File as MutagenFile
         mfile = MutagenFile(self.filepath, easy=True)
         if mfile is None:
@@ -6667,8 +6804,9 @@ class RandomShufflePlayerWindow(QMainWindow):
             self.show_controls_temporarily()
         elif key in (Qt.Key.Key_N, Qt.Key.Key_Right):
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                new_pos = min(self.player.duration(), self.player.position() + 10000)
-                self.player.setPosition(new_pos)
+                dur = self.player.duration()
+                target = self.player.position() + 10000
+                self.player.setPosition(min(dur, target) if dur > 0 else target)
             else:
                 self.play_random_next(force_new=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
             self.show_controls_temporarily()
@@ -6701,8 +6839,9 @@ class RandomShufflePlayerWindow(QMainWindow):
             self.player.setPosition(new_pos)
             self.show_controls_temporarily()
         elif key == Qt.Key.Key_BracketRight:
-            new_pos = min(self.player.duration(), self.player.position() + 5000)
-            self.player.setPosition(new_pos)
+            dur = self.player.duration()
+            target = self.player.position() + 5000
+            self.player.setPosition(min(dur, target) if dur > 0 else target)
             self.show_controls_temporarily()
         else:
             super().keyPressEvent(event)
@@ -7582,17 +7721,16 @@ class ComparisonViewWindow(QMainWindow):
         self.pane_left.cleanup()
         self.pane_right.cleanup()
 
-        # Delete sidecars as well if any
-        sidecars = find_sidecars(info.filepath)
-        trashed = []
-        for sc in sidecars:
-            if send_to_recycle_bin(sc):
-                trashed.append(sc)
-
+        # Delete the main file first: if it fails (locked/denied), no sidecars
+        # have been touched yet. Sidecars are only removed after it succeeds.
         success = send_to_recycle_bin(info.filepath)
+        trashed = []
         if success:
-            trashed.append(info.filepath)
-            append_rename_audit([(p, "(recycle bin)") for p in trashed], op="delete")
+            for sc in find_sidecars(info.filepath):
+                if send_to_recycle_bin(sc):
+                    trashed.append(sc)
+        if success:
+            append_rename_audit([(info.filepath, "(recycle bin)")] + [(p, "(recycle bin)") for p in trashed], op="delete")
             if self.parent_tab:
                 # Find row in table and remove
                 for row in range(self.parent_tab.table.rowCount()):
@@ -8553,7 +8691,7 @@ class DuplicateScanWorker(QThread):
 
                 if rust_avail:
                     try:
-                        self.progress.emit(0, max(1, n), "Analyzing duplicates (Rust Multi-Threaded Core)…")
+                        self.progress.emit(0, 0, "Analyzing duplicates (Rust Multi-Threaded Core)…")
                         raw_groups, skipped = find_duplicates_rust(
                             entries,
                             on_progress=lambda d, t, p: self.progress.emit(d, t, p),
@@ -8562,7 +8700,7 @@ class DuplicateScanWorker(QThread):
                         path_to_idx = {os.path.normcase(os.path.normpath(e['path'])): i for i, e in enumerate(entries)}
                         resolved_groups = []
                         for g in raw_groups:
-                            idxs = [path_to_idx[os.path.normcase(os.path.normpath(p))] for p in g if os.path.normcase(os.path.normpath(p)) in path_to_idx]
+                            idxs = list(dict.fromkeys(path_to_idx[os.path.normcase(os.path.normpath(p))] for p in g if os.path.normcase(os.path.normpath(p)) in path_to_idx))
                             if len(idxs) > 1:
                                 resolved_groups.append(idxs)
                         return self._emit(resolved_groups, skipped)
@@ -8574,7 +8712,7 @@ class DuplicateScanWorker(QThread):
                 for i, e in enumerate(entries):
                     if self._cancelled:
                         return self._emit(groups, skipped)
-                    size_groups.setdefault(int(e.get('size', 0)), []).append(i)
+                    size_groups.setdefault(int(e.get('size', 0) or 0), []).append(i)
                 candidates = [g for g in size_groups.values() if len(g) > 1]
                 head_map = {}
                 done = 0
@@ -8583,6 +8721,8 @@ class DuplicateScanWorker(QThread):
                     if self._cancelled:
                         return self._emit(groups, skipped)
                     for i in g:
+                        if self._cancelled:
+                            return self._emit(groups, skipped)
                         h = calculate_file_hash(entries[i]['path'], head_only=True)
                         if h:
                             head_map.setdefault(h, []).append(i)
@@ -8598,6 +8738,8 @@ class DuplicateScanWorker(QThread):
                         break
                     full_map = {}
                     for i in g:
+                        if self._cancelled:
+                            break
                         fh = calculate_file_hash(entries[i]['path'], head_only=False)
                         if fh:
                             full_map.setdefault(fh, []).append(i)
@@ -8732,10 +8874,15 @@ class DuplicateResolverDialog(QDialog):
         btn_row.addWidget(close_btn)
         lay.addLayout(btn_row)
 
+        seen_entry_paths = set()
         for info in list(getattr(tab, 'media_infos', []) or []):
             if not getattr(info, 'is_valid', False):
                 continue
             path = info.filepath
+            norm_key = os.path.normcase(os.path.abspath(path))
+            if norm_key in seen_entry_paths:
+                continue
+            seen_entry_paths.add(norm_key)
             try:
                 size = int(getattr(info, 'size_bytes', 0) or 0)
                 mtime = os.path.getmtime(path)
@@ -8753,13 +8900,11 @@ class DuplicateResolverDialog(QDialog):
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(1000)
         super().closeEvent(event)
 
     def reject(self):
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(1000)
         super().reject()
 
     def _start_scan(self):
@@ -8783,8 +8928,11 @@ class DuplicateResolverDialog(QDialog):
         self.worker.start()
 
     def _on_progress(self, done, total, phase):
-        self.progress.setMaximum(max(1, int(total)))
-        self.progress.setValue(int(done))
+        if total <= 0:
+            self.progress.setRange(0, 0)
+        else:
+            self.progress.setRange(0, int(total))
+            self.progress.setValue(int(done))
         self.phase_label.setText(phase)
 
     def _on_worker_finished(self):
@@ -9109,7 +9257,12 @@ class MediaTagEditorDialog(QDialog):
                 raw = dto.decode('utf-8', 'replace').strip()
                 dt = self._parse_date_input(raw)
                 if dt is not None:
-                    self._edits['date'].setText(dt.strftime("%Y-%m-%d"))
+                    # Keep the time of day: the field is written back on save
+                    # and truncating it to the date destroyed the capture time.
+                    if (dt.hour, dt.minute, dt.second) != (0, 0, 0):
+                        self._edits['date'].setText(dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    else:
+                        self._edits['date'].setText(dt.strftime("%Y-%m-%d"))
         except Exception as ex:
             logger.warning("EXIF read failed for %s: %s", path, ex)
 
@@ -9146,7 +9299,19 @@ class MediaTagEditorDialog(QDialog):
             else:
                 exif['0th'].pop(piexif.ImageIFD.Artist, None)
         if 'date' in values and dt is not None:
-            exif['Exif'][piexif.ExifIFD.DateTimeOriginal] = dt.strftime("%Y:%m:%d %H:%M:%S").encode('ascii')
+            stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+            # A value without a time must not wipe the captured time of day:
+            # keep the original time when only the date part was changed.
+            if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+                original = exif.get('Exif', {}).get(piexif.ExifIFD.DateTimeOriginal)
+                if original:
+                    try:
+                        orig_text = original.decode('ascii', 'replace').strip()
+                    except Exception:
+                        orig_text = ''
+                    if len(orig_text) >= 19 and orig_text[10] in ' T':
+                        stamp = f"{dt.strftime('%Y:%m:%d')} {orig_text[11:19]}"
+            exif['Exif'][piexif.ExifIFD.DateTimeOriginal] = stamp.encode('ascii')
         exif_bytes = piexif.dump(exif)
         piexif.insert(exif_bytes, path)
 
@@ -9359,6 +9524,7 @@ class FolderProfilesDialog(QDialog):
             self.main_win._debounced_save_state()
         except Exception:
             logger.exception("profiles persist failed")
+        super().accept()
 class OverlayContentContainer(QWidget):
     """Hosts view_stack at 100% width and height, and coordinates floating overlay panels."""
     def __init__(self, media_tab, parent=None):
@@ -10101,7 +10267,12 @@ class MediaTab(QWidget):
             if self._deferred_found_infos:
                 deferred, self._deferred_found_infos = self._deferred_found_infos, []
                 for info in deferred:
+                    prev_count = self.table.rowCount()
                     self._on_file_found(info)
+                    if self.table.rowCount() > prev_count and info.is_valid:
+                        row = prev_count
+                        self._apply_saved_file_data_to_row(row)
+                        self._update_row_preview(row)
                 self._apply_filter()
                 self._update_stats()
                 self._load_visible_widgets()
@@ -10119,11 +10290,6 @@ class MediaTab(QWidget):
                     _gi = self._grid_item(info)
                     if _gi: _gi.setHidden(True)
                     continue
-            filename = self.table.item(row, self.COL_FILENAME).text().lower()
-            artist_item = self.table.item(row, self.COL_ARTIST)
-            artist = artist_item.text().lower() if artist_item else ""
-            rating_item = self.table.item(row, self.COL_RATING)
-            rating = rating_item.text().lower() if rating_item else ""
             preview_item = self.table.item(row, self.COL_PREVIEW)
             preview = preview_item.text().lower() if preview_item else ""
             if not search_lower or matches_query(info, search_lower, preview):
@@ -10319,6 +10485,8 @@ class MediaTab(QWidget):
                     elif res_idx == 5 and (h < 720 or h >= 1080): keep = False # 720p
                     elif res_idx == 6 and (h < 480 or h >= 720): keep = False # 480p
                     elif res_idx == 7 and h >= 480: keep = False # Below 480p
+                else:
+                    keep = False
 
             # Duration
             d = float(getattr(info, 'duration_seconds', 0) or 0.0)
@@ -10334,6 +10502,8 @@ class MediaTab(QWidget):
                     m_date = QDateTime.fromSecsSinceEpoch(int(m_ts)).date()
                     if m_date < date_from or m_date > date_to:
                         keep = False
+                else:
+                    keep = False
 
             # Size
             s = int(getattr(info, 'size_bytes', 0) or 0)
@@ -10352,12 +10522,12 @@ class MediaTab(QWidget):
                     r_text = rating_item.text().strip() if rating_item else ""
                 
                 if rat_idx == 1: # Unrated
-                    if r_text and r_text != "—":
+                    if r_text and r_text not in ("-", "—"):
                         keep = False
                 else:
                     thresh = rat_idx - 1
                     try:
-                        if not r_text or r_text == "—" or float(r_text) < thresh:
+                        if not r_text or r_text in ("-", "—") or float(r_text) < thresh:
                             keep = False
                     except ValueError:
                         keep = False
@@ -10395,7 +10565,17 @@ class MediaTab(QWidget):
         text = self.exclude_input.text()
         patterns = [p.strip() for p in text.split(',') if p.strip()]
         self._exclude_patterns = patterns
-        if self.directories: self._start_scan(self.directories)
+        if self.directories:
+            # The rescan empties the table and (in _on_clear) drops the rename
+            # history. History entries are path-based and stay valid across a
+            # rescan, so keep them — typing an exclude pattern must not
+            # silently destroy the undo stack.
+            history, redo = list(self._rename_history), list(self._redo_history)
+            self._start_scan(self.directories)
+            self._rename_history[:] = history
+            self._redo_history[:] = redo
+            self.btn_undo.setEnabled(len(self._rename_history) > 0)
+            self.btn_redo.setEnabled(len(self._redo_history) > 0)
 
     def _should_exclude(self, filepath: str) -> bool:
         if not self._exclude_patterns: return False
@@ -10493,7 +10673,22 @@ class MediaTab(QWidget):
         # rebuild the baseline so old paths don't count as "removed" while
         # their new paths are already known (prevents duplicate rows).
         if getattr(self, '_known_files_dirty', False):
-            self._known_files = {os.path.normcase(os.path.normpath(info.filepath)): info.filepath for info in self.media_infos}
+            # Rebuild the baseline from the table (renames change paths), but
+            # only for files that live in a watched directory. Rows that were
+            # dropped in from elsewhere are not part of the watched tree, so
+            # they must not be treated as "removed" on the next poll — that
+            # deleted the row (and released its player) even though the file
+            # was still on disk.
+            watched = [os.path.normcase(os.path.abspath(d)) for d in self.directories]
+            rebuilt = {}
+            for info in self.media_infos:
+                path = getattr(info, 'filepath', '') or ''
+                if not path: continue
+                abs_path = os.path.normcase(os.path.abspath(path))
+                if watched and not any(abs_path.startswith(d + os.sep) or abs_path == d for d in watched):
+                    continue
+                rebuilt[os.path.normcase(os.path.normpath(path))] = path
+            self._known_files = rebuilt
             self._known_files_dirty = False
             
         valid_exts = get_extensions_for_type(self.media_type)
@@ -10557,11 +10752,18 @@ class MediaTab(QWidget):
 
             if removed_paths:
                 self._release_file_locks(removed_paths)
+                if self._user_removed_paths:
+                    for rp in removed_paths:
+                        self._user_removed_paths.discard(os.path.normcase(os.path.normpath(rp)))
 
             was_sorting = self.table.isSortingEnabled()
             self.table.setSortingEnabled(False)
             for r in sorted(rows_to_remove, reverse=True):
-                self._remove_row_from_list(r)
+                # user_initiated=False: the file disappeared on disk, the user
+                # did not remove it — it must not be blacklisted in
+                # _user_removed_paths, otherwise a file that comes back
+                # (restore from backup, copy-back) never reappears.
+                self._remove_row_from_list(r, user_initiated=False)
             self.table.setSortingEnabled(was_sorting)
             self._update_selection_buttons_and_preview()
 
@@ -10590,6 +10792,11 @@ class MediaTab(QWidget):
             return
         if getattr(info, 'watch_generation', self._watch_generation) != self._watch_generation:
             return  # stale result — table was cleared/reloaded since this worker started
+        # The file can vanish while its metadata is extracted (cancelled
+        # download, moved elsewhere). Adding it now would leave a permanent
+        # row for a file that does not exist.
+        if not os.path.exists(getattr(info, 'filepath', '') or ''):
+            return
         if not hasattr(self, '_pending_watch_infos'):
             self._pending_watch_infos = []
         self._pending_watch_infos.append(info)
@@ -10618,13 +10825,15 @@ class MediaTab(QWidget):
             for info in pending:
                 if getattr(info, 'watch_generation', self._watch_generation) != self._watch_generation:
                     continue  # stale — table cleared since extraction started
-                row = self.table.rowCount()
+                prev_count = self.table.rowCount()
                 self._on_file_found(info)
-                if info.is_valid:
-                    # Apply persisted artist/rating/tags for files restored from config
-                    self._apply_saved_file_data_to_row(row)
-                    self._update_row_preview(row)
-                    added_infos.append(info)
+                if self.table.rowCount() > prev_count:
+                    row = prev_count
+                    if info.is_valid:
+                        # Apply persisted artist/rating/tags for files restored from config
+                        self._apply_saved_file_data_to_row(row)
+                        self._update_row_preview(row)
+                        added_infos.append(info)
         finally:
             self.table.setSortingEnabled(was_sorting)
         self._apply_filter()
@@ -10736,9 +10945,9 @@ class MediaTab(QWidget):
                     continue
                 src = info.filepath
                 dst = os.path.join(os.path.dirname(src), target_display)
-                same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+                same_file = _same_file_path(src, dst)
                 if os.path.exists(dst) and not same_file:
-                    base, ext = os.path.splitext(target_display)
+                    base, ext = _split_target_for_suffix(target_display, info.extension)
                     counter = 1
                     while os.path.exists(dst):
                         dst = os.path.join(os.path.dirname(src), f"{base}_{counter}{ext}")
@@ -10747,9 +10956,7 @@ class MediaTab(QWidget):
                     os.rename(src, dst)
                     info.filepath = dst
                     info.filename = os.path.basename(dst)
-                    new_ext = os.path.splitext(dst)[1]
-                    if new_ext:
-                        info.extension = new_ext
+                    info.extension = _renamed_extension(dst, info.extension)
                     self._updating_table = True
                     fname_item.setText(info.filename)
                     fname_item.setToolTip(dst)
@@ -10808,6 +11015,9 @@ class MediaTab(QWidget):
         results = []
         main_win = self.window()
         keep_ext = getattr(main_win, 'naming_keep_extension', True)
+        # Mirrors _on_process_all: names claimed earlier in this batch must not
+        # be handed out twice, so the preview matches the real outcome.
+        claimed_targets = set()
         for row in range(self.table.rowCount()):
             if self.table.isRowHidden(row):
                 continue
@@ -10824,7 +11034,7 @@ class MediaTab(QWidget):
                 fields = getattr(main_win, 'naming_fields', []) or []
                 if "name" in fields and not artist:
                     missing.append("Name")
-                if "rating" in fields and (not rating or rating == "—"):
+                if "rating" in fields and (not rating or rating in ("-", "—")):
                     missing.append("Rating")
                 if ("date_taken" in fields or "ym" in fields) and get_media_datetime(info) is None:
                     missing.append("Date")
@@ -10845,19 +11055,20 @@ class MediaTab(QWidget):
                 continue
             src = info.filepath
             dst = os.path.join(os.path.dirname(src), target_display)
-            same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+            same_file = _same_file_path(src, dst)
             final_target, note = target_display, ""
             status = 'ready'
-            if os.path.exists(dst) and not same_file:
+            if (os.path.exists(dst) or _abs_path_key(dst) in claimed_targets) and not same_file:
                 status = 'conflict'
-                base, ext = os.path.splitext(target_display)
+                base, ext = _split_target_for_suffix(target_display, info.extension)
                 counter = 1
                 probe = os.path.join(os.path.dirname(src), f"{base}_{counter}{ext}")
-                while os.path.exists(probe):
+                while os.path.exists(probe) or _abs_path_key(probe) in claimed_targets:
                     counter += 1
                     probe = os.path.join(os.path.dirname(src), f"{base}_{counter}{ext}")
                 final_target = f"{base}_{counter}{ext}"
                 note = f"'{target_display}' already exists on disk — will get the _{counter} suffix"
+            claimed_targets.add(_abs_path_key(os.path.join(os.path.dirname(src), final_target)))
             results.append({'row': row, 'current': current_display, 'target': target_display,
                             'final_target': final_target, 'status': status, 'note': note})
         return results
@@ -11120,6 +11331,10 @@ class MediaTab(QWidget):
             self.progress_bar.setMaximum(total)
             self.progress_bar.setValue(current)
             self.progress_bar.setFormat(f"Processing {current}/{total}…")
+        else:
+            self.progress_bar.setMaximum(0)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat(f"Processing {current} files…")
 
     def _on_file_found(self, info: MediaInfo):
         if getattr(self, '_modal_depth', 0) > 0:
@@ -11257,19 +11472,26 @@ class MediaTab(QWidget):
             dt_item.setForeground(QColor("#9ca3af") if is_dark else QColor("#64748b"))
             self.table.setItem(row, col, dt_item)
         parsed_artist, parsed_rating = parse_naming_format(info.filename, getattr(info, 'media_type', None))
+        # A user-edited artist/rating wins over the filename parse. Otherwise a
+        # re-added row (e.g. a smart folder refresh) shows the parsed values
+        # and "Process All" renames the file back to them, silently discarding
+        # the edit the user made.
+        edited_artist = (getattr(info, 'parsed_artist', '') or '').strip()
+        edited_rating = (getattr(info, 'parsed_rating', '') or '').strip()
+        artist_value = edited_artist or parsed_artist or ""
+        rating_value = edited_rating or parsed_rating or "—"
         is_dark = getattr(self.window(), 'current_theme', 'dark') == 'dark'
         text_color = QColor("#e0e0e0") if is_dark else QColor("#0f172a")
         
         if info.is_valid:
-            artist_item = NumericTableWidgetItem(parsed_artist or "")
+            artist_item = NumericTableWidgetItem(artist_value)
             artist_item.setFont(meta_font)
             artist_item.setForeground(text_color)
             artist_item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             artist_item.setFlags(artist_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, self.COL_ARTIST, artist_item)
             
-            rating_val = parsed_rating or "—"
-            rating_item = NumericTableWidgetItem(rating_val, sort_key=int(parsed_rating) if parsed_rating else 0)
+            rating_item = NumericTableWidgetItem(rating_value, sort_key=int(rating_value) if rating_value.isdigit() else 0)
             rating_item.setFont(meta_font)
             rating_item.setForeground(text_color)
             rating_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -11353,7 +11575,9 @@ class MediaTab(QWidget):
     @property
     def progress_bar(self):
         main_win = self.window()
-        if main_win and hasattr(main_win, 'progress_bar'):
+        # `main_win is not self`: a standalone MediaTab is its own window and
+        # hasattr(self, 'progress_bar') would recurse into this property.
+        if main_win and main_win is not self and hasattr(main_win, 'progress_bar'):
             return main_win.progress_bar
         if not hasattr(self, '_dummy_progress_bar'):
             self._dummy_progress_bar = QProgressBar()
@@ -11484,6 +11708,12 @@ class MediaTab(QWidget):
             if not self._watch_timer.isActive():
                 self._watch_timer.start(3000)
         self._load_visible_widgets()
+        # Smart folders are views over the source tabs: rebuild them now that
+        # the source tab has new rows, otherwise they stay empty/stale until
+        # the user navigates away and back.
+        main_win = self.window()
+        if main_win is not None and main_win is not self and hasattr(main_win, 'refresh_smart_folders'):
+            main_win.refresh_smart_folders()
 
     def _ensure_widgets_for_row(self, row: int):
         info = self._get_row_info(row)
@@ -11625,6 +11855,8 @@ class MediaTab(QWidget):
                 main_win = self.window()
                 if main_win and hasattr(main_win, '_debounced_save_state'):
                     main_win._debounced_save_state()
+                if hasattr(self, '_filter_timer'):
+                    self._filter_timer.start()
                 break
 
     def _get_row_info(self, row: int) -> MediaInfo | None:
@@ -11789,13 +12021,13 @@ class MediaTab(QWidget):
                 if artist:
                     parts.append(sanitize_folder_name(artist))  # FIX: strip characters illegal in filenames
             elif config_key == "duration":
-                if self.media_type != 'image' and info.duration_compact and info.duration_compact != "—":
+                if self.media_type != 'image' and info.duration_compact and info.duration_compact not in ("-", "—"):
                     parts.append(info.duration_compact)
             elif config_key == "resolution":
-                if self.media_type != 'audio' and info.resolution_tag and info.resolution_tag != "—":
+                if self.media_type != 'audio' and info.resolution_tag and info.resolution_tag not in ("-", "—"):
                     parts.append(info.resolution_tag)
             elif config_key == "rating":
-                if rating and rating != "—":
+                if rating and rating not in ("-", "—"):
                     parts.append(sanitize_folder_name(rating))
             elif config_key == "tags":
                 tags = getattr(info, 'tags', [])
@@ -11825,13 +12057,13 @@ class MediaTab(QWidget):
                 if artist:
                     parts.append(sanitize_folder_name(artist))  # FIX: strip characters illegal in filenames
             elif config_key == "duration":
-                if self.media_type != 'image' and info.duration_compact and info.duration_compact != "—":
+                if self.media_type != 'image' and info.duration_compact and info.duration_compact not in ("-", "—"):
                     parts.append(info.duration_compact)
             elif config_key == "resolution":
-                if self.media_type != 'audio' and info.resolution_tag and info.resolution_tag != "—":
+                if self.media_type != 'audio' and info.resolution_tag and info.resolution_tag not in ("-", "—"):
                     parts.append(info.resolution_tag)
             elif config_key == "rating":
-                if rating and rating != "—":
+                if rating and rating not in ("-", "—"):
                     parts.append(sanitize_folder_name(rating))
             elif config_key == "tags":
                 tags = getattr(info, 'tags', [])
@@ -11859,7 +12091,7 @@ class MediaTab(QWidget):
             return False
         if "name" in fields_checked and not artist:
             return False
-        if "rating" in fields_checked and (not rating or rating == "—"):
+        if "rating" in fields_checked and (not rating or rating in ("-", "—")):
             return False
         if info is not None and ("date_taken" in fields_checked or "ym" in fields_checked):
             if get_media_datetime(info) is None:
@@ -12053,6 +12285,8 @@ class MediaTab(QWidget):
                 self._updating_table = False
                 self.table.setSortingEnabled(was_sorting)
 
+            if hasattr(self, '_filter_timer'):
+                self._filter_timer.start()
             if hasattr(self.window(), '_debounced_save_state'):
                 self.window()._debounced_save_state()
             self._show_toast(f"Updated tags for {len(selected_infos)} files.", 'success')
@@ -12225,7 +12459,7 @@ class MediaTab(QWidget):
                         os.makedirs(dest_dir, exist_ok=True)
 
                         dest_file = os.path.join(dest_dir, info.filename)
-                        same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest_file))
+                        same_file = _same_file_path(src, dest_file)
                         if os.path.exists(dest_file) and not same_file:
                             base, ext = os.path.splitext(info.filename)
                             counter = 1
@@ -12560,12 +12794,16 @@ class MediaTab(QWidget):
             import csv as _csv
             with open(path, 'w', encoding='utf-8-sig', newline='') as f:
                 wr = _csv.writer(f)
-                wr.writerow(list(self.HEADERS) + ["Path"])
+                # Column 0 is the thumbnail column: it holds a cell widget
+                # (never a QTableWidgetItem), so it exported as an empty,
+                # mislabelled "Preview" column. Skip it in both the header and
+                # the rows.
+                wr.writerow(list(self.HEADERS[1:]) + ["Path"])
                 count = 0
                 for row in range(self.table.rowCount()):
                     if self.table.isRowHidden(row): continue
                     vals = []
-                    for col in range(self.NUM_COLS):
+                    for col in range(1, self.NUM_COLS):
                         it = self.table.item(row, col)
                         vals.append(csv_safe(it.text() if it else ""))
                     info = self._get_row_info(row)
@@ -12833,15 +13071,19 @@ class MediaTab(QWidget):
             self._show_toast("Path copied to clipboard", 'success')
             QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
 
-    def _remove_row_from_list(self, row: int):
+    def _remove_row_from_list(self, row: int, user_initiated: bool = True):
         info = self._get_row_info(row)
         if info:
             # Identity match: filepath-string comparison misses case variants
             # on Windows (C:\A.mp4 vs c:\a.mp4) and drops wrong rows if paths repeat.
             self.media_infos = [v for v in self.media_infos if v is not info]
             # Remember user-removed files so watch mode doesn't re-add them on
-            # the next poll while they still exist on disk.
-            self._user_removed_paths.add(os.path.normcase(os.path.normpath(info.filepath)))
+            # the next poll while they still exist on disk. Files that vanished
+            # on their own (watcher-detected removals) must NOT be blacklisted:
+            # the user never removed them, so a restored/copied-back file has
+            # to reappear in the list.
+            if user_initiated:
+                self._user_removed_paths.add(os.path.normcase(os.path.normpath(info.filepath)))
             self.table.removeRow(row)
             _gi = self._grid_item(info)
             if _gi:
@@ -13012,9 +13254,9 @@ class MediaTab(QWidget):
         else:
             new_name_no_ext = new_text
         dst = os.path.join(os.path.dirname(src), new_name_no_ext + info.extension)
-        # normcase: on Windows the FS is case-insensitive, so renaming
-        # ABC.mp4 -> abc.mp4 must NOT be treated as a collision.
-        same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+        # samefile(): on Windows the FS is case-insensitive, so renaming
+        # ABC.mp4 -> abc.mp4 must NOT be treated as a collision (same on macOS).
+        same_file = _same_file_path(src, dst)
         if os.path.exists(dst) and not same_file:
             base = new_name_no_ext
             ext = info.extension
@@ -13045,7 +13287,7 @@ class MediaTab(QWidget):
         try:
             info.filepath = dst
             info.filename = os.path.basename(dst)
-            info.extension = os.path.splitext(dst)[1]
+            info.extension = _renamed_extension(dst, info.extension)
             item.setToolTip(dst)
             self._updating_table = True
             try:
@@ -13113,6 +13355,9 @@ class MediaTab(QWidget):
             auto_renamed = 0
             error_count = 0
             errors = []
+            # Target names claimed by this batch (so two rows cannot pick the
+            # same _N suffix).
+            claimed_targets = set()
             was_sorting = self.table.isSortingEnabled()
             self.table.setSortingEnabled(False)
             self._release_file_locks([info.filepath for _, info, _ in ready_rows])
@@ -13131,15 +13376,20 @@ class MediaTab(QWidget):
                         continue
                     src = info.filepath
                     dst = os.path.join(os.path.dirname(src), target_display)
-                    # normcase: case-only renames on Windows are not collisions
-                    same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
-                    if os.path.exists(dst) and not same_file:
-                        base, ext = os.path.splitext(target_display)
+                    # samefile(): a case-only rename ("Clip.MP4" -> "clip.mp4")
+                    # is not a collision on case-insensitive volumes.
+                    same_file = _same_file_path(src, dst)
+                    if (os.path.exists(dst) or _abs_path_key(dst) in claimed_targets) and not same_file:
+                        base, ext = _split_target_for_suffix(target_display, info.extension)
                         counter = 1
-                        while os.path.exists(dst):
+                        while os.path.exists(dst) or _abs_path_key(dst) in claimed_targets:
                             dst = os.path.join(os.path.dirname(src), f"{base}_{counter}{ext}")
                             counter += 1
                         auto_renamed += 1
+                    # Reserve the name: another row in this batch may target it
+                    # too, and the suffix must not be picked twice. Reserved
+                    # after the UI check so a skipped row does not block a name
+                    # it never took.
                     # Validate UI handles BEFORE touching the filesystem so a missing
                     # table item can't orphan a successful rename from undo history.
                     fname_item = self.table.item(row, self.COL_FILENAME)
@@ -13150,6 +13400,7 @@ class MediaTab(QWidget):
                         error_count += 1
                         errors.append(f"{target_display}: table row {row} is missing UI items; rename skipped")
                         continue
+                    claimed_targets.add(_abs_path_key(dst))
                     try:
                         if sys.platform == "win32" and same_file and os.path.abspath(src) != os.path.abspath(dst):
                             tmp_dst = dst + f".__mf_tmp_{random.randint(10000, 99999)}__"
@@ -13159,11 +13410,10 @@ class MediaTab(QWidget):
                             os.rename(src, dst)
                         info.filepath = dst
                         info.filename = os.path.basename(dst)
-                        new_ext = os.path.splitext(dst)[1]
-                        if new_ext:
-                            # keep_extension=False yields an extensionless dst — never
-                            # clobber the known extension with "" or it can't be restored.
-                            info.extension = new_ext
+                        # Renaming never changes the file type: keep the known
+                        # extension unless the new name ends with exactly it
+                        # ("Vol. 2" must not turn the extension into ". 2").
+                        info.extension = _renamed_extension(dst, info.extension)
                         self._updating_table = True
                         try:
                             fname_item.setText(info.filename)
@@ -13325,6 +13575,10 @@ class MediaTab(QWidget):
                 if not self._rename_history or self._rename_history[-1] is not last:
                     self._rename_history.append(last)
         else:
+            # Keep the entry: the file may come back (offline drive, slow copy).
+            # Dropping it made the rename permanently un-undoable and lost the
+            # history the user still sees in the list.
+            self._rename_history.append(last)
             QMessageBox.warning(self, "Undo Unavailable", "Cannot undo: file has been moved or renamed again.")
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
         self.btn_redo.setEnabled(len(self._redo_history) > 0)
@@ -13401,11 +13655,13 @@ class MediaTab(QWidget):
                 self._show_toast(f"Redone: {os.path.basename(dst)}", 'success')
                 self._update_stats()
                 self._known_files_dirty = True
-                self._add_to_history(src, dst, target_row, clear_redo=False, extra=last.get('extra'), op="redo")
+                self._add_to_history(src, dst, target_row, clear_redo=False, extra=extra_done, op="redo")
             except Exception as e:
                 QMessageBox.warning(self, "Redo Failed", f"Cannot redo rename:\n{e}")
                 self._redo_history.append(last)
         else:
+            # Keep the entry so the redo stays available (see _on_undo_rename).
+            self._redo_history.append(last)
             QMessageBox.warning(self, "Redo Unavailable", "Cannot redo: file has been deleted, moved, or renamed again.")
         self.btn_redo.setEnabled(len(self._redo_history) > 0)
         self.btn_undo.setEnabled(len(self._rename_history) > 0)
@@ -13418,6 +13674,7 @@ class MediaTab(QWidget):
         if not data: return
 
         artist = data.get('artist', '')
+        if not isinstance(artist, str): artist = str(artist) if artist is not None else ''
         if artist:
             info.parsed_artist = artist
             artist_item = self.table.item(row, self.COL_ARTIST)
@@ -13426,6 +13683,10 @@ class MediaTab(QWidget):
             if artist_widget: artist_widget.setText(artist)
 
         rating = data.get('rating', '—')
+        # A hand-edited/older config may hold a number (8) instead of "8";
+        # setText() with a non-string raised TypeError and aborted the whole
+        # restore, so every later row lost its metadata.
+        if not isinstance(rating, str): rating = str(rating)
         if rating != '—':
             info.parsed_rating = rating
             rating_item = self.table.item(row, self.COL_RATING)
@@ -13461,7 +13722,12 @@ class MediaTab(QWidget):
             for row in range(self.table.rowCount()):
                 info = self._get_row_info(row)
                 if not info: continue
-                self._apply_saved_file_data_to_row(row)
+                # One malformed entry must not abort the restore for every
+                # other row.
+                try:
+                    self._apply_saved_file_data_to_row(row)
+                except Exception as e:
+                    logger.warning("Could not restore saved metadata for row %s: %s", row, e)
                 self._update_row_preview(row)
         finally:
             self._updating_table = False
@@ -15667,6 +15933,11 @@ class MediaFlowWindow(QMainWindow):
     # Thumbnail size — live label updates while dragging; layout reflow on release
     def _on_thumb_size_live(self, value: int):
         self.thumb_size = int(value)
+        # Mouse drags apply on sliderReleased; keyboard/wheel input never emits
+        # it, so apply immediately when the slider is not being dragged.
+        slider = getattr(self, 'thumb_size_slider', None)
+        if slider is not None and not slider.isSliderDown():
+            self._on_thumb_size_changed()
 
     def _on_thumb_size_changed(self):
         size = int(getattr(self, 'thumb_size', 130))
@@ -15909,6 +16180,19 @@ class MediaFlowWindow(QMainWindow):
             self.btn_nav_pdfs.style().polish(self.btn_nav_pdfs)
             for n, item in self.smart_folder_nav_items.items(): item.set_active(n == name)
             self.refresh_smart_folder_tab(smart_tab)
+
+    def refresh_smart_folders(self):
+        """Rebuild every smart-folder tab from the (updated) source tabs.
+
+        Called when a source tab finishes scanning: a smart folder is a view
+        over the source tabs, so it must be rebuilt or it keeps showing the
+        state from before the scan.
+        """
+        for smart_tab in list(getattr(self, 'smart_folder_tabs', {}).values()):
+            try:
+                self.refresh_smart_folder_tab(smart_tab)
+            except Exception as e:
+                logger.warning("Smart folder refresh failed: %s", e)
 
     def refresh_smart_folder_tab(self, smart_tab: MediaTab):
         smart_tab._on_clear()
@@ -16391,6 +16675,12 @@ class MediaFlowWindow(QMainWindow):
             self.separator_input.setText(sep_text)
             self.separator_input.blockSignals(False)
             self.show_toast("Separator can't contain characters illegal in filenames — removed.", 'warning')
+        if len(sep_text) > 8:
+            sep_text = sep_text[:8]
+            self.separator_input.blockSignals(True)
+            self.separator_input.setText(sep_text)
+            self.separator_input.blockSignals(False)
+            self.show_toast("Separator is limited to 8 characters.", 'warning')
         # Cap at 8 chars to match _load_state's round-trip — a longer separator
         # was silently truncated to 8 on the next launch.
         self.naming_separator = (sep_text[:8] or ' ')
@@ -16512,7 +16802,7 @@ class MediaFlowWindow(QMainWindow):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f: state = json.load(f)
             if not isinstance(state, dict):
                 raise TypeError("config root is not a JSON object")
-        except (json.JSONDecodeError, TypeError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as e:
             logger.warning("Corrupt config file (%s); starting fresh: %s", CONFIG_FILE, e)
             self._load_failed = True
             try:
@@ -16970,9 +17260,9 @@ class MediaFlowWindow(QMainWindow):
             except RuntimeError:
                 pass
         # Close any open native players
-        for np in list(getattr(self, '_native_players', []) or []):
+        for player in list(getattr(self, '_native_players', []) or []):
             try:
-                np.close()
+                player.close()
             except Exception:
                 pass
         # Cancel and wait for still-running metadata workers

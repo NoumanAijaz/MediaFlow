@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+.ruff_cache/
 
 # Environments
 venv/
@@ -12,6 +14,7 @@ env/
 # PyInstaller
 build/
 dist/
+*.spec
 
 # IDEs
 .vscode/
