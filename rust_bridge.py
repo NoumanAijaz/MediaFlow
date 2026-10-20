@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from typing import Callable, Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger("mediaflow.rust_bridge")
@@ -99,16 +100,25 @@ def scan_directories_rust(
     if not binary:
         raise RuntimeError("mediaflow-core binary is not available")
 
+    valid_dirs = [os.path.abspath(d) for d in directories if os.path.isdir(d)]
+    if not valid_dirs:
+        return 0, 0.0
+
     args = [binary, "scan", "--media-type", media_type]
     if include_no_ext:
         args.append("--include-no-ext")
 
     if exclude_patterns:
-        args.append("--exclude")
-        args.extend(exclude_patterns)
+        # "--exclude=<value>" form: a pattern that starts with "-" is parsed as
+        # a flag by clap and aborts the whole scan (exit code 2), which
+        # silently disabled the Rust engine for that scan.
+        for pattern in exclude_patterns:
+            args.append(f"--exclude={pattern}")
 
-    args.append("--dirs")
-    args.extend([os.path.abspath(d) for d in directories if os.path.isdir(d)])
+    # Same reason: a directory whose name starts with "-" must not be read
+    # as a flag.
+    for directory in valid_dirs:
+        args.append(f"--dirs={directory}")
 
     creationflags = 0
     if sys.platform == "win32":
@@ -159,6 +169,14 @@ def scan_directories_rust(
                 logger.warning("Rust scan error: %s", event.get("message"))
 
         proc.wait(timeout=5)
+        if (not is_interrupted or not is_interrupted()) and proc.returncode != 0:
+            stderr_out = ""
+            if proc.stderr:
+                try:
+                    stderr_out = proc.stderr.read()
+                except Exception:
+                    pass
+            raise RuntimeError(f"mediaflow-core scan exited with code {proc.returncode}: {stderr_out.strip()}")
     except Exception as e:
         logger.error("Error during Rust directory scan: %s", e)
         try:
@@ -184,7 +202,7 @@ def find_duplicates_rust(
         raise RuntimeError("mediaflow-core binary is not available")
 
     # Serialize items payload
-    payload = json.dumps([{"path": it["path"], "size": int(it.get("size", 0))} for it in items])
+    payload = json.dumps([{"path": it["path"], "size": int(it.get("size", 0) or 0)} for it in items])
 
     creationflags = 0
     if sys.platform == "win32":
@@ -198,37 +216,130 @@ def find_duplicates_rust(
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
         creationflags=creationflags,
     )
 
     try:
-        stdout_data, stderr_data = proc.communicate(input=payload, timeout=600)
+        proc.stdin.write(payload)
+        proc.stdin.close()
     except Exception as e:
         try:
             proc.kill()
         except Exception:
             pass
-        raise RuntimeError(f"Rust dedupe failed: {e}")
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"mediaflow-core dedupe exited with code {proc.returncode}: {stderr_data}")
+        raise RuntimeError(f"Failed to send input payload to mediaflow-core dedupe: {e}")
 
     groups = []
     skipped = 0
-    for line in stdout_data.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-            if event.get("type") == "groups":
+    start_time = time.time()
+    try:
+        for line in proc.stdout:
+            if is_cancelled and is_cancelled():
+                try:
+                    proc.terminate()
+                    proc.kill()
+                except Exception:
+                    pass
+                return [], 0
+            if time.time() - start_time > 600:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise RuntimeError("Rust dedupe timed out after 600 seconds")
+
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+
+            event_type = event.get("type")
+            if event_type == "progress":
+                if on_progress:
+                    on_progress(event.get("done", 0), event.get("total", 0), event.get("phase", "Analyzing duplicates…"))
+            elif event_type == "groups":
                 groups = event.get("groups", [])
                 skipped = event.get("skipped", 0)
-                break
+            elif event_type == "error":
+                logger.warning("Rust dedupe error: %s", event.get("message"))
+
+        proc.wait(timeout=5)
+        if proc.returncode != 0 and (not is_cancelled or not is_cancelled()):
+            stderr_out = ""
+            if proc.stderr:
+                try:
+                    stderr_out = proc.stderr.read()
+                except Exception:
+                    pass
+            raise RuntimeError(f"mediaflow-core dedupe exited with code {proc.returncode}: {stderr_out}")
+    except Exception as e:
+        try:
+            proc.kill()
         except Exception:
-            continue
+            pass
+        raise
 
     return groups, skipped
+
+
+def execute_rename_rust(
+    tasks: List[Dict[str, str]],
+    dry_run: bool = False,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str, str]]]:
+    """
+    Batch execute file renames using mediaflow-core.
+    Returns (successful_pairs, failed_triples).
+    successful_pairs: [(source, target), ...]
+    failed_triples: [(source, target, error_message), ...]
+    """
+    binary = get_rust_core_binary()
+    if not binary:
+        raise RuntimeError("mediaflow-core binary is not available")
+
+    payload = json.dumps(tasks)
+    cmd = [binary, "rename"]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NO_WINDOW
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+
+    try:
+        stdout_data, stderr_data = proc.communicate(input=payload, timeout=120)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError("Rust batch rename timed out")
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"mediaflow-core rename exited with code {proc.returncode}: {stderr_data}")
+
+    try:
+        data = json.loads(stdout_data.strip())
+        successful = [tuple(x) for x in data.get("successful", [])]
+        failed = [tuple(x) for x in data.get("failed", [])]
+        return successful, failed
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse rename results from mediaflow-core: {e}")
+
 
 
 def extract_metadata_rust(filepath: str, media_type: str = "audio") -> Optional[Dict[str, Any]]:

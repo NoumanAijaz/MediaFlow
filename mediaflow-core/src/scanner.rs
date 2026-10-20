@@ -1,24 +1,24 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
-    "m2v", "ts", "m2ts", "mts", "vob", "3gp", "3g2", "ogv", "f4v", "f4p"
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "m2v", "ts", "m2ts",
+    "mts", "vob", "3gp", "3g2", "ogv", "f4v", "f4p", "divx", "rm", "rmvb", "asf", "amv", "svi",
 ];
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "wav", "aac", "flac", "ogg", "m4a", "wma", "opus", "aiff", "aif",
-    "alac", "mid", "midi", "mka", "ape"
+    "mp3", "wav", "aac", "flac", "ogg", "m4a", "wma", "opus", "aiff", "aif", "alac", "mid", "midi",
+    "mka", "ape", "amr", "m4b",
 ];
 
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "ico", "svg",
-    "heic", "heif", "avif", "raw", "cr2", "nef", "arw"
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "tif", "jfif", "ico", "svg", "heic", "heif",
+    "avif", "raw", "cr2", "nef", "arw",
 ];
 
 pub const PDF_EXTENSIONS: &[&str] = &["pdf"];
@@ -58,13 +58,11 @@ pub fn matches_exclusion(filename_lower: &str, patterns: &[String]) -> bool {
             if filename_lower.contains(inner) {
                 return true;
             }
-        } else if p.starts_with('*') {
-            let suffix = &p[1..];
+        } else if let Some(suffix) = p.strip_prefix('*') {
             if filename_lower.ends_with(suffix) {
                 return true;
             }
-        } else if p.ends_with('*') {
-            let prefix = &p[..p.len() - 1];
+        } else if let Some(prefix) = p.strip_suffix('*') {
             if filename_lower.starts_with(prefix) {
                 return true;
             }
@@ -98,8 +96,8 @@ pub fn sniff_media_type(path: &std::path::Path) -> Option<&'static str> {
         return None;
     }
 
-    // Check PNG: 89 50 4E 47
-    if buffer.starts_with(&[0x89, b'P', b'N', b'G']) {
+    // Check PNG: 89 50 4E 47 0D 0A 1A 0A
+    if buffer.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         return Some("image");
     }
     // Check JPEG: FF D8 FF
@@ -107,7 +105,7 @@ pub fn sniff_media_type(path: &std::path::Path) -> Option<&'static str> {
         return Some("image");
     }
     // Check GIF: GIF87a or GIF89a
-    if buffer.starts_with(b"GIF8") {
+    if buffer.starts_with(b"GIF87a") || buffer.starts_with(b"GIF89a") {
         return Some("image");
     }
     // Check BMP: BM
@@ -122,18 +120,33 @@ pub fn sniff_media_type(path: &std::path::Path) -> Option<&'static str> {
     if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..12] == b"WEBP" {
         return Some("image");
     }
-    // Check AVI: RIFF....AVI
-    if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..11] == b"AVI" {
+    // Check AVI: RIFF....AVI 
+    if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..12] == b"AVI " {
         return Some("video");
     }
     // Check WAV: RIFF....WAVE
     if buffer.starts_with(b"RIFF") && n >= 12 && &buffer[8..12] == b"WAVE" {
         return Some("audio");
     }
-    // Check MP4 / MOV / M4V / M4A: ftyp at offset 4
+    // Check MP4 / MOV / M4V / M4A / M4B / HEIC / AVIF: ftyp at offset 4
     if n >= 8 && &buffer[4..8] == b"ftyp" {
-        if n >= 12 && (&buffer[8..12] == b"M4A " || &buffer[8..12] == b"m4a ") {
+        let brand: &[u8] = if n >= 12 { &buffer[8..12] } else { &[] };
+        if [&b"M4A "[..], &b"m4a "[..], &b"M4B "[..], &b"m4b "[..]].contains(&brand) {
             return Some("audio");
+        }
+        if [
+            &b"heic"[..],
+            &b"heix"[..],
+            &b"heim"[..],
+            &b"heis"[..],
+            &b"hevc"[..],
+            &b"hevx"[..],
+            &b"avif"[..],
+            &b"avis"[..],
+        ]
+        .contains(&brand)
+        {
+            return Some("image");
         }
         return Some("video");
     }
@@ -155,6 +168,17 @@ pub fn sniff_media_type(path: &std::path::Path) -> Option<&'static str> {
     }
 
     None
+}
+
+/// Seconds since the Unix epoch.
+///
+/// Timestamps before 1970 are negative; `duration_since(UNIX_EPOCH)` fails for
+/// them, which reported them as 0.0 (1970-01-01) instead of the real time.
+fn epoch_seconds(t: std::time::SystemTime) -> f64 {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    }
 }
 
 pub fn run_scan(
@@ -181,13 +205,24 @@ pub fn run_scan(
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
                 let name = e.file_name().to_string_lossy();
                 // Skip dotfiles and dotdirs (.git, .vscode, .DS_Store, etc.)
                 !name.starts_with('.')
             })
             .filter_map(|e| e.ok())
         {
-            if !entry.file_type().is_file() {
+            // fs::metadata() follows symlinks: a symlink pointing at a media
+            // file IS a file, but walkdir's entry.file_type() describes the
+            // link itself, so every symlinked file was dropped from the scan
+            // (the Python fallback scanner keeps them).
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !metadata.is_file() {
                 continue;
             }
 
@@ -214,36 +249,40 @@ pub fn run_scan(
 
             let accepted_type: Option<&str> = match target_type.as_str() {
                 "video" => {
-                    if detected == Some("video") || (include_no_ext && is_no_ext) {
-                        Some(detected.unwrap_or("video"))
+                    if detected == Some("video") && (!is_no_ext || include_no_ext) {
+                        Some("video")
                     } else {
                         None
                     }
                 }
                 "audio" => {
-                    if detected == Some("audio") || (include_no_ext && is_no_ext) {
-                        Some(detected.unwrap_or("audio"))
+                    if detected == Some("audio") && (!is_no_ext || include_no_ext) {
+                        Some("audio")
                     } else {
                         None
                     }
                 }
                 "image" => {
-                    if detected == Some("image") || (include_no_ext && is_no_ext) {
-                        Some(detected.unwrap_or("image"))
+                    if detected == Some("image") && (!is_no_ext || include_no_ext) {
+                        Some("image")
                     } else {
                         None
                     }
                 }
                 "pdf" => {
-                    if detected == Some("pdf") || (include_no_ext && is_no_ext) {
-                        Some(detected.unwrap_or("pdf"))
+                    if detected == Some("pdf") && (!is_no_ext || include_no_ext) {
+                        Some("pdf")
                     } else {
                         None
                     }
                 }
                 _ => {
                     if let Some(d) = detected {
-                        Some(d)
+                        if !is_no_ext || include_no_ext {
+                            Some(d)
+                        } else {
+                            None
+                        }
                     } else if include_no_ext && is_no_ext {
                         Some("unknown")
                     } else {
@@ -257,38 +296,53 @@ pub fn run_scan(
                 None => continue,
             };
 
-            let norm_path = match path.canonicalize() {
-                Ok(p) => p.to_string_lossy().trim_start_matches(r"\\?\").to_string(),
+            // Duplicate key: the canonical path resolves symlinks, so a file
+            // reachable through two different links is only reported once.
+            let canonical_path = match path.canonicalize() {
+                Ok(p) => {
+                    let s = p.to_string_lossy();
+                    if let Some(unc_suffix) = s.strip_prefix(r"\\?\UNC\") {
+                        format!(r"\\{}", unc_suffix)
+                    } else if let Some(local_suffix) = s.strip_prefix(r"\\?\") {
+                        local_suffix.to_string()
+                    } else {
+                        s.to_string()
+                    }
+                }
                 Err(_) => path.to_string_lossy().to_string(),
             };
 
-            let norm_key = norm_path.to_lowercase();
+            // Case-fold only where the filesystem is case-insensitive: on
+            // POSIX "Song.mp3" and "song.mp3" are two different files and
+            // folding them silently dropped one of them from the scan.
+            let norm_key = if cfg!(windows) {
+                canonical_path.to_lowercase()
+            } else {
+                canonical_path.clone()
+            };
             if !seen_norm_paths.insert(norm_key) {
                 continue;
             }
 
-            let metadata = match fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
             let size = metadata.len();
             let mtime = metadata
                 .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
+                .map(epoch_seconds)
                 .unwrap_or(0.0);
 
             let ctime = metadata
                 .created()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
+                .map(epoch_seconds)
                 .unwrap_or(mtime);
 
             let item = ScannedFile {
-                path: norm_path,
+                // The path AS WALKED, not the canonical one: for a symlinked
+                // file the canonical path points at the link's target, so the
+                // row would show a path outside the scanned folder and a
+                // rename or delete would act on that target instead of the
+                // entry the user sees (breaking the link / moving the
+                // original file). The Python scanner reports the walked path.
+                path: path.to_string_lossy().to_string(),
                 filename: file_name.to_string(),
                 ext: ext_with_dot,
                 size,
@@ -323,4 +377,66 @@ pub fn run_scan(
     let _ = writer.flush();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matches_exclusion() {
+        let patterns = vec![
+            "*.tmp".to_string(),
+            "*_backup*".to_string(),
+            "prefix_*".to_string(),
+            "sample".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+        ];
+
+        assert!(matches_exclusion("video.tmp", &patterns));
+        assert!(matches_exclusion("my_backup_file.mp4", &patterns));
+        assert!(matches_exclusion("prefix_test.mov", &patterns));
+        assert!(matches_exclusion("mysamplefile.mkv", &patterns));
+        assert!(!matches_exclusion("other_file.mp4", &patterns));
+    }
+
+    #[test]
+    fn test_epoch_seconds_keeps_pre_epoch_timestamps_negative() {
+        // 1969-12-31 23:59:59 UTC -> one second before the epoch
+        let before = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(epoch_seconds(before), -1.0);
+        assert_eq!(epoch_seconds(std::time::UNIX_EPOCH), 0.0);
+        assert_eq!(
+            epoch_seconds(std::time::UNIX_EPOCH + std::time::Duration::from_secs(90)),
+            90.0
+        );
+    }
+
+    #[test]
+    fn test_sniff_ftyp_brands() {
+        fn write_brand(name: &str, brand: &[u8; 4]) -> PathBuf {
+            let path = std::env::temp_dir()
+                .join(format!("mf_sniff_{}_{}", std::process::id(), name));
+            let mut data = b"\x00\x00\x00\x18ftyp".to_vec();
+            data.extend_from_slice(brand);
+            data.extend_from_slice(b"\x00\x00\x00\x00");
+            data.extend_from_slice(brand);
+            data.extend_from_slice(b"isom");
+            fs::write(&path, data).unwrap();
+            path
+        }
+
+        let cases: [(&str, &[u8; 4], &str); 4] = [
+            ("heic", b"heic", "image"),
+            ("avif", b"avif", "image"),
+            ("m4b", b"M4B ", "audio"),
+            ("mp4", b"mp42", "video"),
+        ];
+        for (name, brand, expected) in cases {
+            let path = write_brand(name, brand);
+            assert_eq!(sniff_media_type(&path), Some(expected));
+            let _ = fs::remove_file(path);
+        }
+    }
 }

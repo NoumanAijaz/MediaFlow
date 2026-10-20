@@ -1,8 +1,8 @@
-use std::path::Path;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::Accessor;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MediaMetadataResult {
@@ -29,8 +29,10 @@ pub fn format_duration(seconds: f64) -> String {
     let s = total % 60;
     if h > 0 {
         format!("{}h {:02}m {:02}s", h, m, s)
-    } else {
+    } else if m > 0 {
         format!("{}m {:02}s", m, s)
+    } else {
+        format!("{}s", s)
     }
 }
 
@@ -44,7 +46,9 @@ pub fn extract_audio_metadata(path: &Path) -> Result<MediaMetadataResult, String
     let duration = properties.duration();
     let duration_seconds = duration.as_secs_f64();
 
-    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+    let tag = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag());
 
     let (artist, title, album, year) = match tag {
         Some(t) => (
@@ -141,8 +145,22 @@ pub fn extract_metadata(path_str: &str, media_type: &str) -> MediaMetadataResult
             title: None,
             album: None,
             year: None,
-            is_valid: true,
-            error_message: None,
+            // Nothing was analysed: reporting success made callers believe the
+            // file had been read (is_valid == true, no error).
+            is_valid: false,
+            error_message: Some(format!("Unsupported media type: {}", media_type)),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unsupported_media_type_is_not_valid() {
+        let res = extract_metadata("video.mp4", "video");
+        assert!(!res.is_valid);
+        assert!(res.error_message.is_some());
     }
 }

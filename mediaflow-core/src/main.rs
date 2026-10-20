@@ -3,9 +3,9 @@ mod metadata;
 mod renamer;
 mod scanner;
 
+use clap::{Parser, Subcommand};
 use std::io::{self, Read};
 use std::path::PathBuf;
-use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "mediaflow-core")]
@@ -32,7 +32,7 @@ enum Commands {
         exclude: Vec<String>,
 
         /// Include files with no extension
-        #[arg(long, default_value_t = true)]
+        #[arg(long)]
         include_no_ext: bool,
     },
 
