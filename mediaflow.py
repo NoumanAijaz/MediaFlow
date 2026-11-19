@@ -19,7 +19,7 @@ import math
 import logging
 import threading
 import weakref
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import cv2
 
@@ -347,8 +347,14 @@ def format_duration(total_seconds: float) -> str:
 def format_timestamp(ts: float) -> str:
     """Human date for table cells ('—' when unknown)."""
     try:
-        if ts and ts > 0:
-            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        if ts is not None:
+            ts_f = float(ts)
+            if math.isfinite(ts_f) and ts_f != 0.0:
+                try:
+                    dt = datetime.fromtimestamp(ts_f)
+                except (OSError, OverflowError, ValueError):
+                    dt = datetime.fromtimestamp(0) + timedelta(seconds=ts_f)
+                return dt.strftime("%Y-%m-%d %H:%M")
     except (OverflowError, OSError, ValueError, TypeError):
         pass
     return "—"
@@ -405,9 +411,21 @@ def parse_naming_format(filename: str, media_type: str = None) -> tuple[str | No
     return None, None
 
 
+def strip_extended_prefix(path: str) -> str:
+    """Strip Win32 extended-length prefixes (\\\\?\\ and \\\\?\\UNC\\)."""
+    if not path:
+        return ""
+    p = path.replace("/", "\\")
+    if p.upper().startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    elif p.startswith("\\\\?\\"):
+        return p[4:]
+    return path
+
+
 def _abs_path_key(path: str) -> str:
     """Absolute, case-insensitive-on-Windows key for path comparisons."""
-    return os.path.normcase(os.path.abspath(path))
+    return os.path.normcase(os.path.abspath(strip_extended_prefix(path)))
 
 
 def _same_file_path(path_a: str, path_b: str) -> bool:
@@ -422,7 +440,7 @@ def _same_file_path(path_a: str, path_b: str) -> bool:
     if not path_a or not path_b:
         return False
     try:
-        return os.path.samefile(path_a, path_b)
+        return os.path.samefile(strip_extended_prefix(path_a), strip_extended_prefix(path_b))
     except (OSError, ValueError):
         return _abs_path_key(path_a) == _abs_path_key(path_b)
 
@@ -452,6 +470,11 @@ def _split_target_for_suffix(target_display: str, ext: str) -> tuple[str, str]:
     ext = ext or ""
     if ext and target_display.lower().endswith(ext.lower()):
         return target_display[:-len(ext)], ext
+    _base, _candidate_ext = os.path.splitext(target_display)
+    if _candidate_ext and _candidate_ext.lower() in (
+        VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS | _SIDECAR_EXTS
+    ):
+        return _base, _candidate_ext
     return target_display, ""
 
 
@@ -578,17 +601,17 @@ def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> 
             
             if key == 'rating':
                 if val in ('unrated', 'none', '-', '—'):
-                    if rating not in ('', '-', '—'): return False
+                    if rating not in ('', '-', '—', 'unrated', 'none'): return False
                 elif ',' in val:
                     if rating not in [x.strip() for x in val.split(',')]: return False
-                elif val.startswith('>=') and val[2:].isdigit():
-                    if not rating.isdigit() or int(rating) < int(val[2:]): return False
-                elif val.startswith('>') and val[1:].isdigit():
-                    if not rating.isdigit() or int(rating) <= int(val[1:]): return False
-                elif val.startswith('<=') and val[2:].isdigit():
-                    if not rating.isdigit() or int(rating) > int(val[2:]): return False
-                elif val.startswith('<') and val[1:].isdigit():
-                    if not rating.isdigit() or int(rating) >= int(val[1:]): return False
+                elif val.startswith('>=') and val[2:].strip().isdigit():
+                    if not rating.isdigit() or int(rating) < int(val[2:].strip()): return False
+                elif val.startswith('>') and val[1:].strip().isdigit():
+                    if not rating.isdigit() or int(rating) <= int(val[1:].strip()): return False
+                elif val.startswith('<=') and val[2:].strip().isdigit():
+                    if not rating.isdigit() or int(rating) > int(val[2:].strip()): return False
+                elif val.startswith('<') and val[1:].strip().isdigit():
+                    if not rating.isdigit() or int(rating) >= int(val[1:].strip()): return False
                 else:
                     if rating != val: return False
             elif key in ['tag', 'tags', '-tag', '-tags']:
@@ -622,7 +645,9 @@ def matches_query(info: 'MediaInfo', query_str: str, preview_name: str = "") -> 
                 res_dims = f"{getattr(info, 'width', 0)}x{getattr(info, 'height', 0)}".lower()
                 res_dims_alt = f"{getattr(info, 'height', 0)}x{getattr(info, 'width', 0)}".lower()
                 val_clean = val.rstrip('p') if val.endswith('p') and val[:-1].isdigit() else val
-                if val not in res_tag and val not in res_dims and val not in res_dims_alt and val_clean not in res_tag and val_clean not in res_dims and val_clean not in res_dims_alt: return False
+                tag_match = (res_tag == 'k') if (val == 'k' or val_clean == 'k') else (val in res_tag or val_clean in res_tag)
+                dims_match = val in res_dims or val in res_dims_alt or val_clean in res_dims or val_clean in res_dims_alt
+                if not tag_match and not dims_match: return False
             elif key == 'type':
                 norm_val = {'videos': 'video', 'images': 'image', 'pdfs': 'pdf', 'audios': 'audio'}.get(val, val)
                 if norm_val != (getattr(info, 'media_type', '') or '').lower(): return False
@@ -654,8 +679,13 @@ def sanitize_folder_name(name: str) -> str:
     # Reserved device names break Windows even from non-Windows hosts (USB
     # drives) and even with an extension (CON.txt), so always guard the stem.
     clean = clean.rstrip(". ")
-    if clean.split('.')[0].upper() in _WIN_RESERVED_NAMES:
-        clean = f"{clean}_folder"
+    # The suffix has to go on the STEM: Windows treats any name whose part
+    # before the first dot is CON/PRN/AUX/NUL/COM1-9/LPT1-9 as a device name,
+    # extension included. Appending to the end of the whole name left
+    # "con.txt" as "con.txt_folder" — still reserved, still unusable.
+    stem, dot, rest = clean.partition('.')
+    if stem.upper() in _WIN_RESERVED_NAMES:
+        clean = f"{stem}_folder{dot}{rest}"
     if len(clean) > 100:
         clean = clean[:100].rstrip(". ")
     return clean or "Unknown"
@@ -855,6 +885,220 @@ def parse_ffprobe_json(data: dict) -> dict:
             parsed['audio'] = a_info
     return parsed
 
+
+def _extract_album_art_bytes(filepath: str) -> bytes | None:
+    """Extract raw album art image bytes from audio file tags or folder cover images."""
+    if not filepath or not os.path.isfile(filepath):
+        return None
+    try:
+        import mutagen
+        mfile = mutagen.File(filepath)
+        if mfile is not None:
+            # 1. ID3 tags (MP3, AIFF, TrueAudio, etc.)
+            if hasattr(mfile, 'tags') and mfile.tags:
+                for k in list(mfile.tags.keys()):
+                    if str(k).startswith('APIC'):
+                        apic = mfile.tags[k]
+                        if hasattr(apic, 'data') and apic.data:
+                            return bytes(apic.data)
+            # 2. FLAC / Ogg pictures list attribute
+            if hasattr(mfile, 'pictures') and mfile.pictures:
+                pic = mfile.pictures[0]
+                if hasattr(pic, 'data') and pic.data:
+                    return bytes(pic.data)
+            # 3. MP4 / M4A covr atom
+            if hasattr(mfile, 'tags') and mfile.tags and 'covr' in mfile.tags:
+                covr = mfile.tags['covr']
+                if covr and len(covr) > 0:
+                    return bytes(covr[0])
+            # 4. Vorbis comment metadata_block_picture or coverart in tags
+            if hasattr(mfile, 'tags') and mfile.tags:
+                if 'metadata_block_picture' in mfile.tags:
+                    mbp = mfile.tags['metadata_block_picture']
+                    if mbp and len(mbp) > 0:
+                        import base64
+                        try:
+                            from mutagen.flac import Picture
+                            raw = base64.b64decode(mbp[0])
+                            pic = Picture(raw)
+                            if hasattr(pic, 'data') and pic.data:
+                                return bytes(pic.data)
+                        except Exception:
+                            pass
+                if 'coverart' in mfile.tags:
+                    ca = mfile.tags['coverart']
+                    if ca and len(ca) > 0:
+                        import base64
+                        try:
+                            return base64.b64decode(ca[0])
+                        except Exception:
+                            pass
+    except Exception as e:
+        logger.debug("Failed extracting embedded art from %s: %s", filepath, e)
+
+    # 5. Fallback: folder artwork
+    try:
+        folder = os.path.dirname(os.path.abspath(filepath))
+        candidates = [
+            'cover.jpg', 'cover.jpeg', 'cover.png',
+            'folder.jpg', 'folder.jpeg', 'folder.png',
+            'album.jpg', 'album.jpeg', 'album.png',
+            'front.jpg', 'front.jpeg', 'front.png'
+        ]
+        for name in candidates:
+            target = os.path.join(folder, name)
+            if os.path.isfile(target):
+                with open(target, 'rb') as f:
+                    return f.read()
+    except Exception as e:
+        logger.debug("Failed checking folder art for %s: %s", filepath, e)
+
+    return None
+
+
+def _extract_album_art_image(filepath: str) -> QImage | None:
+    """Thread-safe album art extraction returning QImage (safe on worker threads)."""
+    data = _extract_album_art_bytes(filepath)
+    if data:
+        img = QImage()
+        if img.loadFromData(data) and not img.isNull():
+            return img
+    return None
+
+
+def _extract_album_art(filepath: str) -> QPixmap | None:
+    """Extract high-resolution album art as QPixmap (GUI thread only)."""
+    img = _extract_album_art_image(filepath)
+    if img is not None and not img.isNull():
+        return QPixmap.fromImage(img)
+    return None
+
+
+def _load_track_metadata(filepath: str) -> dict:
+    """Extract track metadata (title, artist, album, duration_ms) with clean fallbacks."""
+    fallback_title = os.path.splitext(os.path.basename(filepath))[0] if filepath else "Unknown Track"
+    folder_name = os.path.basename(os.path.dirname(os.path.abspath(filepath))) if filepath else ""
+    meta = {
+        'title': fallback_title,
+        'artist': 'Unknown Artist',
+        'album': folder_name or 'Unknown Album',
+        'duration_ms': 0
+    }
+    if not filepath or not os.path.isfile(filepath):
+        return meta
+    try:
+        import mutagen
+        m = mutagen.File(filepath, easy=True)
+        if m is not None:
+            if m.get('title'):
+                val = str(m['title'][0]).strip()
+                if val: meta['title'] = val
+            if m.get('artist'):
+                val = str(m['artist'][0]).strip()
+                if val: meta['artist'] = val
+            if m.get('album'):
+                val = str(m['album'][0]).strip()
+                if val: meta['album'] = val
+            if hasattr(m, 'info') and hasattr(m.info, 'length') and m.info.length:
+                meta['duration_ms'] = int(m.info.length * 1000)
+        else:
+            m_raw = mutagen.File(filepath)
+            if m_raw is not None and hasattr(m_raw, 'info') and hasattr(m_raw.info, 'length') and m_raw.info.length:
+                meta['duration_ms'] = int(m_raw.info.length * 1000)
+    except Exception as e:
+        logger.debug("Failed loading metadata for %s: %s", filepath, e)
+    return meta
+
+
+def _format_time_ms(ms: int) -> str:
+    """Format duration in milliseconds to mm:ss or hh:mm:ss string."""
+    if ms < 0: ms = 0
+    total_sec = int(ms // 1000)
+    minutes = total_sec // 60
+    seconds = total_sec % 60
+    if minutes >= 60:
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _rounded_pixmap(source: QPixmap | QImage, width: int, height: int, radius: int = 12) -> QPixmap:
+    """Scale source smoothly to width x height and apply rounded corner mask."""
+    if isinstance(source, QImage):
+        src_pixmap = QPixmap.fromImage(source)
+    else:
+        src_pixmap = source
+    if src_pixmap.isNull():
+        target = QPixmap(width, height)
+        target.fill(Qt.GlobalColor.transparent)
+        return target
+
+    scaled = src_pixmap.scaled(width, height, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    target = QPixmap(width, height)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
+    painter.setClipPath(path)
+    x = (width - scaled.width()) // 2
+    y = (height - scaled.height()) // 2
+    painter.drawPixmap(x, y, scaled)
+    painter.end()
+    return target
+
+
+def _create_fallback_art_pixmap(width: int, height: int, radius: int = 12) -> QPixmap:
+    """Generate a high-res vector art fallback with deep gradient and music note."""
+    pix = QPixmap(width, height)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
+    painter.setClipPath(path)
+
+    grad = QLinearGradient(0, 0, width, height)
+    grad.setColorAt(0.0, QColor("#1e1b4b"))
+    grad.setColorAt(0.5, QColor("#312e81"))
+    grad.setColorAt(1.0, QColor("#4338ca"))
+    painter.fillRect(QRect(0, 0, width, height), grad)
+
+    note_size = min(width, height) * 0.45
+    cx = width / 2.0
+    cy = height / 2.0
+    painter.save()
+    painter.translate(cx, cy)
+    scale_f = note_size / 24.0
+    painter.scale(scale_f, scale_f)
+    painter.translate(-12, -12)
+
+    note_color = QColor("#c4b5fd")
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(note_color))
+    painter.drawEllipse(QRectF(4, 13, 6, 5))
+    painter.drawEllipse(QRectF(14, 11, 6, 5))
+
+    stem_pen = QPen(note_color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    painter.setPen(stem_pen)
+    painter.drawLine(QPointF(9.5, 15), QPointF(9.5, 5))
+    painter.drawLine(QPointF(19.5, 13), QPointF(19.5, 3))
+
+    beam_path = QPainterPath()
+    beam_path.moveTo(9.5, 5)
+    beam_path.lineTo(19.5, 3)
+    beam_path.lineTo(19.5, 6.5)
+    beam_path.lineTo(9.5, 8.5)
+    beam_path.closeSubpath()
+    painter.setBrush(QBrush(note_color))
+    painter.drawPath(beam_path)
+    painter.restore()
+    painter.end()
+    return pix
+
+
 def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 120, height: int = 68) -> QImage | None:
     """Build a thumbnail as a QImage.
 
@@ -865,14 +1109,54 @@ def generate_thumbnail(filepath: str, media_type: str = 'video', width: int = 12
     try:
         if width <= 0 or height <= 0: return None
         if media_type == 'audio':
-            img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
-            img.fill(QColor("#1e1b4b"))
-            with QPainter(img) as painter:
+            art_img = _extract_album_art_image(filepath)
+            if art_img is not None and not art_img.isNull():
+                qimg_scaled = art_img.scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                canvas = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+                canvas.fill(QColor("#0f0c29"))
+                with QPainter(canvas) as painter:
+                    painter.drawImage((width - qimg_scaled.width()) // 2, (height - qimg_scaled.height()) // 2, qimg_scaled)
+                return canvas
+
+            # Fallback to a styled vector note on dark gradient if no art exists
+            canvas = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+            with QPainter(canvas) as painter:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-                painter.setFont(QFont(BASE_FONT_FAMILY, 14, QFont.Weight.Bold))
-                painter.setPen(QColor("#a78bfa"))
-                painter.drawText(QRect(0, 0, width, height), Qt.AlignmentFlag.AlignCenter, "AUDIO")
-            return img
+                grad = QLinearGradient(0, 0, width, height)
+                grad.setColorAt(0.0, QColor("#1e1b4b"))
+                grad.setColorAt(1.0, QColor("#312e81"))
+                painter.fillRect(QRect(0, 0, width, height), grad)
+
+                note_size = min(width, height) * 0.55
+                cx = width / 2.0
+                cy = height / 2.0
+                painter.save()
+                painter.translate(cx, cy)
+                scale_f = note_size / 24.0
+                painter.scale(scale_f, scale_f)
+                painter.translate(-12, -12)
+
+                note_color = QColor("#c4b5fd")
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(note_color))
+                painter.drawEllipse(QRectF(4, 13, 6, 5))
+                painter.drawEllipse(QRectF(14, 11, 6, 5))
+
+                stem_pen = QPen(note_color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+                painter.setPen(stem_pen)
+                painter.drawLine(QPointF(9.5, 15), QPointF(9.5, 5))
+                painter.drawLine(QPointF(19.5, 13), QPointF(19.5, 3))
+
+                beam_path = QPainterPath()
+                beam_path.moveTo(9.5, 5)
+                beam_path.lineTo(19.5, 3)
+                beam_path.lineTo(19.5, 6.5)
+                beam_path.lineTo(9.5, 8.5)
+                beam_path.closeSubpath()
+                painter.setBrush(QBrush(note_color))
+                painter.drawPath(beam_path)
+                painter.restore()
+            return canvas
         if media_type == 'pdf':
             img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
             img.fill(QColor("#1e1b4b"))
@@ -984,9 +1268,13 @@ def find_sidecars(filepath: str) -> list[str]:
     """Sibling subtitle/NFO files sharing this file's stem (plus optional
     language tags like movie.en.srt) — they follow the video on rename/move."""
     filepath = os.path.abspath(filepath)
-    base = os.path.splitext(filepath)[0]
+    all_exts = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
+    fext = os.path.splitext(filepath)[1].lower()
+    if fext in all_exts and filepath.lower().endswith(fext):
+        stem = os.path.basename(filepath[:-len(fext)])
+    else:
+        stem = os.path.basename(filepath)
     parent = os.path.dirname(filepath) or "."
-    stem = os.path.basename(base)
     low = stem.lower()
     found = []
     try:
@@ -1104,11 +1392,14 @@ def get_media_datetime(info) -> datetime | None:
     dt = None
     if getattr(info, 'media_type', '') == 'image':
         dt = _exif_datetime_original(info.filepath)
-    if dt is None and mtime > 0:
+    if dt is None and mtime != 0.0 and math.isfinite(mtime):
         try:
             dt = datetime.fromtimestamp(mtime)
         except (OverflowError, OSError, ValueError):
-            dt = None
+            try:
+                dt = datetime.fromtimestamp(0) + timedelta(seconds=mtime)
+            except (OverflowError, OSError, ValueError):
+                dt = None
     try:
         info._cached_datetime = (mtime, dt)
     except Exception:
@@ -1134,7 +1425,7 @@ def send_to_recycle_bin(path: str) -> bool:
                     ("lpszProgressTitle", LPCWSTR),
                 ]
 
-            path = os.path.abspath(path)
+            path = os.path.abspath(strip_extended_prefix(path))
             # NOTE: never prepend \\?\ here — SHFileOperationW does not support
             # extended-length paths and would delete long paths PERMANENTLY
             # (FOF_ALLOWUNDO ignored) while reporting success. Prefer send2trash
@@ -1214,7 +1505,8 @@ def _build_vector_icon(name: str, is_dark: bool, color_override: str = None) -> 
         color_hex = '#fbbf24' if is_dark else '#d97706'
     elif name in ['video', 'image', 'audio', 'star', 'save', 'plus', 'pdf', 'relocate',
                   'stats', 'watch', 'filter', 'duplicate', 'tag', 'columns', 'presets',
-                  'scissors', 'trim', 'info', 'prev', 'next', 'shuffle']:
+                  'scissors', 'trim', 'info', 'prev', 'next', 'shuffle', 'repeat',
+                  'repeat_one', 'popout']:
         color_hex = accent or ('#a78bfa' if is_dark else '#6366f1')
     else:
         color_hex = accent or ('#c4b5fd' if is_dark else '#4338ca')
@@ -1575,6 +1867,57 @@ def _build_vector_icon(name: str, is_dark: bool, color_override: str = None) -> 
             painter.drawLine(QPointF(15, 7), QPointF(20, 7))
             painter.drawLine(QPointF(17, 4), QPointF(20, 7))
             painter.drawLine(QPointF(17, 10), QPointF(20, 7))
+        elif name == 'repeat':
+            p1 = QPainterPath()
+            p1.moveTo(4, 12)
+            p1.lineTo(4, 8)
+            p1.quadTo(QPointF(4, 6), QPointF(6, 6))
+            p1.lineTo(19, 6)
+            painter.drawPath(p1)
+            painter.drawLine(QPointF(16, 3), QPointF(19.5, 6))
+            painter.drawLine(QPointF(16, 9), QPointF(19.5, 6))
+            p2 = QPainterPath()
+            p2.moveTo(20, 12)
+            p2.lineTo(20, 16)
+            p2.quadTo(QPointF(20, 18), QPointF(18, 18))
+            p2.lineTo(5, 18)
+            painter.drawPath(p2)
+            painter.drawLine(QPointF(8, 15), QPointF(4.5, 18))
+            painter.drawLine(QPointF(8, 21), QPointF(4.5, 18))
+        elif name == 'repeat_one':
+            p1 = QPainterPath()
+            p1.moveTo(4, 12)
+            p1.lineTo(4, 8)
+            p1.quadTo(QPointF(4, 6), QPointF(6, 6))
+            p1.lineTo(19, 6)
+            painter.drawPath(p1)
+            painter.drawLine(QPointF(16, 3), QPointF(19.5, 6))
+            painter.drawLine(QPointF(16, 9), QPointF(19.5, 6))
+            p2 = QPainterPath()
+            p2.moveTo(20, 12)
+            p2.lineTo(20, 16)
+            p2.quadTo(QPointF(20, 18), QPointF(18, 18))
+            p2.lineTo(5, 18)
+            painter.drawPath(p2)
+            painter.drawLine(QPointF(8, 15), QPointF(4.5, 18))
+            painter.drawLine(QPointF(8, 21), QPointF(4.5, 18))
+            painter.drawLine(QPointF(10.5, 10.5), QPointF(12, 9))
+            painter.drawLine(QPointF(12, 9), QPointF(12, 15))
+            painter.drawLine(QPointF(10.5, 15), QPointF(13.5, 15))
+        elif name == 'popout':
+            p = QPainterPath()
+            p.moveTo(14, 5)
+            p.lineTo(6, 5)
+            p.quadTo(QPointF(4, 5), QPointF(4, 7))
+            p.lineTo(4, 18)
+            p.quadTo(QPointF(4, 20), QPointF(6, 20))
+            p.lineTo(17, 20)
+            p.quadTo(QPointF(19, 20), QPointF(19, 18))
+            p.lineTo(19, 10)
+            painter.drawPath(p)
+            painter.drawLine(QPointF(11, 13), QPointF(20, 4))
+            painter.drawLine(QPointF(15, 4), QPointF(20, 4))
+            painter.drawLine(QPointF(20, 4), QPointF(20, 9))
         elif name == 'tag':
             path = QPainterPath()
             path.moveTo(4, 11)
@@ -3158,13 +3501,44 @@ class ScannerThread(QThread):
             pattern = pattern.lower().strip()
             if not pattern: continue
             if pattern.startswith('*') and pattern.endswith('*'):
-                if pattern[1:-1] in filename: return True
+                inner = pattern[1:-1]
+                if not inner or all(c == '*' for c in inner) or inner in filename: return True
             elif pattern.startswith('*'):
                 if filename.endswith(pattern[1:]): return True
             elif pattern.endswith('*'):
                 if filename.startswith(pattern[:-1]): return True
             elif pattern in filename: return True
         return False
+
+    def _collect_stale_cache_paths(self, cache, valid_exts, seen_norm_paths) -> list:
+        """Cache entries under the scanned dirs whose file is gone from disk.
+
+        Shared by both scan engines. Paths are compared in absolute form: the
+        Rust engine reports absolute paths (it abspaths the scan roots), the
+        Python fallback reports them relative to the CWD, and the cache is
+        shared between the two — comparing raw strings would purge entries the
+        current scan just wrote.
+        """
+        norm_dirs = []
+        for d in self.directories:
+            nd = os.path.normcase(os.path.abspath(os.path.normpath(d))).rstrip(os.sep) + os.sep
+            norm_dirs.append(nd)
+        seen = {os.path.normcase(os.path.abspath(os.path.normpath(p))) for p in seen_norm_paths}
+        stale = []
+        for cached_path in cache:
+            cached_norm = os.path.normcase(os.path.abspath(os.path.normpath(cached_path)))
+            cached_norm_dir = cached_norm + os.sep if not cached_norm.endswith(os.sep) else cached_norm
+            if not any(cached_norm_dir.startswith(nd) for nd in norm_dirs):
+                continue
+            if cached_norm in seen:
+                continue
+            cached_ext = os.path.splitext(cached_path)[1].lower()
+            if cached_ext not in valid_exts and cached_ext != '':
+                continue  # belongs to another media type's scan
+            if self._should_exclude(cached_path):
+                continue  # excluded files are invisible to this scan, keep their cache
+            stale.append(cached_path)
+        return stale
 
     @staticmethod
     def _process_scan_item(item, cache, force_full, media_type):
@@ -3209,7 +3583,7 @@ class ScannerThread(QThread):
     def run(self):
         try:
             try:
-                from rust_bridge import is_rust_core_available, scan_directories_rust
+                from rust_bridge import is_rust_core_available, scan_directories_rust, normalize_ipc_path
                 rust_avail = is_rust_core_available()
             except Exception:
                 rust_avail = False
@@ -3240,7 +3614,7 @@ class ScannerThread(QThread):
                             return
                         fpath = event.get('path')
                         if fpath:
-                            seen_norm_paths.add(os.path.normcase(os.path.normpath(fpath)))
+                            seen_norm_paths.add(normalize_ipc_path(fpath))
                         size = event.get('size', 0)
                         mtime = event.get('mtime', 0.0)
                         mtype = event.get('media_type', self.media_type)
@@ -3269,11 +3643,15 @@ class ScannerThread(QThread):
                         self.scan_complete.emit(0)
                         return
 
-                    if new_entries:
-                        try:
-                            update_metadata_cache(new_entries, not_before_ts=scan_started)
-                        except Exception as e:
-                            logger.warning("update_metadata_cache failed: %s", e)
+                    # Purge cache entries for files that no longer exist under
+                    # the scanned dirs. The Python fallback does this too;
+                    # without it the Rust engine (the default) let
+                    # scan_cache.json grow forever and re-wrote the whole file
+                    # on every scan.
+                    valid_exts = get_extensions_for_type(self.media_type)
+                    deleted_paths = self._collect_stale_cache_paths(cache, valid_exts, seen_norm_paths)
+                    if new_entries or deleted_paths:
+                        update_metadata_cache(new_entries, deleted_paths, not_before_ts=scan_started)
 
                     self.scan_complete.emit(total_emitted)
                     return
@@ -3282,11 +3660,7 @@ class ScannerThread(QThread):
 
             paths_with_stats = []
             self.status_update.emit("Scanning directories…")
-            if self.media_type == 'video': valid_exts = VIDEO_EXTENSIONS
-            elif self.media_type == 'audio': valid_exts = AUDIO_EXTENSIONS
-            elif self.media_type == 'image': valid_exts = IMAGE_EXTENSIONS
-            elif self.media_type == 'pdf': valid_exts = PDF_EXTENSIONS
-            else: valid_exts = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
+            valid_exts = get_extensions_for_type(self.media_type)
             
             for directory in self.directories:
                 if not os.path.isdir(directory): continue
@@ -3297,11 +3671,11 @@ class ScannerThread(QThread):
                     try:
                         for entry in os.scandir(current_dir):
                             if self.isInterruptionRequested(): self.scan_complete.emit(0); return
+                            if entry.name.startswith('.'):
+                                continue  # dotfiles and dotdirs (.git, .DS_Store, .venv) are never media
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=True):
-                                if entry.name.startswith('.'):
-                                    continue  # dotfiles (.DS_Store, .gitignore) are never media
                                 ext = os.path.splitext(entry.name)[1].lower()
                                 # Include files without extensions as requested
                                 if ext in valid_exts or ext == '':
@@ -3383,20 +3757,7 @@ class ScannerThread(QThread):
             #      on every visit to the other tabs.
             #   2. Timestamp filter (not_before_ts) — entries a NEWER scan wrote
             #      after this run started are preserved.
-            norm_dirs = [os.path.normcase(os.path.normpath(d)).rstrip(os.sep) + os.sep for d in self.directories]
-            deleted_paths = []
-            for cached_path in cache:
-                cached_norm = os.path.normcase(os.path.normpath(cached_path))
-                cached_norm_dir = cached_norm + os.sep if not cached_norm.endswith(os.sep) else cached_norm
-                is_under_scanned = any(cached_norm_dir.startswith(nd) for nd in norm_dirs)
-                if not is_under_scanned or cached_norm in seen_norm_paths:
-                    continue
-                cached_ext = os.path.splitext(cached_path)[1].lower()
-                if cached_ext not in valid_exts and cached_ext != '':
-                    continue  # belongs to another media type's scan
-                if self._should_exclude(cached_path):
-                    continue  # excluded files are invisible to this scan, keep their cache
-                deleted_paths.append(cached_path)
+            deleted_paths = self._collect_stale_cache_paths(cache, valid_exts, seen_norm_paths)
 
             if new_entries or deleted_paths:
                 update_metadata_cache(new_entries, deleted_paths, not_before_ts=scan_started)
@@ -4049,6 +4410,10 @@ class TrimExportWorker(QThread):
             try:
                 p.terminate()
                 p.kill()
+                try:
+                    p.wait(timeout=2)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -4071,6 +4436,7 @@ class TrimExportWorker(QThread):
             self.trim_finished.emit(False, "", "Output filename must not start with '-'.")
             return
         src = os.path.abspath(self.filepath)
+        out_ext = os.path.splitext(out_abs)[1].lower()
         if self.cut_mode == 'fast':
             # Stream copy: instant, but cuts snap to the nearest keyframe
             cmd = [
@@ -4081,22 +4447,31 @@ class TrimExportWorker(QThread):
                 "-i", src,
                 "-c", "copy",
                 "-avoid_negative_ts", "make_zero",
-                os.path.abspath(self.output_path)
+                out_abs
             ]
         else:
             # Precise (default): fast input-side seek + veryfast re-encode —
             # the clip starts exactly on the previewed IN point instead of the
-            # preceding keyframe. Re-encode audio to AAC to guarantee A/V sync.
+            # preceding keyframe. Re-encode audio to AAC (or libopus for WebM) to guarantee A/V sync.
+            if out_ext == '.webm':
+                codec_args = [
+                    "-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0",
+                    "-c:a", "libopus", "-b:a", "128k",
+                ]
+            else:
+                codec_args = [
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "192k",
+                ]
             cmd = [
                 ffmpeg_cmd,
                 "-y",
                 "-ss", f"{self.in_sec:.3f}",
                 "-to", f"{self.out_sec:.3f}",
                 "-i", src,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                "-c:a", "aac", "-b:a", "192k",
+                *codec_args,
                 "-avoid_negative_ts", "make_zero",
-                os.path.abspath(self.output_path)
+                out_abs
             ]
 
         startupinfo = None
@@ -4113,11 +4488,21 @@ class TrimExportWorker(QThread):
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace', startupinfo=startupinfo, creationflags=creationflags)
             stdout, stderr = self._proc.communicate()
             if self._cancelled:
+                if os.path.exists(self.output_path):
+                    try:
+                        os.remove(self.output_path)
+                    except OSError:
+                        pass
                 self.trim_finished.emit(False, "", "Trim export was cancelled.")
                 return
             if self._proc.returncode == 0 and os.path.exists(self.output_path) and os.path.getsize(self.output_path) > 0:
                 self.trim_finished.emit(True, self.output_path, "")
             else:
+                if os.path.exists(self.output_path):
+                    try:
+                        os.remove(self.output_path)
+                    except OSError:
+                        pass
                 err = stderr or "FFmpeg failed with unknown error."
                 self.trim_finished.emit(False, "", err)
         except Exception as e:
@@ -4349,7 +4734,7 @@ class QuickTrimDialog(QDialog):
                 if secs is None or mins >= 60: return None
                 return (mins * 60 + secs) * 1000 + ms
             elif len(parts) == 1:
-                secs, ms = self._parse_secs_ms(parts[0])
+                secs, ms = self._parse_secs_ms(parts[0], allow_over_60=True)
                 if secs is None: return None
                 return secs * 1000 + ms
         except Exception as e:
@@ -4357,15 +4742,15 @@ class QuickTrimDialog(QDialog):
         return None
 
     @staticmethod
-    def _parse_secs_ms(secs_s: str) -> tuple[int | None, int]:
-        """Parse 'SS[.mmm]' — exactly zero or one dot, digits only, secs < 60."""
+    def _parse_secs_ms(secs_s: str, allow_over_60: bool = False) -> tuple[int | None, int]:
+        """Parse 'SS[.mmm]' — exactly zero or one dot, digits only, secs < 60 unless allow_over_60."""
         if secs_s.count('.') > 1:
             return None, 0
         secs_parts = secs_s.split('.')
         if not secs_parts[0].isdigit():
             return None, 0
         secs = int(secs_parts[0])
-        if secs >= 60:
+        if not allow_over_60 and secs >= 60:
             return None, 0
         ms = 0
         if len(secs_parts) > 1:
@@ -4498,7 +4883,7 @@ class QuickTrimDialog(QDialog):
             QMessageBox.warning(self, "Invalid Output", "Please specify an output file path.")
             return
 
-        if os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(os.path.abspath(self.filepath)):
+        if _same_file_path(output_path, self.filepath):
             QMessageBox.warning(self, "Invalid Output", "Output file cannot be the same as the original input file.")
             return
 
@@ -4608,8 +4993,8 @@ class QuickTrimDialog(QDialog):
     def done(self, result):
         # accept()/reject() funnel through here; release before hiding
         self._release_player()
-        # If the export worker is still running when the dialog closes, drop its
-        # late result instead of popping dialogs/toasts on a hidden window.
+        # If the export worker is still running when the dialog closes, cancel it
+        # and drop its late result instead of popping dialogs/toasts on a hidden window.
         worker = getattr(self, 'worker', None)
         try:
             is_running = worker is not None and worker.isRunning()
@@ -4617,10 +5002,24 @@ class QuickTrimDialog(QDialog):
             is_running = False
         if is_running:
             self._suppress_export_result = True
+            try:
+                worker.cancel()
+            except Exception:
+                pass
         super().done(result)
 
     def closeEvent(self, event):
         self._release_player()
+        worker = getattr(self, 'worker', None)
+        try:
+            if worker is not None and worker.isRunning():
+                self._suppress_export_result = True
+                try:
+                    worker.cancel()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
@@ -5434,6 +5833,40 @@ class DoubleClickVideoWidget(QVideoWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.installEventFilter(self)
+        self._track_child_widgets()
+
+    def _track_child_widgets(self):
+        for child in self.findChildren(QWidget):
+            try:
+                child.setMouseTracking(True)
+                child.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+                child.installEventFilter(self)
+            except Exception:
+                pass
+
+    def childEvent(self, event):
+        super().childEvent(event)
+        try:
+            if event.type() == QEvent.Type.ChildAdded and isinstance(event.child(), QWidget):
+                child = event.child()
+                child.setMouseTracking(True)
+                child.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+                child.installEventFilter(self)
+        except Exception:
+            pass
+
+    def eventFilter(self, watched, event):
+        try:
+            if event.type() in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
+                self.mouse_moved.emit()
+            elif event.type() == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.double_clicked.emit()
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
 
     def mouseDoubleClickEvent(self, event):
         super().mouseDoubleClickEvent(event)
@@ -5624,15 +6057,15 @@ class ImageDisplayWidget(QWidget):
 class NativeImagePlayerWindow(QMainWindow):
     def __init__(self, filepath, parent=None):
         super().__init__(parent)
-        self.filepath = filepath
-        self.setWindowTitle(f"MediaFlow Image Viewer — {os.path.basename(filepath)}")
+        self.filepath = os.path.abspath(filepath)
+        self.setWindowTitle(f"MediaFlow Image Viewer — {os.path.basename(self.filepath)}")
         self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
         is_dark = getattr(parent, 'current_theme', 'dark') == 'dark' if parent else True
 
         # Load image respecting EXIF orientation tags and magic bytes
-        self._orig_pixmap = load_image_pixmap(filepath)
+        self._orig_pixmap = load_image_pixmap(self.filepath)
 
         # Smart initial window sizing matching image aspect ratio
         init_w, init_h = 800, 600
@@ -5738,71 +6171,322 @@ class NativeImagePlayerWindow(QMainWindow):
         super().closeEvent(event)
 
 class NativeAudioPlayerWindow(QMainWindow):
-    def __init__(self, filepath, parent=None):
-        super().__init__(parent)
-        self.filepath = filepath
-        self.setWindowTitle(f"MediaFlow Audio Player — {os.path.basename(filepath)}")
-        self.resize(450, 160)
+    def __init__(self, filepath_or_pool, parent=None, initial_file: str = None, start_position_ms: int = 0):
+        super().__init__(None)
+        self.parent_window = parent
         self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        
-        is_dark = getattr(parent, 'current_theme', 'dark') == 'dark' if parent else True
-        
+
+        if isinstance(filepath_or_pool, (list, tuple)):
+            self.playlist = [os.path.abspath(f) for f in filepath_or_pool if f]
+            target = os.path.abspath(initial_file) if initial_file else (self.playlist[0] if self.playlist else "")
+            self.current_index = self.playlist.index(target) if target in self.playlist else 0
+            self.filepath = self.playlist[self.current_index] if self.playlist else ""
+        else:
+            self.filepath = os.path.abspath(filepath_or_pool) if filepath_or_pool else ""
+            self.playlist = [self.filepath] if self.filepath else []
+            self.current_index = 0
+            p = parent
+            infos = getattr(p, 'media_infos', None)
+            if not infos and hasattr(p, 'audio_tab'):
+                infos = getattr(p.audio_tab, 'media_infos', None)
+            if infos:
+                pool = [os.path.abspath(info.filepath) for info in infos
+                        if (getattr(info, 'media_type', '') == 'audio' or
+                            info.filepath.lower().endswith(tuple(AUDIO_EXTENSIONS)))]
+                if pool:
+                    if self.filepath in pool:
+                        self.playlist = pool
+                        self.current_index = pool.index(self.filepath)
+                    else:
+                        self.playlist = [self.filepath] + [f for f in pool if f != self.filepath]
+                        self.current_index = 0
+
+        self.start_position_ms = start_position_ms
+        self.shuffle_mode = False
+        self.repeat_mode = "off"
+
+        main_win = parent.window() if parent else self.window()
+        self.is_dark = getattr(main_win, 'current_theme', 'dark') == 'dark' if main_win else True
+
+        self.setWindowTitle("MediaFlow Audio Player")
+        self.resize(520, 440)
+        self.setMinimumSize(480, 420)
+
+        self._build_ui()
+        self._apply_styling()
+
+        if self.filepath:
+            self.load_track(self.filepath, start_pos_ms=self.start_position_ms, auto_play=True)
+
+    def _build_ui(self):
         central = QWidget(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-        
-        self.player = QMediaPlayer(self)
-        self.audio_output = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio_output)
-        
-        title_lbl = QLabel(os.path.basename(filepath), self)
-        title_lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
-        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title_lbl)
-        
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(10)
+
+        # 1. Album Art 280x280 centered
+        self.art_label = QLabel(self)
+        self.art_label.setFixedSize(280, 280)
+        self.art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.art_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.art_label.mousePressEvent = lambda e: self._toggle_playback() if e.button() == Qt.MouseButton.LeftButton else None
+
+        shadow = QGraphicsDropShadowEffect(self.art_label)
+        shadow.setBlurRadius(28)
+        shadow.setColor(QColor(0, 0, 0, 140 if self.is_dark else 70))
+        shadow.setOffset(0, 6)
+        self.art_label.setGraphicsEffect(shadow)
+        layout.addWidget(self.art_label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # 2. Metadata (Title + Subtitle)
+        self.title_lbl = QLabel(self)
+        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_lbl.setStyleSheet("font-size: 15px; font-weight: bold;")
+        self.title_lbl.setWordWrap(True)
+        layout.addWidget(self.title_lbl)
+
+        self.subtitle_lbl = QLabel(self)
+        self.subtitle_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.subtitle_lbl.setStyleSheet(f"font-size: 12px; color: {'#9ca3af' if self.is_dark else '#6b7280'};")
+        layout.addWidget(self.subtitle_lbl)
+
+        # 3. Timeline Slider with Elapsed/Total Time
+        timeline_row = QHBoxLayout()
+        timeline_row.setSpacing(8)
+        self.lbl_elapsed = QLabel("00:00", self)
+        self.lbl_elapsed.setStyleSheet(f"font-size: 11px; font-family: monospace; color: {'#9ca3af' if self.is_dark else '#6b7280'};")
+        self.lbl_total = QLabel("00:00", self)
+        self.lbl_total.setStyleSheet(f"font-size: 11px; font-family: monospace; color: {'#9ca3af' if self.is_dark else '#6b7280'};")
+
         self.slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self)
         self.slider.setRange(0, 1000)
         self.slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Single seek path: sliderMoved AND valueChanged+isSliderDown both fired
-        # per drag pixel (2x setPosition). valueChanged alone covers both.
         self.slider.valueChanged.connect(self._on_slider_value_changed)
-        layout.addWidget(self.slider)
-        
+
+        timeline_row.addWidget(self.lbl_elapsed)
+        timeline_row.addWidget(self.slider, 1)
+        timeline_row.addWidget(self.lbl_total)
+        layout.addLayout(timeline_row)
+
+        # 4. Transport Controls Row
         btn_row = QHBoxLayout()
-        self.btn_play = QPushButton("Play", self)
+        btn_row.setSpacing(8)
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_shuffle = QPushButton(self)
+        self.btn_shuffle.setFixedSize(32, 32)
+        self.btn_shuffle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark))
+        self.btn_shuffle.setToolTip("Shuffle: Off (S)")
+        self.btn_shuffle.clicked.connect(self.toggle_shuffle)
+        btn_row.addWidget(self.btn_shuffle)
+
+        self.btn_prev = QPushButton(self)
+        self.btn_prev.setFixedSize(32, 32)
+        self.btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prev.setIcon(get_vector_icon('prev', self.is_dark))
+        self.btn_prev.setToolTip("Previous Track (P / PageUp)")
+        self.btn_prev.clicked.connect(self.play_prev)
+        btn_row.addWidget(self.btn_prev)
+
+        self.btn_rw10 = QPushButton("-10s", self)
+        self.btn_rw10.setFixedSize(38, 32)
+        self.btn_rw10.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rw10.setToolTip("Rewind 10s (Left / [)")
+        self.btn_rw10.clicked.connect(lambda: self.seek_relative(-10000))
+        btn_row.addWidget(self.btn_rw10)
+
+        self.btn_play = QPushButton(self)
+        self.btn_play.setObjectName("btnPlayAudio")
+        self.btn_play.setFixedSize(40, 40)
         self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play.setIcon(get_vector_icon('play', self.is_dark))
+        self.btn_play.setIconSize(QSize(22, 22))
+        self.btn_play.setToolTip("Play / Pause (Space)")
         self.btn_play.clicked.connect(self._toggle_playback)
-        self.btn_mute = QPushButton("Mute", self)
-        self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_mute.clicked.connect(self._toggle_mute)
-        
         btn_row.addWidget(self.btn_play)
-        btn_row.addWidget(self.btn_mute)
+
+        self.btn_ff10 = QPushButton("+10s", self)
+        self.btn_ff10.setFixedSize(38, 32)
+        self.btn_ff10.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ff10.setToolTip("Forward 10s (Right / ])")
+        self.btn_ff10.clicked.connect(lambda: self.seek_relative(10000))
+        btn_row.addWidget(self.btn_ff10)
+
+        self.btn_next = QPushButton(self)
+        self.btn_next.setFixedSize(32, 32)
+        self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_next.setIcon(get_vector_icon('next', self.is_dark))
+        self.btn_next.setToolTip("Next Track (N / PageDown)")
+        self.btn_next.clicked.connect(self.play_next)
+        btn_row.addWidget(self.btn_next)
+
+        self.btn_repeat = QPushButton(self)
+        self.btn_repeat.setFixedSize(32, 32)
+        self.btn_repeat.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark))
+        self.btn_repeat.setToolTip("Repeat: Off (L)")
+        self.btn_repeat.clicked.connect(self.cycle_repeat)
+        btn_row.addWidget(self.btn_repeat)
+
         layout.addLayout(btn_row)
-        
+
+        # 5. Volume Row
+        vol_row = QHBoxLayout()
+        vol_row.setSpacing(8)
+        vol_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_mute = QPushButton(self)
+        self.btn_mute.setFixedSize(28, 28)
+        self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mute.setIcon(get_vector_icon('unmute', self.is_dark))
+        self.btn_mute.setToolTip("Mute / Unmute (M)")
+        self.btn_mute.clicked.connect(self._toggle_mute)
+        vol_row.addWidget(self.btn_mute)
+
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(110)
+        self.vol_slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+        vol_row.addWidget(self.vol_slider)
+
+        self.lbl_volume = QLabel("100%", self)
+        self.lbl_volume.setFixedWidth(36)
+        self.lbl_volume.setStyleSheet(f"font-size: 11px; color: {'#9ca3af' if self.is_dark else '#6b7280'};")
+        vol_row.addWidget(self.lbl_volume)
+
+        layout.addLayout(vol_row)
+
+        # Player setup
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
         self.player.positionChanged.connect(self._position_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
         self.player.playbackStateChanged.connect(lambda state: self._update_play_button_text())
-        self.player.setSource(QUrl.fromLocalFile(filepath))
-        self.player.play()
-        self._update_play_button_text()
-        
-        if is_dark:
-            self.setStyleSheet("""
-                QMainWindow { background-color: #0f0c29; }
-                QLabel { color: #f3f4f6; }
-                QPushButton { background-color: #312e81; color: #f3f4f6; border: 1px solid #4f46e5; border-radius: 4px; padding: 6px 12px; }
-                QPushButton:hover { background-color: #4338ca; }
-            """)
+        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+
+    def load_track(self, filepath: str, start_pos_ms: int = 0, auto_play: bool = True):
+        self.filepath = os.path.abspath(filepath)
+        meta = _load_track_metadata(self.filepath)
+        self.setWindowTitle(f"MediaFlow Audio Player — {meta['title']}")
+        self.title_lbl.setText(meta['title'])
+        self.title_lbl.setToolTip(meta['title'])
+        self.subtitle_lbl.setText(f"{meta['artist']} • {meta['album']}")
+        self.subtitle_lbl.setToolTip(f"{meta['artist']} • {meta['album']}")
+
+        art = _extract_album_art(self.filepath)
+        if art is None:
+            art = _create_fallback_art_pixmap(280, 280, radius=14)
         else:
-            self.setStyleSheet("""
-                QMainWindow { background-color: #f1f5f9; }
-                QLabel { color: #1e293b; }
-                QPushButton { background-color: #e2e8f0; color: #1e293b; border: 1px solid #cbd5e1; border-radius: 4px; padding: 6px 12px; }
-                QPushButton:hover { background-color: #cbd5e1; }
-            """)
+            art = _rounded_pixmap(art, 280, 280, radius=14)
+        self.art_label.setPixmap(art)
+
+        self.player.setSource(QUrl.fromLocalFile(self.filepath))
+        if start_pos_ms > 0:
+            self.player.setPosition(start_pos_ms)
+        if auto_play:
+            self.player.play()
+        self._update_play_button_text()
+
+    def play_next(self):
+        if not self.playlist: return
+        if self.shuffle_mode:
+            import random
+            if len(self.playlist) > 1:
+                choices = [i for i in range(len(self.playlist)) if i != self.current_index]
+                self.current_index = random.choice(choices)
+            else:
+                self.current_index = 0
+        else:
+            if self.current_index + 1 < len(self.playlist):
+                self.current_index += 1
+            elif self.repeat_mode == 'all':
+                self.current_index = 0
+            else:
+                self.player.stop()
+                self._update_play_button_text()
+                return
+        self.load_track(self.playlist[self.current_index])
+
+    def play_prev(self):
+        if self.player.position() > 3000:
+            self.player.setPosition(0)
+            return
+        if not self.playlist: return
+        if self.current_index > 0:
+            self.current_index -= 1
+        elif self.repeat_mode == 'all':
+            self.current_index = len(self.playlist) - 1
+        else:
+            self.current_index = 0
+        self.load_track(self.playlist[self.current_index])
+
+    def seek_relative(self, ms: int):
+        cur = self.player.position()
+        dur = self.player.duration()
+        target = max(0, cur + ms)
+        if dur > 0: target = min(dur, target)
+        self.player.setPosition(target)
+
+    def toggle_shuffle(self):
+        self.shuffle_mode = not self.shuffle_mode
+        self._update_button_visuals()
+
+    def cycle_repeat(self):
+        order = ['off', 'all', 'one']
+        idx = order.index(self.repeat_mode)
+        self.repeat_mode = order[(idx + 1) % len(order)]
+        self._update_button_visuals()
+
+    def _update_button_visuals(self):
+        accent = ('#a78bfa' if self.is_dark else '#6366f1')
+        if self.repeat_mode == 'one':
+            self.btn_repeat.setIcon(get_vector_icon('repeat_one', self.is_dark, color_override=accent))
+            self.btn_repeat.setToolTip("Repeat: One (L)")
+            self.btn_repeat.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        elif self.repeat_mode == 'all':
+            self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark, color_override=accent))
+            self.btn_repeat.setToolTip("Repeat: All (L)")
+            self.btn_repeat.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        else:
+            self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark))
+            self.btn_repeat.setToolTip("Repeat: Off (L)")
+            self.btn_repeat.setStyleSheet("")
+
+        if self.shuffle_mode:
+            self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark, color_override=accent))
+            self.btn_shuffle.setToolTip("Shuffle: On (S)")
+            self.btn_shuffle.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        else:
+            self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark))
+            self.btn_shuffle.setToolTip("Shuffle: Off (S)")
+            self.btn_shuffle.setStyleSheet("")
+
+    def _on_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.repeat_mode == 'one':
+                self.player.setPosition(0)
+                self.player.play()
+            else:
+                self.play_next()
+
+    def _on_volume_changed(self, val: int):
+        vol = max(0.0, min(1.0, val / 100.0))
+        self.audio_output.setVolume(vol)
+        self.lbl_volume.setText(f"{val}%")
+        if val > 0 and self.audio_output.isMuted():
+            self.audio_output.setMuted(False)
+            self.btn_mute.setIcon(get_vector_icon('unmute', self.is_dark))
+
+    def _toggle_mute(self):
+        muted = not self.audio_output.isMuted()
+        self.audio_output.setMuted(muted)
+        self.btn_mute.setIcon(get_vector_icon('mute' if muted else 'unmute', self.is_dark))
 
     def _toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -5813,12 +6497,7 @@ class NativeAudioPlayerWindow(QMainWindow):
 
     def _update_play_button_text(self):
         playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
-        self.btn_play.setText("Pause" if playing else "Play")
-
-    def _toggle_mute(self):
-        muted = not self.audio_output.isMuted()
-        self.audio_output.setMuted(muted)
-        self.btn_mute.setText("Unmute" if muted else "Mute")
+        self.btn_play.setIcon(get_vector_icon('pause' if playing else 'play', self.is_dark))
 
     def _position_changed(self, position):
         if not self.slider.isSliderDown():
@@ -5828,46 +6507,88 @@ class NativeAudioPlayerWindow(QMainWindow):
                 self.slider.blockSignals(True)
                 self.slider.setValue(val)
                 self.slider.blockSignals(False)
+            self.lbl_elapsed.setText(_format_time_ms(position))
+
+    def _on_duration_changed(self, duration):
+        self.lbl_total.setText(_format_time_ms(duration))
 
     def _set_position(self, value):
         duration = self.player.duration()
         if duration > 0:
             pos = int((value / 1000) * duration)
             self.player.setPosition(pos)
+            self.lbl_elapsed.setText(_format_time_ms(pos))
 
     def _on_slider_value_changed(self, value):
         if self.slider.isSliderDown():
             self._set_position(value)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Space:
+        key = event.key()
+        if key == Qt.Key.Key_Space:
             self._toggle_playback()
-        elif event.key() == Qt.Key.Key_M:
+        elif key in (Qt.Key.Key_P, Qt.Key.Key_PageUp):
+            self.play_prev()
+        elif key in (Qt.Key.Key_N, Qt.Key.Key_PageDown):
+            self.play_next()
+        elif key in (Qt.Key.Key_Left, Qt.Key.Key_BracketLeft):
+            step = 10000 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 5000
+            self.seek_relative(-step)
+        elif key in (Qt.Key.Key_Right, Qt.Key.Key_BracketRight):
+            step = 10000 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 5000
+            self.seek_relative(step)
+        elif key == Qt.Key.Key_Up:
+            self.vol_slider.setValue(min(100, self.vol_slider.value() + 5))
+        elif key == Qt.Key.Key_Down:
+            self.vol_slider.setValue(max(0, self.vol_slider.value() - 5))
+        elif key == Qt.Key.Key_M:
             self._toggle_mute()
-        elif event.key() == Qt.Key.Key_Left:
-            new_pos = max(0, self.player.position() - 5000)
-            self.player.setPosition(new_pos)
-        elif event.key() == Qt.Key.Key_Right:
-            dur = self.player.duration()
-            new_pos = min(dur, self.player.position() + 5000) if dur > 0 else self.player.position() + 5000
-            self.player.setPosition(new_pos)
-        elif event.key() == Qt.Key.Key_Up:
-            vol = min(1.0, self.audio_output.volume() + 0.05)
-            self.audio_output.setVolume(vol)
-        elif event.key() == Qt.Key.Key_Down:
-            vol = max(0.0, self.audio_output.volume() - 0.05)
-            self.audio_output.setVolume(vol)
-        elif event.key() == Qt.Key.Key_Escape:
+        elif key == Qt.Key.Key_S:
+            self.toggle_shuffle()
+        elif key == Qt.Key.Key_L:
+            self.cycle_repeat()
+        elif key == Qt.Key.Key_Escape:
             self.close()
         else:
             super().keyPressEvent(event)
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
-        is_dark = getattr(self.parent(), 'current_theme', 'dark') == 'dark' if self.parent() else True
+        is_dark = self.is_dark
         act_folder = menu.addAction(get_vector_icon('folder', is_dark), "Open Containing Folder")
         act_folder.triggered.connect(self._open_containing_folder)
+
+        act_tag = menu.addAction(get_vector_icon('edit', is_dark), "Edit Audio Tags")
+        act_tag.triggered.connect(self._edit_audio_tags)
+
+        act_copy = menu.addAction(get_vector_icon('duplicate', is_dark), "Copy File Path")
+        act_copy.triggered.connect(self._copy_filepath)
+
+        act_info = menu.addAction(get_vector_icon('info', is_dark), "Detailed Media Info")
+        act_info.triggered.connect(self._show_detailed_info)
+
         menu.exec(event.globalPos())
+
+    def _edit_audio_tags(self):
+        if hasattr(self, 'filepath') and self.filepath:
+            try:
+                dlg = AudioTagEditorDialog(self.filepath, self)
+                dlg.exec()
+                self.load_track(self.filepath, start_pos_ms=self.player.position(), auto_play=self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+            except Exception as e:
+                logger.debug("Failed opening tag editor: %s", e)
+
+    def _copy_filepath(self):
+        if hasattr(self, 'filepath') and self.filepath:
+            QApplication.clipboard().setText(self.filepath)
+
+    def _show_detailed_info(self):
+        if hasattr(self, 'filepath') and self.filepath:
+            try:
+                dlg = DetailedInfoDialog(self.filepath, parent=self)
+                dlg.exec()
+            except Exception as e:
+                logger.debug("Failed opening detailed info: %s", e)
 
     def _open_containing_folder(self):
         if hasattr(self, 'filepath') and self.filepath:
@@ -5895,6 +6616,88 @@ class NativeAudioPlayerWindow(QMainWindow):
                 if os.path.isdir(norm_folder):
                     subprocess.Popen(["xdg-open", norm_folder])
 
+    def _apply_styling(self):
+        if self.is_dark:
+            self.setStyleSheet("""
+                QMainWindow { background-color: #0b091a; }
+                QLabel { color: #f3f4f6; }
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.05);
+                    color: #f3f4f6;
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    border-radius: 6px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 255, 255, 0.14);
+                    border-color: #a78bfa;
+                }
+                QPushButton#btnPlayAudio {
+                    background-color: #6366f1;
+                    border: 1px solid #818cf8;
+                    border-radius: 20px;
+                }
+                QPushButton#btnPlayAudio:hover {
+                    background-color: #4f46e5;
+                }
+                QSlider::groove:horizontal {
+                    height: 5px;
+                    background: #27273a;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #a78bfa;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    width: 12px;
+                    margin-top: -4px;
+                    margin-bottom: -4px;
+                    border-radius: 6px;
+                    background: #ffffff;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                QMainWindow { background-color: #f8fafc; }
+                QLabel { color: #0f172a; }
+                QPushButton {
+                    background-color: #ffffff;
+                    color: #1e293b;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 6px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #e2e8f0;
+                    border-color: #6366f1;
+                }
+                QPushButton#btnPlayAudio {
+                    background-color: #6366f1;
+                    border: 1px solid #4f46e5;
+                    border-radius: 20px;
+                }
+                QPushButton#btnPlayAudio:hover {
+                    background-color: #4f46e5;
+                }
+                QSlider::groove:horizontal {
+                    height: 5px;
+                    background: #e2e8f0;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #6366f1;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    width: 12px;
+                    margin-top: -4px;
+                    margin-bottom: -4px;
+                    border-radius: 6px;
+                    background: #4338ca;
+                }
+            """)
+
     def closeEvent(self, event):
         self.player.stop()
         self.player.setSource(QUrl())
@@ -5904,22 +6707,583 @@ class NativeAudioPlayerWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+
+class AudioPlayerBar(QFrame):
+    """Modern persistent Now Playing dock bar at the bottom of the Audio MediaTab."""
+    def __init__(self, media_tab, parent=None):
+        super().__init__(parent or media_tab)
+        self.media_tab = media_tab
+        self.setObjectName("audioPlayerBar")
+        self.current_row = -1
+        self.current_filepath = ""
+        self.shuffle_mode = False
+        self.repeat_mode = "off"
+
+        main_win = self.media_tab.window()
+        self.is_dark = getattr(main_win, 'current_theme', 'dark') == 'dark' if main_win else True
+
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio_output)
+        self.player.positionChanged.connect(self._position_changed)
+        self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.playbackStateChanged.connect(lambda state: self._update_play_button_text())
+        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+
+        self._build_ui()
+        self.update_theme(self.is_dark)
+
+    def _build_ui(self):
+        bar_layout = QHBoxLayout(self)
+        bar_layout.setContentsMargins(16, 6, 16, 6)
+        bar_layout.setSpacing(16)
+
+        # 1. Left Group (48x48 art + metadata)
+        left_widget = QWidget(self)
+        left_layout = QHBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+
+        self.art_label = QLabel(left_widget)
+        self.art_label.setFixedSize(48, 48)
+        self.art_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.art_label.setPixmap(_create_fallback_art_pixmap(48, 48, radius=6))
+        left_layout.addWidget(self.art_label)
+
+        meta_col = QVBoxLayout()
+        meta_col.setContentsMargins(0, 0, 0, 0)
+        meta_col.setSpacing(2)
+        meta_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.title_lbl = QLabel("No track playing", left_widget)
+        self.title_lbl.setStyleSheet("font-size: 13px; font-weight: bold;")
+        self.title_lbl.setMaximumWidth(240)
+        meta_col.addWidget(self.title_lbl)
+
+        self.subtitle_lbl = QLabel("Double-click a track to play", left_widget)
+        self.subtitle_lbl.setMaximumWidth(240)
+        meta_col.addWidget(self.subtitle_lbl)
+
+        left_layout.addLayout(meta_col)
+        left_widget.setFixedWidth(280)
+        bar_layout.addWidget(left_widget)
+
+        # 2. Center Group (Transport + Timeline)
+        center_widget = QWidget(self)
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(3)
+        center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_shuffle = QPushButton(self)
+        self.btn_shuffle.setFixedSize(28, 28)
+        self.btn_shuffle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark))
+        self.btn_shuffle.setToolTip("Shuffle: Off")
+        self.btn_shuffle.clicked.connect(self.toggle_shuffle)
+        btn_row.addWidget(self.btn_shuffle)
+
+        self.btn_prev = QPushButton(self)
+        self.btn_prev.setFixedSize(28, 28)
+        self.btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prev.setIcon(get_vector_icon('prev', self.is_dark))
+        self.btn_prev.setToolTip("Previous Track")
+        self.btn_prev.clicked.connect(self.play_prev)
+        btn_row.addWidget(self.btn_prev)
+
+        self.btn_rw10 = QPushButton("-10s", self)
+        self.btn_rw10.setFixedSize(36, 28)
+        self.btn_rw10.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_rw10.setToolTip("Rewind 10 seconds")
+        self.btn_rw10.clicked.connect(lambda: self.seek_relative(-10000))
+        btn_row.addWidget(self.btn_rw10)
+
+        self.btn_play = QPushButton(self)
+        self.btn_play.setObjectName("btnDockPlay")
+        self.btn_play.setFixedSize(34, 34)
+        self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_play.setIcon(get_vector_icon('play', self.is_dark))
+        self.btn_play.setIconSize(QSize(18, 18))
+        self.btn_play.setToolTip("Play / Pause")
+        self.btn_play.clicked.connect(self.play_pause)
+        btn_row.addWidget(self.btn_play)
+
+        self.btn_ff10 = QPushButton("+10s", self)
+        self.btn_ff10.setFixedSize(36, 28)
+        self.btn_ff10.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_ff10.setToolTip("Forward 10 seconds")
+        self.btn_ff10.clicked.connect(lambda: self.seek_relative(10000))
+        btn_row.addWidget(self.btn_ff10)
+
+        self.btn_next = QPushButton(self)
+        self.btn_next.setFixedSize(28, 28)
+        self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_next.setIcon(get_vector_icon('next', self.is_dark))
+        self.btn_next.setToolTip("Next Track")
+        self.btn_next.clicked.connect(self.play_next)
+        btn_row.addWidget(self.btn_next)
+
+        self.btn_repeat = QPushButton(self)
+        self.btn_repeat.setFixedSize(28, 28)
+        self.btn_repeat.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark))
+        self.btn_repeat.setToolTip("Repeat: Off")
+        self.btn_repeat.clicked.connect(self.cycle_repeat)
+        btn_row.addWidget(self.btn_repeat)
+
+        center_layout.addLayout(btn_row)
+
+        time_row = QHBoxLayout()
+        time_row.setSpacing(8)
+        self.lbl_elapsed = QLabel("00:00", self)
+        self.lbl_elapsed.setStyleSheet("font-size: 11px; font-family: monospace;")
+        self.lbl_total = QLabel("00:00", self)
+        self.lbl_total.setStyleSheet("font-size: 11px; font-family: monospace;")
+
+        self.slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self)
+        self.slider.setRange(0, 1000)
+        self.slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.slider.valueChanged.connect(self._on_slider_value_changed)
+
+        time_row.addWidget(self.lbl_elapsed)
+        time_row.addWidget(self.slider, 1)
+        time_row.addWidget(self.lbl_total)
+        center_layout.addLayout(time_row)
+
+        bar_layout.addWidget(center_widget, 1)
+
+        # 3. Right Group (Volume + Pop-out)
+        right_widget = QWidget(self)
+        right_layout = QHBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+        right_layout.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.btn_mute = QPushButton(self)
+        self.btn_mute.setFixedSize(28, 28)
+        self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mute.setIcon(get_vector_icon('unmute', self.is_dark))
+        self.btn_mute.setToolTip("Mute / Unmute")
+        self.btn_mute.clicked.connect(self.toggle_mute)
+        right_layout.addWidget(self.btn_mute)
+
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.vol_slider.setRange(0, 100)
+        self.vol_slider.setValue(100)
+        self.vol_slider.setFixedWidth(80)
+        self.vol_slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.vol_slider.valueChanged.connect(self._on_volume_changed)
+        right_layout.addWidget(self.vol_slider)
+
+        self.lbl_volume = QLabel("100%", self)
+        self.lbl_volume.setFixedWidth(34)
+        self.lbl_volume.setStyleSheet("font-size: 11px;")
+        right_layout.addWidget(self.lbl_volume)
+
+        self.btn_popout = QPushButton(self)
+        self.btn_popout.setFixedSize(28, 28)
+        self.btn_popout.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_popout.setIcon(get_vector_icon('popout', self.is_dark))
+        self.btn_popout.setToolTip("Pop-out to detached player window")
+        self.btn_popout.clicked.connect(self.popout_detached_player)
+        right_layout.addWidget(self.btn_popout)
+
+        right_widget.setFixedWidth(200)
+        bar_layout.addWidget(right_widget)
+
+    def play_row(self, row: int):
+        if row < 0 or row >= self.media_tab.table.rowCount():
+            return
+        info = self.media_tab._get_row_info(row)
+        if not info: return
+        self.current_row = row
+        self.current_filepath = os.path.abspath(info.filepath)
+
+        meta = _load_track_metadata(self.current_filepath)
+        self.title_lbl.setText(meta['title'])
+        self.title_lbl.setToolTip(f"{meta['title']} — {meta['artist']}")
+        self.subtitle_lbl.setText(f"{meta['artist']} • {meta['album']}")
+        self.subtitle_lbl.setToolTip(f"{meta['artist']} • {meta['album']}")
+
+        art = _extract_album_art(self.current_filepath)
+        if art is None:
+            art = _create_fallback_art_pixmap(48, 48, radius=6)
+        else:
+            art = _rounded_pixmap(art, 48, 48, radius=6)
+        self.art_label.setPixmap(art)
+
+        self.player.setSource(QUrl.fromLocalFile(self.current_filepath))
+        self.player.play()
+        self._update_play_button_text()
+
+        try:
+            self.media_tab.table.selectRow(row)
+        except Exception:
+            pass
+
+    def play_pause(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            if not self.current_filepath and self.media_tab.table.rowCount() > 0:
+                self.play_row(0)
+            else:
+                self.player.play()
+        self._update_play_button_text()
+
+    def play_next(self):
+        rowCount = self.media_tab.table.rowCount()
+        if rowCount == 0: return
+
+        if self.shuffle_mode:
+            import random
+            valid_rows = [r for r in range(rowCount) if not self.media_tab.table.isRowHidden(r)]
+            if len(valid_rows) > 1:
+                choices = [r for r in valid_rows if r != self.current_row]
+                self.play_row(random.choice(choices))
+            elif valid_rows:
+                self.play_row(valid_rows[0])
+        else:
+            next_row = self._find_next_visible_row(self.current_row, 1)
+            if next_row != -1:
+                self.play_row(next_row)
+            elif self.repeat_mode == 'all':
+                first_row = self._find_first_visible_row()
+                if first_row != -1:
+                    self.play_row(first_row)
+            else:
+                self.player.stop()
+                self._update_play_button_text()
+
+    def play_prev(self):
+        if self.player.position() > 3000:
+            self.player.setPosition(0)
+            return
+        prev_row = self._find_next_visible_row(self.current_row, -1)
+        if prev_row != -1:
+            self.play_row(prev_row)
+        elif self.repeat_mode == 'all':
+            last_row = self._find_last_visible_row()
+            if last_row != -1:
+                self.play_row(last_row)
+        else:
+            self.player.setPosition(0)
+
+    def _find_next_visible_row(self, start_row: int, step: int) -> int:
+        r = start_row + step
+        cnt = self.media_tab.table.rowCount()
+        while 0 <= r < cnt:
+            if not self.media_tab.table.isRowHidden(r):
+                return r
+            r += step
+        return -1
+
+    def _find_first_visible_row(self) -> int:
+        for r in range(self.media_tab.table.rowCount()):
+            if not self.media_tab.table.isRowHidden(r):
+                return r
+        return -1
+
+    def _find_last_visible_row(self) -> int:
+        for r in range(self.media_tab.table.rowCount() - 1, -1, -1):
+            if not self.media_tab.table.isRowHidden(r):
+                return r
+        return -1
+
+    def seek_relative(self, ms: int):
+        cur = self.player.position()
+        dur = self.player.duration()
+        target = max(0, cur + ms)
+        if dur > 0: target = min(dur, target)
+        self.player.setPosition(target)
+
+    def toggle_shuffle(self):
+        self.shuffle_mode = not self.shuffle_mode
+        self._update_button_visuals()
+
+    def cycle_repeat(self):
+        order = ['off', 'all', 'one']
+        idx = order.index(self.repeat_mode)
+        self.repeat_mode = order[(idx + 1) % len(order)]
+        self._update_button_visuals()
+
+    def _update_button_visuals(self):
+        accent = ('#a78bfa' if self.is_dark else '#6366f1')
+        if self.repeat_mode == 'one':
+            self.btn_repeat.setIcon(get_vector_icon('repeat_one', self.is_dark, color_override=accent))
+            self.btn_repeat.setToolTip("Repeat: One")
+            self.btn_repeat.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        elif self.repeat_mode == 'all':
+            self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark, color_override=accent))
+            self.btn_repeat.setToolTip("Repeat: All")
+            self.btn_repeat.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        else:
+            self.btn_repeat.setIcon(get_vector_icon('repeat', self.is_dark))
+            self.btn_repeat.setToolTip("Repeat: Off")
+            self.btn_repeat.setStyleSheet("")
+
+        if self.shuffle_mode:
+            self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark, color_override=accent))
+            self.btn_shuffle.setToolTip("Shuffle: On")
+            self.btn_shuffle.setStyleSheet(f"border-color: {accent}; background: rgba(167, 139, 250, 0.2);")
+        else:
+            self.btn_shuffle.setIcon(get_vector_icon('shuffle', self.is_dark))
+            self.btn_shuffle.setToolTip("Shuffle: Off")
+            self.btn_shuffle.setStyleSheet("")
+
+    def _on_media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.repeat_mode == 'one':
+                self.player.setPosition(0)
+                self.player.play()
+            else:
+                self.play_next()
+
+    def _on_volume_changed(self, val: int):
+        vol = max(0.0, min(1.0, val / 100.0))
+        self.audio_output.setVolume(vol)
+        self.lbl_volume.setText(f"{val}%")
+        if val > 0 and self.audio_output.isMuted():
+            self.audio_output.setMuted(False)
+            self.btn_mute.setIcon(get_vector_icon('unmute', self.is_dark))
+
+    def toggle_mute(self):
+        muted = not self.audio_output.isMuted()
+        self.audio_output.setMuted(muted)
+        self.btn_mute.setIcon(get_vector_icon('mute' if muted else 'unmute', self.is_dark))
+
+    def _toggle_playback(self):
+        self.play_pause()
+
+    def _toggle_mute(self):
+        self.toggle_mute()
+
+    def _update_play_button_text(self):
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.btn_play.setIcon(get_vector_icon('pause' if playing else 'play', self.is_dark))
+
+    def _position_changed(self, position):
+        if not self.slider.isSliderDown():
+            duration = self.player.duration()
+            if duration > 0:
+                val = int((position / duration) * 1000)
+                self.slider.blockSignals(True)
+                self.slider.setValue(val)
+                self.slider.blockSignals(False)
+            self.lbl_elapsed.setText(_format_time_ms(position))
+
+    def _on_duration_changed(self, duration):
+        self.lbl_total.setText(_format_time_ms(duration))
+
+    def _set_position(self, value):
+        duration = self.player.duration()
+        if duration > 0:
+            pos = int((value / 1000) * duration)
+            self.player.setPosition(pos)
+            self.lbl_elapsed.setText(_format_time_ms(pos))
+
+    def _on_slider_value_changed(self, value):
+        if self.slider.isSliderDown():
+            self._set_position(value)
+
+    def popout_detached_player(self):
+        if not self.current_filepath:
+            return
+        pos = self.player.position()
+        was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.player.pause()
+        self._update_play_button_text()
+
+        main_win = self.media_tab.window()
+        if main_win:
+            if not hasattr(main_win, '_native_players'):
+                main_win._native_players = []
+            prune_native_players(main_win)
+
+            audio_files = []
+            for r in range(self.media_tab.table.rowCount()):
+                if not self.media_tab.table.isRowHidden(r):
+                    info = self.media_tab._get_row_info(r)
+                    if info:
+                        audio_files.append(os.path.abspath(info.filepath))
+
+            player_win = NativeAudioPlayerWindow(audio_files or self.current_filepath, parent=main_win, initial_file=self.current_filepath, start_position_ms=pos)
+            player_win.show()
+            if was_playing:
+                player_win.player.play()
+            main_win._native_players.append(player_win)
+
+    def stop(self):
+        if hasattr(self, 'player'):
+            self.player.stop()
+            self.player.setSource(QUrl())
+        self.current_row = -1
+        self.current_filepath = ""
+        self.title_lbl.setText("No track playing")
+        self.subtitle_lbl.setText("Double-click a track to play")
+        self.art_label.setPixmap(_create_fallback_art_pixmap(48, 48, radius=6))
+        self.lbl_elapsed.setText("00:00")
+        self.lbl_total.setText("00:00")
+        self.slider.setValue(0)
+        self._update_play_button_text()
+
+    def update_theme(self, is_dark: bool):
+        self.is_dark = is_dark
+        self.btn_shuffle.setIcon(get_vector_icon('shuffle', is_dark))
+        self.btn_prev.setIcon(get_vector_icon('prev', is_dark))
+        self.btn_next.setIcon(get_vector_icon('next', is_dark))
+        self.btn_popout.setIcon(get_vector_icon('popout', is_dark))
+        self.btn_mute.setIcon(get_vector_icon('mute' if self.audio_output.isMuted() else 'unmute', is_dark))
+        self._update_play_button_text()
+        self._update_button_visuals()
+
+        if is_dark:
+            self.setStyleSheet("""
+                QFrame#audioPlayerBar {
+                    background-color: #111827;
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 8px;
+                }
+                QLabel { color: #f3f4f6; }
+                QPushButton {
+                    background-color: rgba(255, 255, 255, 0.05);
+                    color: #f3f4f6;
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 5px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: rgba(255, 255, 255, 0.12);
+                    border-color: #a78bfa;
+                }
+                QPushButton#btnDockPlay {
+                    background-color: #6366f1;
+                    border: 1px solid #818cf8;
+                    border-radius: 17px;
+                }
+                QPushButton#btnDockPlay:hover {
+                    background-color: #4f46e5;
+                }
+                QSlider::groove:horizontal {
+                    height: 4px;
+                    background: #27273a;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #a78bfa;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    width: 10px;
+                    margin-top: -3px;
+                    margin-bottom: -3px;
+                    border-radius: 5px;
+                    background: #ffffff;
+                }
+            """)
+            self.subtitle_lbl.setStyleSheet("font-size: 11px; color: #9ca3af;")
+        else:
+            self.setStyleSheet("""
+                QFrame#audioPlayerBar {
+                    background-color: #f8fafc;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 8px;
+                }
+                QLabel { color: #0f172a; }
+                QPushButton {
+                    background-color: #ffffff;
+                    color: #1e293b;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 5px;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #e2e8f0;
+                    border-color: #6366f1;
+                }
+                QPushButton#btnDockPlay {
+                    background-color: #6366f1;
+                    border: 1px solid #4f46e5;
+                    border-radius: 17px;
+                }
+                QPushButton#btnDockPlay:hover {
+                    background-color: #4f46e5;
+                }
+                QSlider::groove:horizontal {
+                    height: 4px;
+                    background: #e2e8f0;
+                    border-radius: 2px;
+                }
+                QSlider::sub-page:horizontal {
+                    background: #6366f1;
+                    border-radius: 2px;
+                }
+                QSlider::handle:horizontal {
+                    width: 10px;
+                    margin-top: -3px;
+                    margin-bottom: -3px;
+                    border-radius: 5px;
+                    background: #4338ca;
+                }
+            """)
+            self.subtitle_lbl.setStyleSheet("font-size: 11px; color: #64748b;")
+
 class NativeVideoPlayerWindow(QMainWindow):
-    def __init__(self, filepath, parent=None):
-        super().__init__(parent)
+    def __init__(self, filepath_or_pool, parent=None, start_random_time: bool = False, initial_file: str = None):
+        # Pass None so the window acts as an independent top-level window (not owned by parent)
+        super().__init__(None)
         self.parent_window = parent
         self.setWindowFlags(Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setWindowTitle(f"MediaFlow Player — {os.path.basename(filepath)}")
+
+        # Set window icon
+        if parent and hasattr(parent, 'windowIcon') and not parent.windowIcon().isNull():
+            self.setWindowIcon(parent.windowIcon())
+        else:
+            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+            if os.path.exists(logo_path):
+                self.setWindowIcon(QIcon(logo_path))
+        
+        # Support either a single filepath or a pool list (for backward compatibility)
+        if isinstance(filepath_or_pool, list):
+            self.video_pool = [f for f in filepath_or_pool if isinstance(f, str) and os.path.isfile(f)]
+            filepath = initial_file if (initial_file and os.path.isfile(initial_file)) else (self.video_pool[0] if self.video_pool else "")
+            if not initial_file:
+                start_random_time = True
+        else:
+            filepath = str(filepath_or_pool) if filepath_or_pool else ""
+            self.video_pool = []
+
+        self.filepath = filepath
+        self.setWindowTitle(f"MediaFlow Player — {os.path.basename(filepath) if filepath else 'Video'}")
         self.resize(854, 480)
         
-        # Controls auto-hide timer
+        # State tracking for smooth playback and seeking
+        self._last_seek_time = 0.0
+        self._pending_seek_pos = None
+        self._pending_random_seek = False
+        self._target_seek_ms = None
+        self._seek_attempts = 0
+        self._seek_wait_ticks = 0
+        self._last_time_key = None
+        
+        # Controls auto-hide timer (active in fullscreen)
         self.controls_timer = QTimer(self)
         self.controls_timer.setSingleShot(True)
         self.controls_timer.timeout.connect(self._hide_controls_if_fullscreen)
+
+        # Dedicated timer for applying pending random seek
+        self._random_seek_timer = QTimer(self)
+        self._random_seek_timer.setInterval(100)
+        self._random_seek_timer.timeout.connect(self._check_and_apply_random_seek)
         
         # Central widget and layout
         central = QWidget(self)
+        central.setStyleSheet("background-color: #000000;")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -5965,47 +7329,109 @@ class NativeVideoPlayerWindow(QMainWindow):
         # Buttons row
         buttons_layout = QHBoxLayout()
         buttons_layout.setContentsMargins(0, 0, 0, 0)
-        buttons_layout.setSpacing(12)
+        buttons_layout.setSpacing(8)
+
+        # Previous video button
+        self.btn_prev = QPushButton(self.controls_widget)
+        self.btn_prev.setFixedSize(30, 30)
+        self.btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_prev.clicked.connect(self.play_previous_file)
+        self.btn_prev.setIcon(get_vector_icon('prev', is_dark))
+        self.btn_prev.setToolTip("Previous Video (P / PageUp)")
+        self.btn_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        buttons_layout.addWidget(self.btn_prev)
         
+        # Play / Pause button
         self.btn_play = QPushButton(self.controls_widget)
         self.btn_play.setFixedSize(30, 30)
         self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_play.clicked.connect(self._toggle_playback)
         self.btn_play.setIcon(get_vector_icon('play', is_dark))
+        self.btn_play.setToolTip("Play / Pause (Space)")
+        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         buttons_layout.addWidget(self.btn_play)
+
+        # Next video button
+        self.btn_next = QPushButton(self.controls_widget)
+        self.btn_next.setFixedSize(30, 30)
+        self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_next.clicked.connect(self.play_next_file)
+        self.btn_next.setIcon(get_vector_icon('next', is_dark))
+        self.btn_next.setToolTip("Next Video (N / PageDown)")
+        self.btn_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        buttons_layout.addWidget(self.btn_next)
         
+        # Mute button
         self.btn_mute = QPushButton(self.controls_widget)
         self.btn_mute.setFixedSize(30, 30)
         self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_mute.clicked.connect(self._toggle_mute)
         self.btn_mute.setIcon(get_vector_icon('unmute', is_dark))
+        self.btn_mute.setToolTip("Mute / Unmute (M)")
+        self.btn_mute.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         buttons_layout.addWidget(self.btn_mute)
         
+        # Volume slider
         self.volume_slider = QSlider(Qt.Orientation.Horizontal, self.controls_widget)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(70)
-        self.volume_slider.setFixedWidth(100)
+        self.volume_slider.setFixedWidth(85)
         self.volume_slider.setCursor(Qt.CursorShape.PointingHandCursor)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         buttons_layout.addWidget(self.volume_slider)
         
         buttons_layout.addStretch()
         
-        self.btn_random_mode = QPushButton(self.controls_widget)
-        self.btn_random_mode.setFixedSize(30, 30)
-        self.btn_random_mode.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_random_mode.clicked.connect(self.launch_random_discovery_player)
-        self.btn_random_mode.setIcon(get_vector_icon('shuffle', is_dark))
-        self.btn_random_mode.setToolTip("Random Discovery Player (R)")
-        self.btn_random_mode.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        buttons_layout.addWidget(self.btn_random_mode)
+        btn_rnd_style = (
+            "QPushButton { background: rgba(139, 92, 246, 0.15); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.4); "
+            "border-radius: 6px; font-weight: 600; font-size: 11px; padding: 0 10px; } "
+            "QPushButton:hover { background: rgba(139, 92, 246, 0.3); border-color: #a78bfa; color: #ffffff; }"
+        ) if is_dark else (
+            "QPushButton { background: #e0e7ff; color: #4338ca; border: 1px solid #cbd5e1; "
+            "border-radius: 6px; font-weight: 600; font-size: 11px; padding: 0 10px; } "
+            "QPushButton:hover { background: #c7d2fe; border-color: #6366f1; }"
+        )
+        btn_time_style = (
+            "QPushButton { background: rgba(34, 211, 238, 0.12); color: #22d3ee; border: 1px solid rgba(34, 211, 238, 0.4); "
+            "border-radius: 6px; font-weight: 600; font-size: 11px; padding: 0 10px; } "
+            "QPushButton:hover { background: rgba(34, 211, 238, 0.25); border-color: #67e8f9; color: #ffffff; }"
+        ) if is_dark else (
+            "QPushButton { background: #e0f2fe; color: #0284c7; border: 1px solid #bae6fd; "
+            "border-radius: 6px; font-weight: 600; font-size: 11px; padding: 0 10px; } "
+            "QPushButton:hover { background: #bae6fd; border-color: #0284c7; }"
+        )
 
+        # Randomizer Button 1: Randomize video file
+        self.btn_random_file = QPushButton(" 🎲 Random Video", self.controls_widget)
+        self.btn_random_file.setFixedHeight(30)
+        self.btn_random_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_random_file.setIcon(get_vector_icon('shuffle', is_dark))
+        self.btn_random_file.setStyleSheet(btn_rnd_style)
+        self.btn_random_file.setToolTip("Play random video from loaded files (R)")
+        self.btn_random_file.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_random_file.clicked.connect(self.play_random_file)
+        buttons_layout.addWidget(self.btn_random_file)
+
+        # Randomizer Button 2: Randomize video time
+        self.btn_random_time = QPushButton(" ⏱ Random Time", self.controls_widget)
+        self.btn_random_time.setFixedHeight(30)
+        self.btn_random_time.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_random_time.setIcon(get_vector_icon('sync', is_dark))
+        self.btn_random_time.setStyleSheet(btn_time_style)
+        self.btn_random_time.setToolTip("Jump to random timestamp in current video (T)")
+        self.btn_random_time.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_random_time.clicked.connect(self.randomize_current_time)
+        buttons_layout.addWidget(self.btn_random_time)
+
+        # Fullscreen button
         self.btn_fullscreen = QPushButton(self.controls_widget)
         self.btn_fullscreen.setFixedSize(30, 30)
         self.btn_fullscreen.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         self.btn_fullscreen.setIcon(get_vector_icon('preview', is_dark))
-        self.btn_fullscreen.setToolTip("Toggle Fullscreen")
+        self.btn_fullscreen.setToolTip("Toggle Fullscreen (F)")
+        self.btn_fullscreen.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         buttons_layout.addWidget(self.btn_fullscreen)
         
         controls_layout.addLayout(buttons_layout)
@@ -6021,43 +7447,273 @@ class NativeVideoPlayerWindow(QMainWindow):
         self.player.positionChanged.connect(self._on_player_position_changed)
         self.player.durationChanged.connect(self._on_player_duration_changed)
         self.player.playbackStateChanged.connect(self._on_player_state_changed)
+        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self.player.seekableChanged.connect(self._on_seekable_changed)
         self.seek_slider.valueChanged.connect(self._on_slider_moved)
-        
-        # Load and play media
-        self.player.setSource(QUrl.fromLocalFile(filepath))
+        self.seek_slider.sliderReleased.connect(self._on_slider_released)
         
         global_mute = getattr(parent, 'global_mute', False) if parent else False
         self.audio_output.setMuted(global_mute)
         self.audio_output.setVolume(0.7)
         self.btn_mute.setIcon(get_vector_icon('mute' if global_mute else 'unmute', is_dark))
-        
-        self.player.play()
-        # Removed dead field `_is_slider_pressed` — never read or updated anywhere
-        # else in the class. The slider-press state is already correctly tracked
-        # by `self.seek_slider.isSliderDown()` in _on_player_position_changed.
-        self.filepath = filepath
-
-        # Set Focus Policies to prevent stealing arrow key presses
-        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_mute.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_fullscreen.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.seek_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        # Enable mouse tracking recursively and install event filters for auto-hiding controls
-        self._enable_mouse_tracking_recursive(central)
+        # Mouse tracking on central widget and video widget
+        central.setMouseTracking(True)
         self.setMouseTracking(True)
         central.installEventFilter(self)
-        for child in central.findChildren(QWidget):
-            child.installEventFilter(self)
+        self.video_widget.installEventFilter(self)
+        self._enable_mouse_tracking_recursive(central)
+
+        # Load initial media
+        if filepath and os.path.isfile(filepath):
+            self.load_video(filepath, pick_random_time=start_random_time)
+        elif self.video_pool:
+            self.play_random_file()
 
     def _enable_mouse_tracking_recursive(self, widget):
-        widget.setMouseTracking(True)
-        for child in widget.findChildren(QWidget):
-            child.setMouseTracking(True)
+        try:
+            widget.setMouseTracking(True)
+            for child in widget.findChildren(QWidget):
+                child.setMouseTracking(True)
+                child.installEventFilter(self)
+        except Exception:
+            pass
+
+    def _get_video_pool(self) -> list[str]:
+        pool = []
+        seen = set()
+        parent_win = self.parent_window
+        # 1. From parent window tabs (video_tab, smart_folder_tabs)
+        if parent_win:
+            candidate_tabs = []
+            if hasattr(parent_win, 'video_tab') and parent_win.video_tab:
+                candidate_tabs.append(parent_win.video_tab)
+            for smart_tab in getattr(parent_win, 'smart_folder_tabs', {}).values():
+                candidate_tabs.append(smart_tab)
+            if hasattr(parent_win, 'media_infos') and parent_win not in candidate_tabs:
+                candidate_tabs.append(parent_win)
+            for tab in candidate_tabs:
+                for info in getattr(tab, 'media_infos', []):
+                    fp = getattr(info, 'filepath', None)
+                    mtype = getattr(info, 'media_type', None)
+                    ext = os.path.splitext(fp)[1].lower() if fp else ''
+                    if fp and (mtype == 'video' or ext in VIDEO_EXTENSIONS) and fp not in seen:
+                        if os.path.isfile(fp):
+                            seen.add(fp)
+                            pool.append(fp)
+        # 2. From cached video_pool if passed at init
+        if getattr(self, 'video_pool', None):
+            for fp in self.video_pool:
+                if fp not in seen and os.path.isfile(fp):
+                    seen.add(fp)
+                    pool.append(fp)
+        # 3. Fallback to containing directory
+        if not pool and hasattr(self, 'filepath') and self.filepath:
+            folder = os.path.dirname(self.filepath)
+            if os.path.isdir(folder):
+                try:
+                    for entry in os.scandir(folder):
+                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in VIDEO_EXTENSIONS:
+                            if entry.path not in seen:
+                                seen.add(entry.path)
+                                pool.append(entry.path)
+                except Exception:
+                    pass
+        if not pool and hasattr(self, 'filepath') and self.filepath:
+            pool = [self.filepath]
+        return pool
+
+    def _calc_random_time(self, duration_ms: int) -> int:
+        if duration_ms > 12000:
+            min_pos = max(1000, int(duration_ms * 0.08))
+            max_pos = max(min_pos, int(duration_ms * 0.85))
+            return random.randint(min_pos, max_pos)
+        elif duration_ms > 2000:
+            min_pos = max(500, int(duration_ms * 0.15))
+            max_pos = max(min_pos, int(duration_ms * 0.80))
+            return random.randint(min_pos, max_pos)
+        return 0
+
+    def play_previous_file(self):
+        pool = self._get_video_pool()
+        if not pool:
+            return
+        if not hasattr(self, 'filepath') or not self.filepath:
+            self.load_video(pool[0], pick_random_time=False)
+            return
+        curr_idx = -1
+        for i, p in enumerate(pool):
+            if _same_file_path(p, self.filepath):
+                curr_idx = i
+                break
+        if curr_idx == -1:
+            prev_idx = 0
+        else:
+            prev_idx = (curr_idx - 1) % len(pool)
+        self.load_video(pool[prev_idx], pick_random_time=False)
+
+    def play_next_file(self):
+        pool = self._get_video_pool()
+        if not pool:
+            return
+        if not hasattr(self, 'filepath') or not self.filepath:
+            self.load_video(pool[0], pick_random_time=False)
+            return
+        curr_idx = -1
+        for i, p in enumerate(pool):
+            if _same_file_path(p, self.filepath):
+                curr_idx = i
+                break
+        if curr_idx == -1:
+            next_idx = 0
+        else:
+            next_idx = (curr_idx + 1) % len(pool)
+        self.load_video(pool[next_idx], pick_random_time=False)
+
+    def play_random_file(self):
+        pool = self._get_video_pool()
+        if not pool:
+            return
+        if len(pool) > 1 and hasattr(self, 'filepath') and self.filepath:
+            choices = [v for v in pool if not _same_file_path(v, self.filepath)]
+            chosen = random.choice(choices if choices else pool)
+        else:
+            chosen = pool[0]
+        self.load_video(chosen, pick_random_time=True)
+
+    def randomize_current_time(self):
+        dur = self.player.duration()
+        if dur > 1000:
+            target = self._calc_random_time(dur)
+            self._pending_random_seek = True
+            self._target_seek_ms = target
+            self._seek_attempts = 0
+            self._seek_wait_ticks = 0
+            self.player.setPosition(target)
+            if hasattr(self, '_random_seek_timer'):
+                self._random_seek_timer.start(100)
+            self.show_controls_temporarily()
+
+    def launch_random_discovery_player(self):
+        # Kept for backward compatibility
+        self.play_random_file()
+
+    def load_video(self, filepath: str, pick_random_time: bool = False):
+        if not filepath or not os.path.isfile(filepath):
+            return
+        clean_fp = os.path.abspath(filepath)
+        self.filepath = clean_fp
+        self.setWindowTitle(f"MediaFlow Player — {os.path.basename(clean_fp)}")
+        self._last_time_key = None
+        self._seek_attempts = 0
+        self._seek_wait_ticks = 0
+        
+        # Check if duration is known beforehand from loaded media infos
+        known_duration_ms = 0
+        if self.parent_window:
+            tabs = []
+            if hasattr(self.parent_window, 'media_infos'):
+                tabs.append(self.parent_window)
+            main_win = self.parent_window.window() if hasattr(self.parent_window, 'window') else self.parent_window
+            if main_win and main_win is not self.parent_window:
+                if hasattr(main_win, 'video_tab') and main_win.video_tab:
+                    tabs.append(main_win.video_tab)
+                for smart_tab in getattr(main_win, 'smart_folder_tabs', {}).values():
+                    tabs.append(smart_tab)
+            for tab in tabs:
+                for info in getattr(tab, 'media_infos', []):
+                    item_fp = getattr(info, 'filepath', '')
+                    if item_fp and _same_file_path(item_fp, clean_fp):
+                        sec = getattr(info, 'duration_seconds', 0)
+                        if sec and sec > 0:
+                            known_duration_ms = int(sec * 1000)
+                        break
+                if known_duration_ms > 0:
+                    break
+
+        if pick_random_time:
+            self._pending_random_seek = True
+            if known_duration_ms > 2000:
+                self._target_seek_ms = self._calc_random_time(known_duration_ms)
+            else:
+                self._target_seek_ms = None
+            if hasattr(self, '_random_seek_timer'):
+                self._random_seek_timer.start(100)
+        else:
+            self._pending_random_seek = False
+            self._target_seek_ms = None
+            if hasattr(self, '_random_seek_timer'):
+                self._random_seek_timer.stop()
+
+        self.player.setSource(QUrl.fromLocalFile(clean_fp))
+        self.player.play()
+        if self._pending_random_seek:
+            self._check_and_apply_random_seek()
+
+    def _check_and_apply_random_seek(self):
+        if not getattr(self, '_pending_random_seek', False):
+            if hasattr(self, '_random_seek_timer'):
+                self._random_seek_timer.stop()
+            return
+
+        dur = self.player.duration()
+        if dur <= 1000:
+            if getattr(self, '_target_seek_ms', None) is None:
+                self._seek_wait_ticks = getattr(self, '_seek_wait_ticks', 0) + 1
+                if self._seek_wait_ticks > 50:
+                    self._stop_pending_random_seek()
+                return
+        else:
+            if getattr(self, '_target_seek_ms', None) is None:
+                self._target_seek_ms = self._calc_random_time(dur)
+
+        target = getattr(self, '_target_seek_ms', None)
+        if target is None or target <= 0:
+            self._stop_pending_random_seek()
+            return
+
+        if not self.player.isSeekable():
+            self._seek_wait_ticks = getattr(self, '_seek_wait_ticks', 0) + 1
+            if self._seek_wait_ticks > 50:
+                self._stop_pending_random_seek()
+            return
+
+        effective_dur = dur if dur > 1000 else (target + 10000)
+        clamped_target = max(0, min(effective_dur - 500, target))
+        cur_pos = self.player.position()
+
+        # If current position is already close to target (within 2500ms) and not at start, seek succeeded
+        if abs(cur_pos - clamped_target) <= 2500 and cur_pos > 500:
+            self._stop_pending_random_seek()
+            return
+
+        # Apply seek up to 15 setPosition attempts until confirmed
+        if getattr(self, '_seek_attempts', 0) < 15:
+            self._seek_attempts = getattr(self, '_seek_attempts', 0) + 1
+            self.player.setPosition(clamped_target)
+        else:
+            self._stop_pending_random_seek()
+
+    def _stop_pending_random_seek(self):
+        self._pending_random_seek = False
+        self._target_seek_ms = None
+        self._seek_attempts = 0
+        self._seek_wait_ticks = 0
+        if hasattr(self, '_random_seek_timer'):
+            self._random_seek_timer.stop()
+
+    def _apply_initial_seek(self, target_ms: int):
+        self._pending_random_seek = True
+        self._target_seek_ms = target_ms
+        self._seek_attempts = 0
+        self._seek_wait_ticks = 0
+        if hasattr(self, '_random_seek_timer'):
+            self._random_seek_timer.start(100)
+        self._check_and_apply_random_seek()
 
     def eventFilter(self, watched, event):
-        if event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
+        if event.type() in (QEvent.Type.MouseMove, QEvent.Type.HoverMove):
             self.show_controls_temporarily()
         elif event.type() == QEvent.Type.Wheel:
             delta = event.angleDelta().y()
@@ -6071,27 +7727,55 @@ class NativeVideoPlayerWindow(QMainWindow):
             return True
         return super().eventFilter(watched, event)
 
-
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
         self.show_controls_temporarily()
 
     def show_controls_temporarily(self):
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.controls_widget.show()
+        if not self.controls_widget.isVisible():
+            self.controls_widget.show()
+        if self.cursor().shape() != Qt.CursorShape.ArrowCursor:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        if hasattr(self, 'video_widget'):
+            if self.video_widget.cursor().shape() != Qt.CursorShape.ArrowCursor:
+                self.video_widget.setCursor(Qt.CursorShape.ArrowCursor)
+            for child in self.video_widget.findChildren(QWidget):
+                try:
+                    if child.cursor().shape() != Qt.CursorShape.ArrowCursor:
+                        child.setCursor(Qt.CursorShape.ArrowCursor)
+                except Exception:
+                    pass
         if self.isFullScreen():
-            self.controls_timer.start(2000)
+            self.controls_timer.start(2500)
 
     def _hide_controls_if_fullscreen(self):
         if self.isFullScreen():
-            self.controls_widget.hide()
+            if self.controls_widget.underMouse():
+                self.controls_timer.start(2500)
+                return
+            if self.controls_widget.isVisible():
+                self.controls_widget.hide()
             self.setCursor(Qt.CursorShape.BlankCursor)
+            if hasattr(self, 'video_widget'):
+                self.video_widget.setCursor(Qt.CursorShape.BlankCursor)
+                for child in self.video_widget.findChildren(QWidget):
+                    try:
+                        child.setCursor(Qt.CursorShape.BlankCursor)
+                    except Exception:
+                        pass
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
             self.controls_widget.show()
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            if hasattr(self, 'video_widget'):
+                self.video_widget.setCursor(Qt.CursorShape.ArrowCursor)
+                for child in self.video_widget.findChildren(QWidget):
+                    try:
+                        child.setCursor(Qt.CursorShape.ArrowCursor)
+                    except Exception:
+                        pass
             self.controls_timer.stop()
         else:
             self.showFullScreen()
@@ -6121,40 +7805,82 @@ class NativeVideoPlayerWindow(QMainWindow):
         else:
             self.btn_play.setIcon(get_vector_icon('play', is_dark))
 
+    def _on_seekable_changed(self, is_seekable):
+        if is_seekable and getattr(self, '_pending_random_seek', False):
+            self._check_and_apply_random_seek()
+
     def _on_player_position_changed(self, position):
-        if not self.seek_slider.isSliderDown():
-            self.seek_slider.blockSignals(True)
-            duration = self.player.duration()
-            if duration > 0:
-                self.seek_slider.setValue(int(position * 1000 / duration))
-            self.seek_slider.blockSignals(False)
-        self._update_time_label(position, self.player.duration())
+        if getattr(self, '_pending_random_seek', False):
+            target = getattr(self, '_target_seek_ms', None)
+            if target is not None and abs(position - target) <= 2500 and position > 500:
+                self._stop_pending_random_seek()
+        duration = self.player.duration()
+        if not self.seek_slider.isSliderDown() and duration > 0:
+            val = int(position * 1000 / duration)
+            if val != self.seek_slider.value():
+                self.seek_slider.blockSignals(True)
+                self.seek_slider.setValue(val)
+                self.seek_slider.blockSignals(False)
+        self._update_time_label(position, duration)
 
     def _on_player_duration_changed(self, duration):
+        if getattr(self, '_pending_random_seek', False) and duration > 0:
+            self._check_and_apply_random_seek()
         self._update_time_label(self.player.position(), duration)
+
+    def _on_media_status_changed(self, status):
+        if getattr(self, '_pending_random_seek', False) and status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            self._check_and_apply_random_seek()
 
     def _update_time_label(self, position, duration):
         pos_sec = max(0, int(position)) // 1000
         dur_sec = max(0, int(duration)) // 1000
+        key = (pos_sec, dur_sec)
+        if getattr(self, '_last_time_key', None) == key:
+            return
+        self._last_time_key = key
         pos_str = f"{pos_sec // 60:02d}:{pos_sec % 60:02d}"
         dur_str = f"{dur_sec // 60:02d}:{dur_sec % 60:02d}"
         self.time_label.setText(f"{pos_str} / {dur_str}")
 
     def _on_slider_moved(self, value):
         duration = self.player.duration()
-        if duration > 0:
-            pos = int(value * duration / 1000)
-            self.player.setPosition(pos)
+        if duration <= 0:
+            return
+        pos = int(value * duration / 1000)
+        if self.seek_slider.isSliderDown():
+            now = time.monotonic()
+            if now - getattr(self, '_last_seek_time', 0.0) < 0.06:
+                self._pending_seek_pos = pos
+                return
+            self._last_seek_time = now
+            self._pending_seek_pos = None
+        self.player.setPosition(pos)
 
+    def _on_slider_released(self):
+        pending = getattr(self, '_pending_seek_pos', None)
+        if pending is not None:
+            self.player.setPosition(pending)
+            self._pending_seek_pos = None
 
     def contextMenuEvent(self, event):
         is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
         menu = QMenu(self)
-        act_shuffle = menu.addAction(get_vector_icon('shuffle', is_dark), "🎲 Random Discovery Player (R)")
-        act_shuffle.triggered.connect(self.launch_random_discovery_player)
-        menu.addSeparator()
-        act_play = menu.addAction(get_vector_icon('play', is_dark), "Play / Pause (Space)")
+        act_prev = menu.addAction(get_vector_icon('prev', is_dark), "⏮ Previous Video (P / PageUp)")
+        act_prev.triggered.connect(self.play_previous_file)
+        act_play = menu.addAction(get_vector_icon('play', is_dark), "⏯ Play / Pause (Space)")
         act_play.triggered.connect(self._toggle_playback)
+        act_next = menu.addAction(get_vector_icon('next', is_dark), "⏭ Next Video (N / PageDown)")
+        act_next.triggered.connect(self.play_next_file)
+        menu.addSeparator()
+        act_rand_file = menu.addAction(get_vector_icon('shuffle', is_dark), "🎲 Random Video File (R)")
+        act_rand_file.triggered.connect(self.play_random_file)
+        act_rand_time = menu.addAction(get_vector_icon('sync', is_dark), "⏱ Random Timestamp (T)")
+        act_rand_time.triggered.connect(self.randomize_current_time)
+        menu.addSeparator()
         act_mute = menu.addAction(get_vector_icon('mute', is_dark), "Mute / Unmute (M)")
         act_mute.triggered.connect(self._toggle_mute)
         act_fs = menu.addAction(get_vector_icon('preview', is_dark), "Toggle Fullscreen (F)")
@@ -6190,720 +7916,89 @@ class NativeVideoPlayerWindow(QMainWindow):
                 if os.path.isdir(norm_folder):
                     subprocess.Popen(["xdg-open", norm_folder])
 
-    def launch_random_discovery_player(self):
-        self.player.pause()
-        parent_win = self.parent_window
-        candidate_pool = []
-        if parent_win and hasattr(parent_win, 'video_tab') and parent_win.video_tab:
-            for info in getattr(parent_win.video_tab, 'media_infos', []):
-                if getattr(info, 'media_type', '') == 'video' and os.path.exists(info.filepath):
-                    candidate_pool.append(info.filepath)
-        if not candidate_pool:
-            folder = os.path.dirname(self.filepath)
-            if os.path.isdir(folder):
-                try:
-                    for entry in os.scandir(folder):
-                        if entry.is_file() and os.path.splitext(entry.name)[1].lower() in VIDEO_EXTENSIONS:
-                            candidate_pool.append(entry.path)
-                except Exception:
-                    pass
-        if not candidate_pool:
-            candidate_pool = [self.filepath]
-        self.close()
-        shuffle_win = RandomShufflePlayerWindow(candidate_pool, initial_file=self.filepath, parent=parent_win)
-        if parent_win:
-            if not hasattr(parent_win, '_native_players'):
-                parent_win._native_players = []
-            prune_native_players(parent_win)
-            parent_win._native_players.append(shuffle_win)
-        shuffle_win.show()
-
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_R:
-            self.launch_random_discovery_player()
+        key = event.key()
+        if key == Qt.Key.Key_R:
+            self.play_random_file()
             return
-        elif event.key() == Qt.Key.Key_Space:
+        elif key in (Qt.Key.Key_T, Qt.Key.Key_J):
+            self.randomize_current_time()
+            return
+        elif key in (Qt.Key.Key_P, Qt.Key.Key_PageUp):
+            self.play_previous_file()
+            return
+        elif key in (Qt.Key.Key_N, Qt.Key.Key_PageDown):
+            self.play_next_file()
+            return
+        elif key == Qt.Key.Key_Space:
             self._toggle_playback()
             self.show_controls_temporarily()
-        elif event.key() == Qt.Key.Key_Escape:
+        elif key == Qt.Key.Key_Escape:
             if self.isFullScreen():
                 self.toggle_fullscreen()
-        elif event.key() == Qt.Key.Key_M:
+            else:
+                self.close()
+        elif key == Qt.Key.Key_F:
+            self.toggle_fullscreen()
+        elif key == Qt.Key.Key_M:
             self._toggle_mute()
             self.show_controls_temporarily()
-        elif event.key() == Qt.Key.Key_Left:
-            new_pos = max(0, self.player.position() - 10000)
+        elif key in (Qt.Key.Key_BracketRight,):
+            dur = self.player.duration()
+            target = self.player.position() + 5000
+            self.player.setPosition(min(dur, target) if dur > 0 else target)
+            self.show_controls_temporarily()
+        elif key in (Qt.Key.Key_BracketLeft,):
+            new_pos = max(0, self.player.position() - 5000)
             self.player.setPosition(new_pos)
             self.show_controls_temporarily()
-        elif event.key() == Qt.Key.Key_Right:
-            duration = self.player.duration()
-            new_pos = min(duration, self.player.position() + 10000) if duration > 0 else self.player.position() + 10000
+        elif key == Qt.Key.Key_Left:
+            step = 10000 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 5000
+            new_pos = max(0, self.player.position() - step)
             self.player.setPosition(new_pos)
             self.show_controls_temporarily()
-        elif event.key() == Qt.Key.Key_Up:
+        elif key == Qt.Key.Key_Right:
+            step = 10000 if (event.modifiers() & Qt.KeyboardModifier.ControlModifier) else 5000
+            dur = self.player.duration()
+            target = self.player.position() + step
+            self.player.setPosition(min(dur, target) if dur > 0 else target)
+            self.show_controls_temporarily()
+        elif key == Qt.Key.Key_Up:
             new_vol = min(100, self.volume_slider.value() + 5)
             self.volume_slider.setValue(new_vol)
             self.show_controls_temporarily()
-        elif event.key() == Qt.Key.Key_Down:
+        elif key == Qt.Key.Key_Down:
             new_vol = max(0, self.volume_slider.value() - 5)
             self.volume_slider.setValue(new_vol)
             self.show_controls_temporarily()
         else:
             super().keyPressEvent(event)
 
-
     def closeEvent(self, event):
+        if hasattr(self, '_random_seek_timer'):
+            try:
+                self._random_seek_timer.stop()
+            except Exception:
+                pass
         self.controls_timer.stop()
-        self.player.stop()
-        self.player.setSource(QUrl())
         try:
+            self.player.stop()
+            self.player.setSource(QUrl())
             self.player.setVideoOutput(None)
             self.player.setAudioOutput(None)
-        except (TypeError, RuntimeError):
+        except (TypeError, RuntimeError, Exception):
             pass
+        if getattr(self, 'parent_window', None) and hasattr(self.parent_window, '_native_players'):
+            try:
+                if self in self.parent_window._native_players:
+                    self.parent_window._native_players.remove(self)
+            except Exception:
+                pass
         super().closeEvent(event)
 
 
-class RandomShufflePlayerWindow(QMainWindow):
-    """Hidden Discovery Video Player.
-    
-    Plays random videos from random timestamps with:
-    - Interactive seek slider with time display
-    - Previous and Next buttons navigating with a full history stack
-    - Jump Time button to re-roll timestamp on the currently playing video
-    - Distinctive futuristic HUD overlay (Cyberpunk/Nebula styled)
-    - Full keyboard navigation and auto-hiding controls
-    """
-    def __init__(self, video_pool: list[str], initial_file: str = None, parent=None):
-        super().__init__(parent)
-        self.parent_window = parent
-        self.setWindowFlags(Qt.WindowType.Window)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.resize(980, 560)
-        
-        # Deduplicate pool
-        seen = set()
-        self.video_pool = []
-        for v in (video_pool or []):
-            if isinstance(v, str) and os.path.isfile(v):
-                norm = os.path.normcase(os.path.normpath(v))
-                if norm not in seen:
-                    seen.add(norm)
-                    self.video_pool.append(v)
-        if not self.video_pool and initial_file and os.path.isfile(initial_file):
-            self.video_pool = [initial_file]
-            
-        # History list: [{'filepath': str, 'start_pos_ms': int, 'saved_pos_ms': int, 'duration_ms': int, 'title': str}]
-        self.history = []
-        self.history_index = -1
-        self.pending_random_seek = False
-        self.pending_seek_target_ms = None
-        self._current_filepath = ""
-
-        # Controls auto-hide timer
-        self.controls_timer = QTimer(self)
-        self.controls_timer.setSingleShot(True)
-        self.controls_timer.timeout.connect(self._hide_controls_if_idle)
-        
-        self._build_ui()
-        self._setup_player()
-        
-        # Start initial playback
-        if initial_file and os.path.isfile(initial_file):
-            self._load_video_clip(initial_file, pick_random_time=True, record_new_history=True)
-        else:
-            self.play_random_next(force_new=True)
-
-    def _build_ui(self):
-        is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
-        self.setWindowTitle("MediaFlow — 🎲 Random Discovery Stream")
-        
-        central = QWidget(self)
-        central.setStyleSheet("background: #07060f;" if is_dark else "background: #0f172a;")
-        self.setCentralWidget(central)
-        
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        
-        # ─── Top HUD Header Bar ───
-        self.header_bar = QWidget(central)
-        self.header_bar.setFixedHeight(44)
-        self.header_bar.setStyleSheet(
-            "background: rgba(11, 9, 24, 0.92); border-bottom: 1px solid rgba(34, 211, 238, 0.3);" if is_dark else
-            "background: rgba(248, 250, 252, 0.95); border-bottom: 1px solid #cbd5e1;"
-        )
-        header_layout = QHBoxLayout(self.header_bar)
-        header_layout.setContentsMargins(14, 0, 14, 0)
-        header_layout.setSpacing(10)
-        
-        # Pill Badge
-        badge = QLabel("🎲 RANDOM STREAM", self.header_bar)
-        badge.setStyleSheet(
-            "background: rgba(34, 211, 238, 0.15); color: #22d3ee; border: 1px solid rgba(34, 211, 238, 0.5); "
-            "border-radius: 6px; padding: 3px 8px; font-weight: bold; font-size: 10px; letter-spacing: 1px;"
-        )
-        header_layout.addWidget(badge)
-        
-        # Title Label
-        self.title_label = QLabel("Loading...", self.header_bar)
-        self.title_label.setStyleSheet(
-            "color: #ececf4; font-weight: bold; font-size: 13px;" if is_dark else
-            "color: #0f172a; font-weight: bold; font-size: 13px;"
-        )
-        self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        header_layout.addWidget(self.title_label, 1)
-        
-        # Metadata Pill
-        self.meta_label = QLabel("", self.header_bar)
-        self.meta_label.setStyleSheet("color: #a78bfa; font-size: 11px; font-weight: 600;" if is_dark else "color: #6366f1; font-size: 11px; font-weight: 600;")
-        header_layout.addWidget(self.meta_label)
-        
-        # History Counter
-        self.history_label = QLabel("Track 1 / 1", self.header_bar)
-        self.history_label.setFont(_mono_font(9, bold=True))
-        self.history_label.setStyleSheet("color: #22d3ee; padding: 2px 6px; background: rgba(34, 211, 238, 0.1); border-radius: 4px;")
-        header_layout.addWidget(self.history_label)
-        
-        layout.addWidget(self.header_bar)
-        
-        # ─── Video Display Widget ───
-        self.video_widget = DoubleClickVideoWidget(central)
-        self.video_widget.double_clicked.connect(self.toggle_fullscreen)
-        self.video_widget.mouse_moved.connect(self.show_controls_temporarily)
-        layout.addWidget(self.video_widget, 1)
-        
-        # ─── Bottom HUD Controls ───
-        self.controls_widget = QWidget(central)
-        self.controls_widget.setFixedHeight(76)
-        self.controls_widget.setStyleSheet(
-            "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(17, 14, 38, 0.96), stop:1 rgba(7, 6, 15, 0.98)); "
-            "border-top: 1px solid rgba(139, 92, 246, 0.35);" if is_dark else
-            "background: rgba(248, 250, 252, 0.98); border-top: 1px solid #cbd5e1;"
-        )
-        controls_layout = QVBoxLayout(self.controls_widget)
-        controls_layout.setContentsMargins(16, 6, 16, 8)
-        controls_layout.setSpacing(6)
-        
-        # Row 1: Seek Slider + Time display
-        seek_row = QHBoxLayout()
-        seek_row.setContentsMargins(0, 0, 0, 0)
-        seek_row.setSpacing(12)
-        
-        self.seek_slider = ClickToSeekSlider(Qt.Orientation.Horizontal, self.controls_widget)
-        self.seek_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.seek_slider.setRange(0, 1000)
-        self.seek_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.seek_slider.setFixedHeight(14)
-        self.seek_slider.setStyleSheet("""
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: rgba(139, 92, 246, 0.25);
-                border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8b5cf6, stop:1 #22d3ee);
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #22d3ee;
-                border: 2px solid #ffffff;
-                width: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #67e8f9;
-                border: 2px solid #22d3ee;
-            }
-        """)
-        seek_row.addWidget(self.seek_slider, 1)
-        
-        self.time_label = QLabel("00:00 / 00:00", self.controls_widget)
-        self.time_label.setFont(_mono_font(9, bold=True))
-        self.time_label.setFixedWidth(115)
-        self.time_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.time_label.setStyleSheet("color: #ececf4;" if is_dark else "color: #0f172a;")
-        seek_row.addWidget(self.time_label)
-        controls_layout.addLayout(seek_row)
-        
-        # Row 2: Control Buttons
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(10)
-        
-        # Prev Button
-        self.btn_prev = QPushButton(self.controls_widget)
-        self.btn_prev.setFixedSize(34, 30)
-        self.btn_prev.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_prev.setIcon(get_vector_icon('prev', is_dark))
-        self.btn_prev.setToolTip("Previous in History (P / Left)")
-        self.btn_prev.clicked.connect(self.play_history_prev)
-        self.btn_prev.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(self.btn_prev)
-        
-        # Play / Pause
-        self.btn_play = QPushButton(self.controls_widget)
-        self.btn_play.setFixedSize(36, 30)
-        self.btn_play.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_play.setIcon(get_vector_icon('play', is_dark))
-        self.btn_play.setToolTip("Play / Pause (Space)")
-        self.btn_play.clicked.connect(self._toggle_playback)
-        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        apply_glow(self.btn_play, "#22d3ee", radius=14, alpha=100)
-        btn_row.addWidget(self.btn_play)
-        
-        # Next Button
-        self.btn_next = QPushButton(self.controls_widget)
-        self.btn_next.setFixedSize(34, 30)
-        self.btn_next.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_next.setIcon(get_vector_icon('next', is_dark))
-        self.btn_next.setToolTip("Next Random Video & Timestamp (N / Right)")
-        self.btn_next.clicked.connect(lambda: self.play_random_next(force_new=False))
-        self.btn_next.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(self.btn_next)
-        
-        # Jump Time button
-        self.btn_jump_time = QPushButton(" 🎲 Jump Time", self.controls_widget)
-        self.btn_jump_time.setFixedHeight(30)
-        self.btn_jump_time.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_jump_time.setIcon(get_vector_icon('shuffle', is_dark))
-        self.btn_jump_time.setToolTip("Jump to a new random timestamp in this video (J / R)")
-        self.btn_jump_time.clicked.connect(self.jump_random_time_current)
-        self.btn_jump_time.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_jump_time.setStyleSheet(
-            "QPushButton { background: rgba(34, 211, 238, 0.12); color: #22d3ee; border: 1px solid rgba(34, 211, 238, 0.4); "
-            "border-radius: 6px; font-weight: 600; padding: 0 10px; } "
-            "QPushButton:hover { background: rgba(34, 211, 238, 0.25); border-color: #22d3ee; }"
-        )
-        btn_row.addWidget(self.btn_jump_time)
-        
-        # Shuffle New Video button
-        self.btn_force_shuffle = QPushButton(" 🔀 New Video", self.controls_widget)
-        self.btn_force_shuffle.setFixedHeight(30)
-        self.btn_force_shuffle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_force_shuffle.setIcon(get_vector_icon('sync', is_dark))
-        self.btn_force_shuffle.setToolTip("Always pick a new random video from pool (Shift+N)")
-        self.btn_force_shuffle.clicked.connect(lambda: self.play_random_next(force_new=True))
-        self.btn_force_shuffle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_force_shuffle.setStyleSheet(
-            "QPushButton { background: rgba(139, 92, 246, 0.15); color: #c4b5fd; border: 1px solid rgba(139, 92, 246, 0.4); "
-            "border-radius: 6px; font-weight: 600; padding: 0 10px; } "
-            "QPushButton:hover { background: rgba(139, 92, 246, 0.28); border-color: #a78bfa; }"
-        )
-        btn_row.addWidget(self.btn_force_shuffle)
-        
-        # Audio controls
-        btn_row.addSpacing(10)
-        self.btn_mute = QPushButton(self.controls_widget)
-        self.btn_mute.setFixedSize(30, 30)
-        self.btn_mute.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_mute.clicked.connect(self._toggle_mute)
-        self.btn_mute.setIcon(get_vector_icon('unmute', is_dark))
-        self.btn_mute.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(self.btn_mute)
-        
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal, self.controls_widget)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(70)
-        self.volume_slider.setFixedWidth(85)
-        self.volume_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.volume_slider.valueChanged.connect(self._on_volume_changed)
-        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(self.volume_slider)
-        
-        btn_row.addStretch()
-        
-        # Pool size counter
-        self.pool_label = QLabel(f"Pool: {len(self.video_pool)} videos", self.controls_widget)
-        self.pool_label.setStyleSheet("color: #8e8aa8; font-size: 11px;")
-        btn_row.addWidget(self.pool_label)
-        
-        # Fullscreen button
-        self.btn_fullscreen = QPushButton(self.controls_widget)
-        self.btn_fullscreen.setFixedSize(30, 30)
-        self.btn_fullscreen.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
-        self.btn_fullscreen.setIcon(get_vector_icon('preview', is_dark))
-        self.btn_fullscreen.setToolTip("Toggle Fullscreen (F)")
-        self.btn_fullscreen.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_row.addWidget(self.btn_fullscreen)
-        
-        controls_layout.addLayout(btn_row)
-        layout.addWidget(self.controls_widget)
-        
-        # Mouse tracking & event filters for auto-hiding
-        self._enable_mouse_tracking_recursive(central)
-        self.setMouseTracking(True)
-        central.installEventFilter(self)
-        for child in central.findChildren(QWidget):
-            child.installEventFilter(self)
-
-    def _setup_player(self):
-        is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
-        self.player = QMediaPlayer(self)
-        self.audio_output = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio_output)
-        self.player.setVideoOutput(self.video_widget)
-        
-        self.player.positionChanged.connect(self._on_player_position_changed)
-        self.player.durationChanged.connect(self._on_player_duration_changed)
-        self.player.playbackStateChanged.connect(self._on_player_state_changed)
-        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
-        self.seek_slider.valueChanged.connect(self._on_slider_moved)
-        
-        global_mute = getattr(self.parent_window, 'global_mute', False) if self.parent_window else False
-        self.audio_output.setMuted(global_mute)
-        self.audio_output.setVolume(0.7)
-        self.btn_mute.setIcon(get_vector_icon('mute' if global_mute else 'unmute', is_dark))
-
-    def _enable_mouse_tracking_recursive(self, widget):
-        widget.setMouseTracking(True)
-        for child in widget.findChildren(QWidget):
-            child.setMouseTracking(True)
-
-    def eventFilter(self, watched, event):
-        if event.type() in (QEvent.Type.MouseMove, QEvent.Type.MouseButtonPress):
-            self.show_controls_temporarily()
-        elif event.type() == QEvent.Type.Wheel:
-            delta = event.angleDelta().y()
-            if delta > 0:
-                self.volume_slider.setValue(min(100, self.volume_slider.value() + 5))
-            elif delta < 0:
-                self.volume_slider.setValue(max(0, self.volume_slider.value() - 5))
-            self.show_controls_temporarily()
-            return True
-        return super().eventFilter(watched, event)
-
-    def show_controls_temporarily(self):
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.controls_widget.show()
-        self.header_bar.show()
-        if self.isFullScreen():
-            self.controls_timer.start(2500)
-
-    def _hide_controls_if_idle(self):
-        if self.isFullScreen():
-            self.controls_widget.hide()
-            self.header_bar.hide()
-            self.setCursor(Qt.CursorShape.BlankCursor)
-
-    def toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
-            self.controls_widget.show()
-            self.header_bar.show()
-            self.setCursor(Qt.CursorShape.ArrowCursor)
-            self.controls_timer.stop()
-        else:
-            self.showFullScreen()
-            self.show_controls_temporarily()
-
-    def _toggle_playback(self):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
-
-    def _toggle_mute(self):
-        is_muted = self.audio_output.isMuted()
-        self.audio_output.setMuted(not is_muted)
-        is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
-        self.btn_mute.setIcon(get_vector_icon('mute' if not is_muted else 'unmute', is_dark))
-
-    def _on_volume_changed(self, value):
-        self.audio_output.setVolume(value / 100.0)
-        if value > 0 and self.audio_output.isMuted():
-            self._toggle_mute()
-
-    def _on_player_state_changed(self, state):
-        is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.btn_play.setIcon(get_vector_icon('pause', is_dark))
-        else:
-            self.btn_play.setIcon(get_vector_icon('play', is_dark))
-
-    def _on_player_position_changed(self, position):
-        if not self.seek_slider.isSliderDown():
-            self.seek_slider.blockSignals(True)
-            duration = self.player.duration()
-            if duration > 0:
-                self.seek_slider.setValue(int(position * 1000 / duration))
-            self.seek_slider.blockSignals(False)
-        self._update_time_label(position, self.player.duration())
-
-    def _on_player_duration_changed(self, duration):
-        self._update_time_label(self.player.position(), duration)
-        if self.pending_random_seek and duration > 0:
-            self.pending_random_seek = False
-            target_pos = self._calc_random_time(duration)
-            self.player.setPosition(target_pos)
-            if 0 <= self.history_index < len(self.history):
-                self.history[self.history_index]['start_pos_ms'] = target_pos
-                self.history[self.history_index]['saved_pos_ms'] = target_pos
-                self.history[self.history_index]['duration_ms'] = duration
-        elif self.pending_seek_target_ms is not None and duration > 0:
-            target = min(duration - 500, max(0, self.pending_seek_target_ms))
-            self.pending_seek_target_ms = None
-            self.player.setPosition(target)
-
-    def _on_media_status_changed(self, status):
-        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
-            dur = self.player.duration()
-            if self.pending_random_seek and dur > 0:
-                self.pending_random_seek = False
-                target_pos = self._calc_random_time(dur)
-                self.player.setPosition(target_pos)
-                if 0 <= self.history_index < len(self.history):
-                    self.history[self.history_index]['start_pos_ms'] = target_pos
-                    self.history[self.history_index]['saved_pos_ms'] = target_pos
-                    self.history[self.history_index]['duration_ms'] = dur
-            elif self.pending_seek_target_ms is not None and dur > 0:
-                target = min(dur - 500, max(0, self.pending_seek_target_ms))
-                self.pending_seek_target_ms = None
-                self.player.setPosition(target)
-
-    def _update_time_label(self, position, duration):
-        pos_sec = max(0, int(position)) // 1000
-        dur_sec = max(0, int(duration)) // 1000
-        pos_str = f"{pos_sec // 60:02d}:{pos_sec % 60:02d}"
-        dur_str = f"{dur_sec // 60:02d}:{dur_sec % 60:02d}"
-        self.time_label.setText(f"{pos_str} / {dur_str}")
-
-    def _on_slider_moved(self, value):
-        duration = self.player.duration()
-        if duration > 0:
-            pos = int(value * duration / 1000)
-            self.player.setPosition(pos)
-
-    def _calc_random_time(self, duration_ms: int) -> int:
-        if duration_ms > 12000:
-            min_pos = int(duration_ms * 0.05)
-            max_pos = int(duration_ms * 0.85)
-            return random.randint(min_pos, max_pos)
-        elif duration_ms > 3000:
-            return random.randint(500, duration_ms - 1000)
-        return 0
-
-    def _load_video_clip(self, filepath: str, target_time_ms: int = None, pick_random_time: bool = False, record_new_history: bool = True):
-        self._current_filepath = filepath
-        self.title_label.setText(os.path.basename(filepath))
-        self.setWindowTitle(f"MediaFlow — 🎲 {os.path.basename(filepath)}")
-        
-        # Check if duration is known beforehand from parent tab MediaInfo
-        known_duration_ms = 0
-        if self.parent_window and hasattr(self.parent_window, 'video_tab') and self.parent_window.video_tab:
-            for info in getattr(self.parent_window.video_tab, 'media_infos', []):
-                if getattr(info, 'filepath', '') == filepath:
-                    if getattr(info, 'duration_seconds', 0) > 0:
-                        known_duration_ms = int(info.duration_seconds * 1000)
-                    res = getattr(info, 'resolution_tag', '')
-                    dims = f"{getattr(info, 'width', 0)}x{getattr(info, 'height', 0)}" if getattr(info, 'width', 0) > 0 else ""
-                    self.meta_label.setText(f"[{res} {dims}]" if res or dims else "")
-                    break
-
-        if target_time_ms is not None:
-            self.pending_seek_target_ms = target_time_ms
-            self.pending_random_seek = False
-            start_pos = target_time_ms
-        elif pick_random_time:
-            if known_duration_ms > 0:
-                start_pos = self._calc_random_time(known_duration_ms)
-                self.pending_seek_target_ms = start_pos
-                self.pending_random_seek = False
-            else:
-                self.pending_random_seek = True
-                self.pending_seek_target_ms = None
-                start_pos = 0
-        else:
-            self.pending_seek_target_ms = None
-            self.pending_random_seek = False
-            start_pos = 0
-
-        if record_new_history:
-            entry = {
-                'filepath': filepath,
-                'start_pos_ms': start_pos,
-                'saved_pos_ms': start_pos,
-                'duration_ms': known_duration_ms,
-                'title': os.path.basename(filepath)
-            }
-            # Truncate future history if branched
-            if self.history_index < len(self.history) - 1:
-                self.history = self.history[:self.history_index + 1]
-            self.history.append(entry)
-            self.history_index = len(self.history) - 1
-
-        self._update_history_ui()
-        
-        self.player.setSource(QUrl.fromLocalFile(filepath))
-        self.player.play()
-        if start_pos > 0:
-            QTimer.singleShot(150, lambda: self._apply_initial_seek(start_pos))
-
-    def _apply_initial_seek(self, target_ms: int):
-        if self.player and self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
-            dur = self.player.duration()
-            if dur > 0:
-                self.player.setPosition(min(dur - 500, max(0, target_ms)))
-
-    def _update_history_ui(self):
-        total = len(self.history)
-        current = self.history_index + 1 if total > 0 else 0
-        self.history_label.setText(f"Track {current} / {total}")
-        self.btn_prev.setEnabled(self.history_index > 0)
-
-    def play_random_next(self, force_new: bool = False):
-        if 0 <= self.history_index < len(self.history):
-            self.history[self.history_index]['saved_pos_ms'] = self.player.position()
-
-        if not force_new and self.history_index < len(self.history) - 1:
-            # Advance in existing history forward
-            self.history_index += 1
-            entry = self.history[self.history_index]
-            self._load_video_clip(entry['filepath'], target_time_ms=entry['saved_pos_ms'], pick_random_time=False, record_new_history=False)
-            return
-
-        # Pick new random video from pool
-        if not self.video_pool:
-            return
-        
-        if len(self.video_pool) > 1:
-            choices = [v for v in self.video_pool if v != self._current_filepath]
-            chosen = random.choice(choices if choices else self.video_pool)
-        else:
-            chosen = self.video_pool[0]
-
-        self._load_video_clip(chosen, pick_random_time=True, record_new_history=True)
-
-    def play_history_prev(self):
-        if self.history_index <= 0:
-            return
-        if 0 <= self.history_index < len(self.history):
-            self.history[self.history_index]['saved_pos_ms'] = self.player.position()
-        
-        self.history_index -= 1
-        entry = self.history[self.history_index]
-        self._load_video_clip(entry['filepath'], target_time_ms=entry['saved_pos_ms'], pick_random_time=False, record_new_history=False)
-
-    def jump_random_time_current(self):
-        if not self._current_filepath:
-            return
-        dur = self.player.duration()
-        if dur > 0:
-            new_pos = self._calc_random_time(dur)
-            self.player.setPosition(new_pos)
-            if 0 <= self.history_index < len(self.history):
-                self.history[self.history_index]['saved_pos_ms'] = new_pos
-
-    def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key.Key_Space:
-            self._toggle_playback()
-            self.show_controls_temporarily()
-        elif key in (Qt.Key.Key_N, Qt.Key.Key_Right):
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                dur = self.player.duration()
-                target = self.player.position() + 10000
-                self.player.setPosition(min(dur, target) if dur > 0 else target)
-            else:
-                self.play_random_next(force_new=bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier))
-            self.show_controls_temporarily()
-        elif key in (Qt.Key.Key_P, Qt.Key.Key_Left):
-            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-                new_pos = max(0, self.player.position() - 10000)
-                self.player.setPosition(new_pos)
-            else:
-                self.play_history_prev()
-            self.show_controls_temporarily()
-        elif key in (Qt.Key.Key_J, Qt.Key.Key_R):
-            self.jump_random_time_current()
-            self.show_controls_temporarily()
-        elif key == Qt.Key.Key_F:
-            self.toggle_fullscreen()
-        elif key == Qt.Key.Key_Escape:
-            if self.isFullScreen():
-                self.toggle_fullscreen()
-        elif key == Qt.Key.Key_M:
-            self._toggle_mute()
-            self.show_controls_temporarily()
-        elif key == Qt.Key.Key_Up:
-            self.volume_slider.setValue(min(100, self.volume_slider.value() + 5))
-            self.show_controls_temporarily()
-        elif key == Qt.Key.Key_Down:
-            self.volume_slider.setValue(max(0, self.volume_slider.value() - 5))
-            self.show_controls_temporarily()
-        elif key == Qt.Key.Key_BracketLeft:
-            new_pos = max(0, self.player.position() - 5000)
-            self.player.setPosition(new_pos)
-            self.show_controls_temporarily()
-        elif key == Qt.Key.Key_BracketRight:
-            dur = self.player.duration()
-            target = self.player.position() + 5000
-            self.player.setPosition(min(dur, target) if dur > 0 else target)
-            self.show_controls_temporarily()
-        else:
-            super().keyPressEvent(event)
-
-    def contextMenuEvent(self, event):
-        is_dark = getattr(self.parent_window, 'current_theme', 'dark') == 'dark' if self.parent_window else True
-        menu = QMenu(self)
-        act_next = menu.addAction(get_vector_icon('next', is_dark), "Next Random Video (N)")
-        act_next.triggered.connect(lambda: self.play_random_next(force_new=False))
-        act_prev = menu.addAction(get_vector_icon('prev', is_dark), "Previous Video in History (P)")
-        act_prev.setEnabled(self.history_index > 0)
-        act_prev.triggered.connect(self.play_history_prev)
-        act_jump = menu.addAction(get_vector_icon('shuffle', is_dark), "Jump to Random Timestamp (J / R)")
-        act_jump.triggered.connect(self.jump_random_time_current)
-        menu.addSeparator()
-        act_play = menu.addAction(get_vector_icon('play', is_dark), "Play / Pause (Space)")
-        act_play.triggered.connect(self._toggle_playback)
-        act_mute = menu.addAction(get_vector_icon('mute', is_dark), "Mute / Unmute (M)")
-        act_mute.triggered.connect(self._toggle_mute)
-        act_fs = menu.addAction(get_vector_icon('preview', is_dark), "Toggle Fullscreen (F)")
-        act_fs.triggered.connect(self.toggle_fullscreen)
-        menu.addSeparator()
-        act_folder = menu.addAction(get_vector_icon('folder', is_dark), "Open Containing Folder")
-        act_folder.triggered.connect(self._open_containing_folder)
-        menu.exec(event.globalPos())
-
-    def _open_containing_folder(self):
-        if hasattr(self, '_current_filepath') and self._current_filepath:
-            norm_file = os.path.normpath(os.path.abspath(self._current_filepath))
-            norm_folder = os.path.dirname(norm_file)
-            if sys.platform == "win32":
-                if os.path.isfile(norm_file):
-                    try:
-                        subprocess.Popen(f'explorer.exe /select,"{norm_file}"', shell=False)
-                        return
-                    except Exception:
-                        pass
-                if os.path.isdir(norm_folder):
-                    try:
-                        os.startfile(norm_folder)
-                        return
-                    except Exception:
-                        subprocess.Popen(f'explorer.exe "{norm_folder}"', shell=False)
-            elif sys.platform == "darwin":
-                if os.path.isfile(norm_file):
-                    subprocess.Popen(["open", "-R", norm_file])
-                elif os.path.isdir(norm_folder):
-                    subprocess.Popen(["open", norm_folder])
-            else:
-                if os.path.isdir(norm_folder):
-                    subprocess.Popen(["xdg-open", norm_folder])
-
-    def closeEvent(self, event):
-        self.controls_timer.stop()
-        self.player.stop()
-        self.player.setSource(QUrl())
-        try:
-            self.player.setVideoOutput(None)
-            self.player.setAudioOutput(None)
-        except (TypeError, RuntimeError):
-            pass
-        super().closeEvent(event)
+# Backward-compatibility alias: RandomShufflePlayerWindow is unified into NativeVideoPlayerWindow
+RandomShufflePlayerWindow = NativeVideoPlayerWindow
 
 
 class SingleVideoSubPlayer(QWidget):
@@ -7733,11 +8828,17 @@ class ComparisonViewWindow(QMainWindow):
             append_rename_audit([(info.filepath, "(recycle bin)")] + [(p, "(recycle bin)") for p in trashed], op="delete")
             if self.parent_tab:
                 # Find row in table and remove
-                for row in range(self.parent_tab.table.rowCount()):
-                    row_info = self.parent_tab._get_row_info(row)
-                    if row_info and row_info.filepath == info.filepath:
-                        self.parent_tab._remove_row_from_list(row)
-                        break
+                target_row = -1
+                if hasattr(self.parent_tab, '_find_row_for_info'):
+                    target_row = self.parent_tab._find_row_for_info(info)
+                if target_row == -1:
+                    for row in range(self.parent_tab.table.rowCount()):
+                        row_info = self.parent_tab._get_row_info(row)
+                        if row_info and (row_info is info or _same_file_path(row_info.filepath, info.filepath)):
+                            target_row = row
+                            break
+                if target_row != -1:
+                    self.parent_tab._remove_row_from_list(target_row)
                 if hasattr(self.parent_tab, '_show_toast'):
                     self.parent_tab._show_toast(f"Deleted {info.filename}", 'success')
             self.close()
@@ -8684,7 +9785,7 @@ class DuplicateScanWorker(QThread):
         try:
             if self.mode == 'exact':
                 try:
-                    from rust_bridge import is_rust_core_available, find_duplicates_rust
+                    from rust_bridge import is_rust_core_available, find_duplicates_rust, normalize_ipc_path
                     rust_avail = is_rust_core_available()
                 except Exception:
                     rust_avail = False
@@ -8697,10 +9798,10 @@ class DuplicateScanWorker(QThread):
                             on_progress=lambda d, t, p: self.progress.emit(d, t, p),
                             is_cancelled=lambda: self._cancelled,
                         )
-                        path_to_idx = {os.path.normcase(os.path.normpath(e['path'])): i for i, e in enumerate(entries)}
+                        path_to_idx = {normalize_ipc_path(e['path']): i for i, e in enumerate(entries)}
                         resolved_groups = []
                         for g in raw_groups:
-                            idxs = list(dict.fromkeys(path_to_idx[os.path.normcase(os.path.normpath(p))] for p in g if os.path.normcase(os.path.normpath(p)) in path_to_idx))
+                            idxs = list(dict.fromkeys(path_to_idx[normalize_ipc_path(p)] for p in g if normalize_ipc_path(p) in path_to_idx))
                             if len(idxs) > 1:
                                 resolved_groups.append(idxs)
                         return self._emit(resolved_groups, skipped)
@@ -8953,7 +10054,7 @@ class DuplicateResolverDialog(QDialog):
             self.tree.addTopLevelItem(parent)
             for idx in grp:
                 e = self.entries[idx]
-                details = f"{format_size(e['size'])}  ·  {datetime.fromtimestamp(e['mtime']).strftime('%Y-%m-%d %H:%M')}"
+                details = f"{format_size(e['size'])}  ·  {format_timestamp(e['mtime'])}"
                 child = QTreeWidgetItem([os.path.basename(e['path']), details])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 child.setCheckState(0, Qt.CheckState.Unchecked)
@@ -9079,8 +10180,12 @@ class DuplicateResolverDialog(QDialog):
                             failures.append(f"{os.path.basename(sc)}: could not recycle sidecar")
                     append_rename_audit([(p, "(recycle bin)") for p in trashed], op="delete")
                     row = id_to_row.get(id(info), -1)
+                    if row == -1 and hasattr(tab, '_find_row_for_info'):
+                        row = tab._find_row_for_info(info)
                     if row >= 0:
                         rows_to_remove.append(row)
+                    else:
+                        tab.media_infos = [v for v in tab.media_infos if v is not info and not _same_file_path(v.filepath, path)]
                     recycled_info_ids.add(id(info))
                     recycled += 1
                 else:
@@ -9298,20 +10403,23 @@ class MediaTagEditorDialog(QDialog):
                 exif['0th'][piexif.ImageIFD.Artist] = artist.encode('utf-8')
             else:
                 exif['0th'].pop(piexif.ImageIFD.Artist, None)
-        if 'date' in values and dt is not None:
-            stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
-            # A value without a time must not wipe the captured time of day:
-            # keep the original time when only the date part was changed.
-            if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
-                original = exif.get('Exif', {}).get(piexif.ExifIFD.DateTimeOriginal)
-                if original:
-                    try:
-                        orig_text = original.decode('ascii', 'replace').strip()
-                    except Exception:
-                        orig_text = ''
-                    if len(orig_text) >= 19 and orig_text[10] in ' T':
-                        stamp = f"{dt.strftime('%Y:%m:%d')} {orig_text[11:19]}"
-            exif['Exif'][piexif.ExifIFD.DateTimeOriginal] = stamp.encode('ascii')
+        if 'date' in values:
+            if dt is not None:
+                stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+                # A value without a time must not wipe the captured time of day:
+                # keep the original time when only the date part was changed.
+                if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+                    original = exif.get('Exif', {}).get(piexif.ExifIFD.DateTimeOriginal)
+                    if original:
+                        try:
+                            orig_text = original.decode('ascii', 'replace').strip()
+                        except Exception:
+                            orig_text = ''
+                        if len(orig_text) >= 19 and orig_text[10] in ' T':
+                            stamp = f"{dt.strftime('%Y:%m:%d')} {orig_text[11:19]}"
+                exif['Exif'][piexif.ExifIFD.DateTimeOriginal] = stamp.encode('ascii')
+            else:
+                exif['Exif'].pop(piexif.ExifIFD.DateTimeOriginal, None)
         exif_bytes = piexif.dump(exif)
         piexif.insert(exif_bytes, path)
 
@@ -9683,7 +10791,8 @@ class MediaTab(QWidget):
         
         self._search_history = []
         self._stats_dirty = True
-        
+        self.audio_player_bar = None
+
         self._build_ui()
         if self.is_smart_folder: self.btn_load.setEnabled(True)
 
@@ -10153,6 +11262,9 @@ class MediaTab(QWidget):
         bottom_layout.addLayout(bottom_row1)
         bottom_layout.addLayout(bottom_row2)
         root_layout.addLayout(bottom_layout)
+        if self.media_type == 'audio':
+            self.audio_player_bar = AudioPlayerBar(self)
+            root_layout.addWidget(self.audio_player_bar)
 
     def _make_stat_card(self, value: str, label: str) -> QFrame:
         card = QFrame()
@@ -10584,7 +11696,8 @@ class MediaTab(QWidget):
             pattern = pattern.lower().strip()
             if not pattern: continue
             if pattern.startswith('*') and pattern.endswith('*'):
-                if pattern[1:-1] in filename: return True
+                inner = pattern[1:-1]
+                if not inner or all(c == '*' for c in inner) or inner in filename: return True
             elif pattern.startswith('*'):
                 if filename.endswith(pattern[1:]): return True
             elif pattern.endswith('*'):
@@ -10679,13 +11792,13 @@ class MediaTab(QWidget):
             # they must not be treated as "removed" on the next poll — that
             # deleted the row (and released its player) even though the file
             # was still on disk.
-            watched = [os.path.normcase(os.path.abspath(d)) for d in self.directories]
+            watched = [os.path.normcase(os.path.abspath(os.path.normpath(d))).rstrip(os.sep) + os.sep for d in self.directories]
             rebuilt = {}
             for info in self.media_infos:
                 path = getattr(info, 'filepath', '') or ''
                 if not path: continue
                 abs_path = os.path.normcase(os.path.abspath(path))
-                if watched and not any(abs_path.startswith(d + os.sep) or abs_path == d for d in watched):
+                if watched and not any((abs_path + os.sep).startswith(d) for d in watched):
                     continue
                 rebuilt[os.path.normcase(os.path.normpath(path))] = path
             self._known_files = rebuilt
@@ -10702,11 +11815,11 @@ class MediaTab(QWidget):
                 try:
                     for entry in os.scandir(current_dir):
                         try:
+                            if entry.name.startswith('.'):
+                                continue  # dotfiles and dotdirs (.git, .DS_Store, .venv) are never media
                             if entry.is_dir(follow_symlinks=False):
                                 stack.append(entry.path)
                             elif entry.is_file(follow_symlinks=True):
-                                if entry.name.startswith('.'):
-                                    continue  # dotfiles (.DS_Store, .gitignore) are never media
                                 ext = os.path.splitext(entry.name)[1].lower()
                                 # Match ScannerThread semantics: known extensions
                                 # plus extensionless files only ('all' already
@@ -10918,6 +12031,7 @@ class MediaTab(QWidget):
         self.table.setSortingEnabled(False)
         success = errors = skipped = 0
         error_msgs = []
+        claimed_targets = set()
         self._release_file_locks([info.filepath for _, info, _, _ in pending])
         try:
             for row, info, preset_name, preset in pending:
@@ -10946,23 +12060,39 @@ class MediaTab(QWidget):
                 src = info.filepath
                 dst = os.path.join(os.path.dirname(src), target_display)
                 same_file = _same_file_path(src, dst)
-                if os.path.exists(dst) and not same_file:
+                if (os.path.exists(dst) or _abs_path_key(dst) in claimed_targets) and not same_file:
                     base, ext = _split_target_for_suffix(target_display, info.extension)
                     counter = 1
-                    while os.path.exists(dst):
+                    while os.path.exists(dst) or _abs_path_key(dst) in claimed_targets:
                         dst = os.path.join(os.path.dirname(src), f"{base}_{counter}{ext}")
                         counter += 1
+                claimed_targets.add(_abs_path_key(dst))
                 try:
-                    os.rename(src, dst)
+                    if sys.platform == "win32" and same_file and os.path.abspath(src) != os.path.abspath(dst):
+                        tmp_dst = dst + f".__mf_tmp_{random.randint(10000, 99999)}__"
+                        os.rename(src, tmp_dst)
+                        try:
+                            os.rename(tmp_dst, dst)
+                        except Exception:
+                            if os.path.exists(tmp_dst):
+                                try:
+                                    os.rename(tmp_dst, src)
+                                except Exception:
+                                    pass
+                            raise
+                    else:
+                        os.rename(src, dst)
                     info.filepath = dst
                     info.filename = os.path.basename(dst)
                     info.extension = _renamed_extension(dst, info.extension)
                     self._updating_table = True
-                    fname_item.setText(info.filename)
-                    fname_item.setToolTip(dst)
-                    status_item.setText(f"Auto ({preset_name})")
-                    status_item.setForeground(QColor("#818cf8"))
-                    self._updating_table = False
+                    try:
+                        fname_item.setText(info.filename)
+                        fname_item.setToolTip(dst)
+                        status_item.setText(f"Auto ({preset_name})")
+                        status_item.setForeground(QColor("#818cf8"))
+                    finally:
+                        self._updating_table = False
                     _gi = self._grid_item(info)
                     if _gi:
                         _gi.setText(info.filename)
@@ -10970,7 +12100,7 @@ class MediaTab(QWidget):
                     # an auto-rename un-undoable (same contract as Process All).
                     self._add_to_history(src, dst, row, op=f"auto:{preset_name}")
                     try:
-                        moved_extra = self._move_sidecars(src, dst)
+                        moved_extra = self._move_sidecars(src, dst, info.extension)
                     except Exception as sidecar_err:
                         logger.warning("Auto-rename sidecar move error (%s -> %s): %s", src, dst, sidecar_err)
                         moved_extra = []
@@ -11075,6 +12205,8 @@ class MediaTab(QWidget):
 
 
     def _on_clear(self, keep_watch: bool = False):
+        if hasattr(self, 'audio_player_bar') and self.audio_player_bar:
+            self.audio_player_bar.stop()
         if not keep_watch:
             self._watch_timer.stop()
             self._watch_enabled = False
@@ -11953,7 +13085,7 @@ class MediaTab(QWidget):
                 it.setText(format_timestamp(ts))
                 it.sort_key = ts
 
-    def _move_sidecars(self, old_path: str, new_path: str) -> list:
+    def _move_sidecars(self, old_path: str, new_path: str, ext: str = None) -> list:
         """Move sibling subtitle/NFO files along with their media file.
 
         Returns the list of (old, new) pairs so undo/redo can revert them.
@@ -11961,8 +13093,18 @@ class MediaTab(QWidget):
         """
         moved = []
         failed = 0
-        old_stem = os.path.basename(os.path.splitext(old_path)[0])
-        new_stem = os.path.splitext(new_path)[0]
+        all_exts = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS | IMAGE_EXTENSIONS | PDF_EXTENSIONS
+        old_ext = ext if ext is not None else os.path.splitext(old_path)[1]
+        if old_ext and old_ext.lower() in all_exts and old_path.lower().endswith(old_ext.lower()):
+            old_stem = os.path.basename(old_path[:-len(old_ext)])
+        else:
+            old_stem = os.path.basename(old_path)
+
+        new_ext = os.path.splitext(new_path)[1]
+        if new_ext and new_ext.lower() in all_exts and new_path.lower().endswith(new_ext.lower()):
+            new_stem = new_path[:-len(new_ext)]
+        else:
+            new_stem = new_path
         for sidecar in find_sidecars(old_path):
             base = os.path.basename(sidecar)
             # find_sidecars matches case-insensitively; plain slicing by
@@ -11973,7 +13115,7 @@ class MediaTab(QWidget):
             else:
                 rel = base
             target = new_stem + rel
-            same_file = os.path.normcase(os.path.abspath(sidecar)) == os.path.normcase(os.path.abspath(target))
+            same_file = _same_file_path(sidecar, target)
             try:
                 if os.path.exists(target) and not same_file:
                     b, x = os.path.splitext(target)
@@ -12461,7 +13603,7 @@ class MediaTab(QWidget):
                         dest_file = os.path.join(dest_dir, info.filename)
                         same_file = _same_file_path(src, dest_file)
                         if os.path.exists(dest_file) and not same_file:
-                            base, ext = os.path.splitext(info.filename)
+                            base, ext = _split_target_for_suffix(info.filename, info.extension)
                             counter = 1
                             while os.path.exists(dest_file):
                                 dest_file = os.path.join(dest_dir, f"{base}_{counter}{ext}")
@@ -12472,11 +13614,12 @@ class MediaTab(QWidget):
                         # Update info and matching table items
                         info.filepath = dest_file
                         info.filename = os.path.basename(dest_file)
+                        info.extension = _renamed_extension(dest_file, info.extension)
 
                         row_idx = id_to_row.get(id(info), -1)
 
                         # Sidecars + dates + history must happen even when row_idx==-1
-                        moved_extra = self._move_sidecars(src, dest_file)
+                        moved_extra = self._move_sidecars(src, dest_file, info.extension)
                         self._refresh_row_dates(info)
                         if row_idx >= 0:
                             fname_item = self.table.item(row_idx, self.COL_FILENAME)
@@ -12554,6 +13697,9 @@ class MediaTab(QWidget):
             player_path = self.default_player
 
         if player_path == "native":
+            if info.media_type == 'audio' and hasattr(self, 'audio_player_bar') and self.audio_player_bar is not None:
+                self.audio_player_bar.play_row(row)
+                return
             if main_win:
                 if not hasattr(main_win, '_native_players'):
                     main_win._native_players = []
@@ -12667,11 +13813,6 @@ class MediaTab(QWidget):
             trim_action.triggered.connect(lambda checked=False, r=row: self._on_quick_trim(r))
             menu.addAction(trim_action)
 
-            random_action = QAction("🎲 Random Discovery Player", self)
-            random_action.setIcon(get_vector_icon('shuffle', is_dark))
-            random_action.triggered.connect(lambda checked=False, r=row: self._play_random_shuffle(r))
-            menu.addAction(random_action)
-
         # ─── Open With Submenu ───
         open_with_menu = menu.addMenu("Open with…")
         win_dialog_action = QAction("System open with...", self)
@@ -12682,12 +13823,6 @@ class MediaTab(QWidget):
             native_player_action = QAction("MediaFlow Native Player", self)
             native_player_action.triggered.connect(lambda checked=False, fp=info.filepath: self._play_native(fp))
             open_with_menu.addAction(native_player_action)
-
-        if info.media_type == 'video':
-            random_action_ow = QAction("🎲 Random Discovery Player", self)
-            random_action_ow.setIcon(get_vector_icon('shuffle', is_dark))
-            random_action_ow.triggered.connect(lambda checked=False, fp=info.filepath: self._play_random_shuffle_filepath(fp))
-            open_with_menu.addAction(random_action_ow)
         
         main_win = self.window()
         custom_apps = getattr(main_win, 'open_with_apps', [])
@@ -12923,7 +14058,7 @@ class MediaTab(QWidget):
                 main_win._native_players.append(player_win)
 
     def _play_random_shuffle(self, row: int = -1):
-        """Open the hidden Random Discovery Video Player."""
+        """Open video in Native Video Player with random playback."""
         filepath = None
         if row >= 0:
             info = self._get_row_info(row)
@@ -12948,17 +14083,18 @@ class MediaTab(QWidget):
         if not candidate_pool and filepath:
             candidate_pool = [filepath]
         if not candidate_pool:
-            QMessageBox.information(self, "No Videos", "No video files found to play in Random Discovery mode.")
+            QMessageBox.information(self, "No Videos", "No video files found to play in Random mode.")
             return
 
         target_parent = main_win if main_win else self
-        shuffle_win = RandomShufflePlayerWindow(candidate_pool, initial_file=filepath, parent=target_parent)
+        chosen_file = filepath if filepath else random.choice(candidate_pool)
+        player_win = NativeVideoPlayerWindow(candidate_pool, initial_file=chosen_file, parent=target_parent, start_random_time=True)
         if main_win:
             if not hasattr(main_win, '_native_players'):
                 main_win._native_players = []
             prune_native_players(main_win)
-            main_win._native_players.append(shuffle_win)
-        shuffle_win.show()
+            main_win._native_players.append(player_win)
+        player_win.show()
 
     def _play_random_shuffle_filepath(self, filepath: str):
         row = -1
@@ -13122,12 +14258,18 @@ class MediaTab(QWidget):
             self.table.setSortingEnabled(was_sorting)
 
     def _find_row_for_info(self, target_info) -> int:
-        """Find the current row index of a MediaInfo object by identity."""
+        """Find the current row index of a MediaInfo object by identity or path."""
         if target_info is None:
             return -1
         for row in range(self.table.rowCount()):
             if self._get_row_info(row) is target_info:
                 return row
+        tgt_path = getattr(target_info, 'filepath', None)
+        if tgt_path:
+            for row in range(self.table.rowCount()):
+                info = self._get_row_info(row)
+                if info and _same_file_path(info.filepath, tgt_path):
+                    return row
         return -1
 
     def _on_delete_selected(self, target_row: int = -1):
@@ -13271,7 +14413,15 @@ class MediaTab(QWidget):
             if sys.platform == "win32" and same_file and os.path.abspath(src) != os.path.abspath(dst):
                 tmp_dst = dst + f".__mf_tmp_{random.randint(10000, 99999)}__"
                 os.rename(src, tmp_dst)
-                os.rename(tmp_dst, dst)
+                try:
+                    os.rename(tmp_dst, dst)
+                except Exception:
+                    if os.path.exists(tmp_dst):
+                        try:
+                            os.rename(tmp_dst, src)
+                        except Exception:
+                            pass
+                    raise
             else:
                 os.rename(src, dst)
         except Exception as e:
@@ -13303,7 +14453,7 @@ class MediaTab(QWidget):
             # successful os.rename must not leave the rename un-undoable.
             self._add_to_history(src, dst, row)
             try:
-                moved_extra = self._move_sidecars(src, dst)
+                moved_extra = self._move_sidecars(src, dst, info.extension)
             except Exception as sidecar_err:
                 logger.warning("Sidecar move error after rename (%s -> %s): %s", src, dst, sidecar_err)
                 moved_extra = []
@@ -13405,7 +14555,15 @@ class MediaTab(QWidget):
                         if sys.platform == "win32" and same_file and os.path.abspath(src) != os.path.abspath(dst):
                             tmp_dst = dst + f".__mf_tmp_{random.randint(10000, 99999)}__"
                             os.rename(src, tmp_dst)
-                            os.rename(tmp_dst, dst)
+                            try:
+                                os.rename(tmp_dst, dst)
+                            except Exception:
+                                if os.path.exists(tmp_dst):
+                                    try:
+                                        os.rename(tmp_dst, src)
+                                    except Exception:
+                                        pass
+                                raise
                         else:
                             os.rename(src, dst)
                         info.filepath = dst
@@ -13429,7 +14587,7 @@ class MediaTab(QWidget):
                         # marked Error.
                         self._add_to_history(src, dst, row)
                         try:
-                            moved_extra = self._move_sidecars(src, dst)
+                            moved_extra = self._move_sidecars(src, dst, info.extension)
                         except Exception as sidecar_err:
                             logger.warning("Sidecar move error after rename (%s -> %s): %s", src, dst, sidecar_err)
                             moved_extra = []
@@ -13497,7 +14655,7 @@ class MediaTab(QWidget):
         last = self._rename_history.pop()
         src = last['src']
         dst = last['dst']
-        same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+        same_file = _same_file_path(src, dst)
         if os.path.exists(dst) and (not os.path.exists(src) or same_file):
             self._release_file_locks([dst, src])
             try:
@@ -13505,7 +14663,7 @@ class MediaTab(QWidget):
                 # Revert sidecar moves (best-effort; failures never block undo)
                 extra_done = []
                 for o_, n_ in reversed(last.get('extra') or []):
-                    if os.path.exists(n_) and (not os.path.exists(o_) or os.path.normcase(os.path.abspath(n_)) == os.path.normcase(os.path.abspath(o_))):
+                    if os.path.exists(n_) and (not os.path.exists(o_) or _same_file_path(n_, o_)):
                         try:
                             shutil.move(n_, o_)
                             extra_done.append((o_, n_))
@@ -13519,7 +14677,7 @@ class MediaTab(QWidget):
                     target_row = -1
                     for r in range(self.table.rowCount()):
                         inf = self._get_row_info(r)
-                        if inf and os.path.normcase(os.path.abspath(inf.filepath)) == os.path.normcase(os.path.abspath(dst)):
+                        if inf and _same_file_path(inf.filepath, dst):
                             target_row = r
                             break
                     
@@ -13529,9 +14687,7 @@ class MediaTab(QWidget):
                             self._updating_table = True
                             info.filepath = src
                             info.filename = os.path.basename(src)
-                            undo_ext = os.path.splitext(src)[1]
-                            if undo_ext:
-                                info.extension = undo_ext
+                            info.extension = _renamed_extension(src, info.extension)
                             self._refresh_row_dates(info)
                             self.table.item(target_row, self.COL_FILENAME).setText(info.filename)
                             self.table.item(target_row, self.COL_FILENAME).setToolTip(src)
@@ -13541,6 +14697,14 @@ class MediaTab(QWidget):
                             if _gi: _gi.setText(info.filename)
                             self._update_date_items(target_row, info)
                             self._update_row_preview(target_row)
+                    else:
+                        for info in getattr(self, 'media_infos', []):
+                            if _same_file_path(info.filepath, dst):
+                                info.filepath = src
+                                info.filename = os.path.basename(src)
+                                info.extension = _renamed_extension(src, info.extension)
+                                self._refresh_row_dates(info)
+                                break
                 except Exception as te:
                     # Table update failed after successful move — attempt to roll back
                     logger.exception("Table update failed after move; rolling back")
@@ -13588,14 +14752,14 @@ class MediaTab(QWidget):
         last = self._redo_history.pop()
         src = last['src']
         dst = last['dst']
-        same_file = os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst))
+        same_file = _same_file_path(src, dst)
         if os.path.exists(src) and (not os.path.exists(dst) or same_file):
             self._release_file_locks([src, dst])
             try:
                 shutil.move(src, dst)
                 extra_done = []
                 for o_, n_ in (last.get('extra') or []):
-                    if os.path.exists(o_) and (not os.path.exists(n_) or os.path.normcase(os.path.abspath(o_)) == os.path.normcase(os.path.abspath(n_))):
+                    if os.path.exists(o_) and (not os.path.exists(n_) or _same_file_path(o_, n_)):
                         try:
                             shutil.move(o_, n_)
                             extra_done.append((o_, n_))
@@ -13609,7 +14773,7 @@ class MediaTab(QWidget):
                     target_row = -1
                     for r in range(self.table.rowCount()):
                         inf = self._get_row_info(r)
-                        if inf and os.path.normcase(os.path.abspath(inf.filepath)) == os.path.normcase(os.path.abspath(src)):
+                        if inf and _same_file_path(inf.filepath, src):
                             target_row = r
                             break
                     
@@ -13619,9 +14783,7 @@ class MediaTab(QWidget):
                             self._updating_table = True
                             info.filepath = dst
                             info.filename = os.path.basename(dst)
-                            redo_ext = os.path.splitext(dst)[1]
-                            if redo_ext:
-                                info.extension = redo_ext
+                            info.extension = _renamed_extension(dst, info.extension)
                             self._refresh_row_dates(info)
                             self.table.item(target_row, self.COL_FILENAME).setText(info.filename)
                             self.table.item(target_row, self.COL_FILENAME).setToolTip(dst)
@@ -13631,6 +14793,14 @@ class MediaTab(QWidget):
                             if _gi: _gi.setText(info.filename)
                             self._update_date_items(target_row, info)
                             self._update_row_preview(target_row)
+                    else:
+                        for info in getattr(self, 'media_infos', []):
+                            if _same_file_path(info.filepath, src):
+                                info.filepath = dst
+                                info.filename = os.path.basename(dst)
+                                info.extension = _renamed_extension(dst, info.extension)
+                                self._refresh_row_dates(info)
+                                break
                 except Exception as te:
                     logger.exception("Table update failed after redo move; rolling back")
                     try:
@@ -13958,6 +15128,8 @@ class MediaTab(QWidget):
             self.btn_view_mode.setText("Grid View")
 
     def _update_theme_styling(self, is_dark: bool):
+        if hasattr(self, 'audio_player_bar') and self.audio_player_bar:
+            self.audio_player_bar.update_theme(is_dark)
         self._update_shadow_color()
         self._update_row_colors()
         for row in range(self.table.rowCount()):
@@ -14688,15 +15860,7 @@ class MediaTab(QWidget):
             self.insp_dur.setText(getattr(info, 'duration_formatted', '') or "—")
             self.insp_size.setText(getattr(info, 'size_formatted', '') or "—")
             m_ts = getattr(info, 'mtime', 0)
-            if m_ts:
-                try:
-                    from datetime import datetime
-                    m_str = datetime.fromtimestamp(m_ts).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    m_str = "—"
-            else:
-                m_str = "—"
-            self.insp_mtime.setText(m_str)
+            self.insp_mtime.setText(format_timestamp(m_ts))
             self.insp_meta_frame.setVisible(True)
 
         # Populate rename preview box

@@ -110,30 +110,9 @@ pub fn run_dedupe(items: Vec<DedupeInputItem>) -> io::Result<()> {
     for item in items {
         let p = Path::new(&item.path);
 
-        // Deduplicate identical physical file paths to prevent a file from matching itself
-        let norm_key = match p.canonicalize() {
-            Ok(cp) => {
-                let s = cp.to_string_lossy();
-                #[cfg(windows)]
-                {
-                    s.to_lowercase()
-                }
-                #[cfg(not(windows))]
-                {
-                    s.into_owned()
-                }
-            }
-            Err(_) => {
-                #[cfg(windows)]
-                {
-                    item.path.to_lowercase()
-                }
-                #[cfg(not(windows))]
-                {
-                    item.path.clone()
-                }
-            }
-        };
+        // Deduplicate identical physical file paths to prevent a file from matching itself.
+        // Uses standardized path normalization to eliminate extended-length prefixes.
+        let norm_key = crate::path_util::canonical_norm_key(p);
 
         if !seen_paths.insert(norm_key) {
             continue;
@@ -260,7 +239,7 @@ pub fn run_dedupe(items: Vec<DedupeInputItem>) -> io::Result<()> {
         }
     }
 
-    let duplicate_groups: Vec<Vec<String>> = final_groups
+    let mut duplicate_groups: Vec<Vec<String>> = final_groups
         .into_values()
         .map(|mut g| {
             g.sort();
@@ -269,6 +248,8 @@ pub fn run_dedupe(items: Vec<DedupeInputItem>) -> io::Result<()> {
         })
         .filter(|g| g.len() > 1)
         .collect();
+
+    duplicate_groups.sort_by(|a, b| a.first().cmp(&b.first()));
 
     let result = DedupeEvent::Groups {
         groups: duplicate_groups,

@@ -1,5 +1,6 @@
 mod dedupe;
 mod metadata;
+pub mod path_util;
 mod renamer;
 mod scanner;
 
@@ -20,7 +21,7 @@ enum Commands {
     /// Fast multi-threaded directory scan streaming NDJSON
     Scan {
         /// Directories to scan
-        #[arg(short, long, num_args = 1..)]
+        #[arg(short, long, num_args = 1.., allow_hyphen_values = true)]
         dirs: Vec<PathBuf>,
 
         /// Target media type: video, audio, image, pdf, all
@@ -28,7 +29,7 @@ enum Commands {
         media_type: String,
 
         /// Glob / substring patterns to exclude
-        #[arg(short, long, num_args = 0..)]
+        #[arg(short, long, num_args = 0.., allow_hyphen_values = true)]
         exclude: Vec<String>,
 
         /// Include files with no extension
@@ -39,14 +40,14 @@ enum Commands {
     /// Multi-threaded duplicate detection (size bucketing + SIMD head/full hashing)
     Dedupe {
         /// Path to JSON file containing array of {path, size}, or omit to read from stdin
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         input: Option<PathBuf>,
     },
 
     /// Extract audio / image metadata directly without spawning heavy processes
     Metadata {
         /// Path to the media file
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         path: String,
 
         /// Media type (audio, image, video)
@@ -57,7 +58,7 @@ enum Commands {
     /// Batch execute rename plan with rollback checks
     Rename {
         /// Path to JSON file containing array of {source, target}, or omit to read from stdin
-        #[arg(short, long)]
+        #[arg(short, long, allow_hyphen_values = true)]
         input: Option<PathBuf>,
 
         /// Dry run simulation only
@@ -126,4 +127,28 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_allows_hyphen_arguments() {
+        let scan_args = vec!["mediaflow-core", "scan", "--dirs", "-dir1", "-dir2", "--exclude", "-skip*"];
+        let parsed = Cli::try_parse_from(scan_args);
+        assert!(parsed.is_ok());
+
+        let dedupe_args = vec!["mediaflow-core", "dedupe", "--input", "-dedupe_input.json"];
+        let parsed = Cli::try_parse_from(dedupe_args);
+        assert!(parsed.is_ok());
+
+        let rename_args = vec!["mediaflow-core", "rename", "--input", "-rename_plan.json"];
+        let parsed = Cli::try_parse_from(rename_args);
+        assert!(parsed.is_ok());
+
+        let meta_args = vec!["mediaflow-core", "metadata", "--path", "-audio.mp3"];
+        let parsed = Cli::try_parse_from(meta_args);
+        assert!(parsed.is_ok());
+    }
 }

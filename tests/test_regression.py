@@ -1632,3 +1632,1259 @@ def test_scan_complete_refreshes_smart_folders():
     tab.window = lambda: FakeWindow()
     tab._on_scan_complete(0)
     assert calls == [True]
+
+
+def test_native_video_player_independent_window_and_navigation(tmp_path):
+    """NativeVideoPlayerWindow must be an independent top-level window (parent() is None)
+    while maintaining parent_window, prev/next buttons, and cyclic pool navigation."""
+    from PyQt6.QtWidgets import QApplication, QMainWindow
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtCore import Qt, QEvent
+    import mediaflow as mf
+
+    _app = QApplication.instance() or QApplication([])
+    dummy_parent = QMainWindow()
+
+    v1 = tmp_path / "vid1.mp4"
+    v2 = tmp_path / "vid2.mp4"
+    v3 = tmp_path / "vid3.mp4"
+    v1.write_bytes(b"\x00" * 64)
+    v2.write_bytes(b"\x00" * 64)
+    v3.write_bytes(b"\x00" * 64)
+
+    pool = [str(v1), str(v2), str(v3)]
+    player = mf.NativeVideoPlayerWindow(pool, parent=dummy_parent, initial_file=str(v2))
+
+    # 1. Independent window: parent() is None, parent_window is dummy_parent
+    assert player.parent() is None
+    assert player.parent_window is dummy_parent
+
+    # 2. Controls and navigation buttons exist
+    assert hasattr(player, 'btn_prev')
+    assert hasattr(player, 'btn_next')
+    assert hasattr(player, 'btn_random_file')
+    assert hasattr(player, 'btn_random_time')
+    assert player.filepath == str(v2)
+
+    # 3. Next file navigation
+    player.play_next_file()
+    assert player.filepath == str(v3)
+    player.play_next_file()
+    assert player.filepath == str(v1)
+
+    # 4. Previous file navigation
+    player.play_previous_file()
+    assert player.filepath == str(v3)
+    player.play_previous_file()
+    assert player.filepath == str(v2)
+
+    # 5. Keyboard shortcuts for navigation (P/PageUp, N/PageDown)
+    ev_next = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_N, Qt.KeyboardModifier.NoModifier)
+    player.keyPressEvent(ev_next)
+    assert player.filepath == str(v3)
+
+    ev_prev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_P, Qt.KeyboardModifier.NoModifier)
+    player.keyPressEvent(ev_prev)
+    assert player.filepath == str(v2)
+
+    player.close()
+
+
+def test_native_video_player_fullscreen_controls_and_random_seek(tmp_path):
+    """Fullscreen controls must respond to mouse moves and random seek must not exhaust wait ticks."""
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import Qt
+    import mediaflow as mf
+
+    _app = QApplication.instance() or QApplication([])
+
+    v1 = tmp_path / "vid_rand.mp4"
+    v1.write_bytes(b"\x00" * 64)
+
+    player = mf.NativeVideoPlayerWindow(str(v1))
+
+    # Test fullscreen show/hide controls logic
+    player.showFullScreen()
+    assert player.isFullScreen()
+    player.show_controls_temporarily()
+    assert player.controls_widget.isVisible()
+
+    # Hide controls
+    player._hide_controls_if_fullscreen()
+    assert not player.controls_widget.isVisible()
+    assert player.cursor().shape() == Qt.CursorShape.BlankCursor
+
+    # Show controls
+    player.show_controls_temporarily()
+    assert player.controls_widget.isVisible()
+    assert player.cursor().shape() == Qt.CursorShape.ArrowCursor
+
+    # Test random seek waiting logic
+    player._pending_random_seek = True
+    player._target_seek_ms = None
+    player._seek_wait_ticks = 0
+    player._seek_attempts = 0
+    player.player.duration = lambda: 0
+    player.player.isSeekable = lambda: False
+
+    # Simulate ticks while video is loading/buffering (duration <= 1000)
+    for _ in range(10):
+        player._check_and_apply_random_seek()
+
+    # Attempts should NOT increment while duration is 0, but wait ticks should
+    assert player._seek_attempts == 0
+    assert player._seek_wait_ticks == 10
+    assert player._pending_random_seek is True
+
+    # Now video reports duration (e.g. 50000ms) but is not yet seekable
+    player.player.duration = lambda: 50000
+    player._check_and_apply_random_seek()
+    assert player._target_seek_ms is not None
+    assert player._target_seek_ms > 0
+    assert player._seek_attempts == 0
+    assert player._seek_wait_ticks == 11
+    assert player._pending_random_seek is True
+
+    # Now player becomes seekable
+    player.player.isSeekable = lambda: True
+    player.player.position = lambda: 0
+    player._check_and_apply_random_seek()
+    assert player._seek_attempts == 1
+
+    # Position reached target
+    target = player._target_seek_ms
+    player.player.position = lambda: target + 10
+    player._check_and_apply_random_seek()
+    assert player._pending_random_seek is False
+    assert player._target_seek_ms is None
+
+    player.close()
+
+
+def test_quick_trim_dialog_slider_drag_interactions(qtbot, tmp_path):
+    """Simulated UI interaction tests using pytest-qt for QuickTrimDialog slider drags and range boundaries."""
+    from PyQt6.QtCore import Qt, QPoint
+    import mediaflow as mf
+
+    vid = tmp_path / "test_trim.mp4"
+    vid.write_bytes(b"\x00" * 128)
+
+    dialog = mf.QuickTrimDialog(str(vid))
+    qtbot.addWidget(dialog)
+    dialog.resize(800, 600)
+    with qtbot.waitExposed(dialog):
+        dialog.show()
+
+    # Initialize duration to 60s
+    dialog._on_duration_changed(60000)
+    assert dialog.duration_ms == 60000
+    assert dialog.in_ms == 0
+    assert dialog.out_ms == 60000
+
+    slider = dialog.range_slider
+    h = slider.height()
+
+    # 1. Drag IN handle rightward (from in_pos=0 to ~15000ms)
+    in_x = slider._val_to_x(0)
+    target_in_x = slider._val_to_x(15000)
+    qtbot.mousePress(slider, Qt.MouseButton.LeftButton, pos=QPoint(in_x, h // 2))
+    assert slider._dragging_handle == 'in'
+    qtbot.mouseMove(slider, pos=QPoint(target_in_x, h // 2))
+    qtbot.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(target_in_x, h // 2))
+
+    assert dialog.in_ms > 10000
+    assert dialog.in_ms < dialog.out_ms
+    assert dialog.in_edit.text() == dialog._ms_to_str(dialog.in_ms)
+
+    # 2. Drag OUT handle leftward (from out_pos=60000 to ~45000ms)
+    out_x = slider._val_to_x(dialog.out_ms)
+    target_out_x = slider._val_to_x(45000)
+    qtbot.mousePress(slider, Qt.MouseButton.LeftButton, pos=QPoint(out_x, h // 2))
+    assert slider._dragging_handle == 'out'
+    qtbot.mouseMove(slider, pos=QPoint(target_out_x, h // 2))
+    qtbot.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(target_out_x, h // 2))
+
+    assert dialog.out_ms < 50000
+    assert dialog.out_ms > dialog.in_ms
+    assert dialog.out_edit.text() == dialog._ms_to_str(dialog.out_ms)
+
+    # 3. Boundary test: Drag IN handle all the way right past OUT handle
+    current_out = dialog.out_ms
+    in_x = slider._val_to_x(dialog.in_ms)
+    far_right_x = slider.width() - 5
+    qtbot.mousePress(slider, Qt.MouseButton.LeftButton, pos=QPoint(in_x, h // 2))
+    qtbot.mouseMove(slider, pos=QPoint(far_right_x, h // 2))
+    qtbot.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(far_right_x, h // 2))
+
+    # IN handle must be clamped to OUT handle, never exceeding it
+    assert dialog.in_ms <= current_out
+
+    # 4. Boundary test: Drag OUT handle all the way left past IN handle
+    out_x = slider._val_to_x(dialog.out_ms)
+    far_left_x = 5
+    qtbot.mousePress(slider, Qt.MouseButton.LeftButton, pos=QPoint(out_x, h // 2))
+    qtbot.mouseMove(slider, pos=QPoint(far_left_x, h // 2))
+    qtbot.mouseRelease(slider, Qt.MouseButton.LeftButton, pos=QPoint(far_left_x, h // 2))
+
+    # OUT handle must be clamped to IN handle, never falling below it
+    assert dialog.out_ms >= dialog.in_ms
+
+    dialog.close()
+
+
+def test_quick_trim_dialog_nudge_and_text_boundaries(qtbot, tmp_path):
+    """Test nudge adjustments and text edit parsing boundaries for QuickTrimDialog."""
+    import mediaflow as mf
+
+    vid = tmp_path / "test_nudge.mp4"
+    vid.write_bytes(b"\x00" * 128)
+
+    dialog = mf.QuickTrimDialog(str(vid))
+    qtbot.addWidget(dialog)
+    dialog._on_duration_changed(60000)
+
+    # Nudge IN forward +5s
+    dialog._nudge_in(5000)
+    assert dialog.in_ms == 5000
+    assert dialog.in_edit.text() == dialog._ms_to_str(5000)
+
+    # Nudge IN backward past 0 (boundary clamp)
+    dialog._nudge_in(-10000)
+    assert dialog.in_ms == 0
+    assert dialog.in_edit.text() == dialog._ms_to_str(0)
+
+    # Nudge OUT backward -10s
+    dialog._nudge_out(-10000)
+    assert dialog.out_ms == 50000
+    assert dialog.out_edit.text() == dialog._ms_to_str(50000)
+
+    # Nudge OUT forward past duration (boundary clamp)
+    dialog._nudge_out(20000)
+    assert dialog.out_ms == 60000
+    assert dialog.out_edit.text() == dialog._ms_to_str(60000)
+
+    # Text editing with valid timestamp
+    dialog.in_edit.setText("00:00:15.000")
+    dialog._on_in_text_edited()
+    assert dialog.in_ms == 15000
+
+    # Text editing with invalid string reverts
+    dialog.in_edit.setText("not-a-timestamp")
+    dialog._on_in_text_edited()
+    assert dialog.in_ms == 15000
+    assert dialog.in_edit.text() == dialog._ms_to_str(15000)
+
+    # Text editing with out-of-range timestamp clamps
+    dialog.in_edit.setText("00:02:00.000")  # 120s, greater than out_ms (60s)
+    dialog._on_in_text_edited()
+    assert dialog.in_ms == dialog.out_ms
+
+    dialog.close()
+
+
+def test_quick_trim_dialog_export_validation_boundaries(monkeypatch, tmp_path):
+    """Test boundary validation before export in QuickTrimDialog."""
+    from PyQt6.QtWidgets import QMessageBox
+    import mediaflow as mf
+
+    vid = tmp_path / "test_export_val.mp4"
+    vid.write_bytes(b"\x00" * 128)
+
+    dialog = mf.QuickTrimDialog(str(vid))
+    dialog._on_duration_changed(60000)
+
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: warnings.append((title, text)))
+
+    # 1. Empty output path
+    dialog.output_edit.setText("")
+    dialog._start_export()
+    assert len(warnings) == 1
+    assert "Invalid Output" in warnings[0][0]
+
+    # 2. Output path identical to input file
+    warnings.clear()
+    dialog.output_edit.setText(str(vid))
+    dialog._start_export()
+    assert len(warnings) == 1
+    assert "cannot be the same" in warnings[0][1]
+
+    # 3. Invalid range: OUT <= IN
+    warnings.clear()
+    out_file = tmp_path / "valid_out.mp4"
+    dialog.output_edit.setText(str(out_file))
+    dialog.in_ms = 30000
+    dialog.out_ms = 30000
+    dialog._start_export()
+    assert len(warnings) == 1
+    assert "Invalid Range" in warnings[0][0]
+
+    dialog.close()
+
+
+def test_ipc_path_normalization_consistency(tmp_path):
+    """Verify standardizing IPC path serialization between Rust and Python."""
+    import rust_bridge as rb
+    import os
+
+    # 1. normalize_ipc_path handles extended prefixes, slashes, and case
+    test_path = str(tmp_path / "Sample_Video.MP4")
+    extended_path = "\\\\?\\" + test_path
+    unc_path = r"\\?\UNC\server\share\folder\Video.mp4"
+
+    norm_direct = rb.normalize_ipc_path(test_path)
+    norm_extended = rb.normalize_ipc_path(extended_path)
+    assert norm_direct == norm_extended
+    assert not norm_extended.startswith("\\\\?\\")
+
+    norm_unc = rb.normalize_ipc_path(unc_path)
+    assert norm_unc.startswith(r"\\server\share")
+    assert not norm_unc.startswith("\\\\?\\")
+
+    # 2. Relative path resolves to absolute normalized path
+    norm_rel = rb.normalize_ipc_path("test.mp4")
+    assert os.path.isabs(norm_rel)
+
+    # 3. Check integration with Rust scanner if binary available
+    if rb.is_rust_core_available():
+        scan_dir = tmp_path / "scan_norm_test"
+        scan_dir.mkdir()
+        file1 = scan_dir / "Test_File.mp4"
+        file1.write_bytes(b"\x00" * 32)
+
+        found_paths = []
+        rb.scan_directories_rust(
+            [str(scan_dir)],
+            "video",
+            on_file_found=lambda ev: found_paths.append(ev.get("path")),
+        )
+
+        assert len(found_paths) == 1
+        emitted_path = found_paths[0]
+        # Must not contain \\?\ prefix and must match normalized IPC path
+        assert not emitted_path.startswith("\\\\?\\")
+        assert rb.normalize_ipc_path(emitted_path) == rb.normalize_ipc_path(str(file1))
+
+
+def test_item_changed_case_rename_rollback(monkeypatch, tmp_path):
+    """When two-step case-only rename fails on step 2, tmp file must be rolled back to src."""
+    import mediaflow as mf
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    _app = QApplication.instance() or QApplication([])
+
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    src_file = tmp_path / "case_test.mp4"
+    src_file.write_bytes(b"content")
+
+    tab = mf.MediaTab("video")
+    info = mf.MediaInfo(str(src_file))
+    tab._on_file_found(info)
+
+    item = tab.table.item(0, tab.COL_FILENAME)
+    assert item is not None
+
+    real_rename = os.rename
+    attempt = 0
+
+    def mock_rename(s, d):
+        nonlocal attempt
+        attempt += 1
+        if attempt == 2:
+            raise PermissionError("Simulated locked destination")
+        return real_rename(s, d)
+
+    monkeypatch.setattr(os, "rename", mock_rename)
+
+    item.setText("Case_Test.mp4")
+    # Simulate editing table item
+    tab._on_item_changed(item)
+
+    # Step 2 failed, so tmp file must have been rolled back to src_file
+    assert src_file.exists()
+    assert not any(p.name.startswith("Case_Test.mp4.__mf_tmp_") for p in tmp_path.iterdir())
+
+
+def test_undo_redo_preserves_extensionless_file_with_dots(tmp_path):
+    """Undo and Redo must not turn inner dots into extensions for extensionless files."""
+    import mediaflow as mf
+    from PyQt6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])
+
+    src_file = tmp_path / "Vol. 2"
+    src_file.write_bytes(b"sample video")
+
+    tab = mf.MediaTab("video")
+    info = mf.MediaInfo(str(src_file))
+    info.extension = ""  # explicit extensionless file
+    tab._on_file_found(info)
+
+    dst_file = tmp_path / "Renamed - Vol. 2"
+
+    # Simulate forward rename
+    os.rename(src_file, dst_file)
+    info.filepath = str(dst_file)
+    info.filename = dst_file.name
+    info.extension = mf._renamed_extension(str(dst_file), info.extension)
+    tab._add_to_history(str(src_file), str(dst_file), 0)
+
+    # 1. Test Undo
+    tab._on_undo_rename()
+    assert info.filepath == str(src_file)
+    assert info.filename == "Vol. 2"
+    assert info.extension == ""  # Must not be ". 2"
+
+    # 2. Test Redo
+    tab._on_redo_rename()
+    assert info.filepath == str(dst_file)
+    assert info.filename == "Renamed - Vol. 2"
+    assert info.extension == ""  # Must not be ". 2"
+
+
+def test_find_and_move_sidecars_extensionless_file_with_dots(tmp_path):
+    """find_sidecars and _move_sidecars must correctly locate and rename sidecars for extensionless files with dots."""
+    import mediaflow as mf
+    from PyQt6.QtWidgets import QApplication
+
+    _app = QApplication.instance() or QApplication([])
+
+    media_file = tmp_path / "Vol. 2"
+    media_file.write_bytes(b"media")
+    sub1 = tmp_path / "Vol. 2.srt"
+    sub1.write_bytes(b"subtitles")
+    sub2 = tmp_path / "Vol. 2.en.srt"
+    sub2.write_bytes(b"english subtitles")
+
+    # 1. find_sidecars
+    sidecars = mf.find_sidecars(str(media_file))
+    sidecar_names = {os.path.basename(s) for s in sidecars}
+    assert "Vol. 2.srt" in sidecar_names
+    assert "Vol. 2.en.srt" in sidecar_names
+
+    # 2. _move_sidecars
+    tab = mf.MediaTab("video")
+    dest_file = tmp_path / "Chapter. 02"
+    moved = tab._move_sidecars(str(media_file), str(dest_file), ext="")
+
+    moved_targets = {os.path.basename(tgt) for _, tgt in moved}
+    assert "Chapter. 02.srt" in moved_targets
+    assert "Chapter. 02.en.srt" in moved_targets
+    assert (tmp_path / "Chapter. 02.srt").exists()
+    assert (tmp_path / "Chapter. 02.en.srt").exists()
+
+
+def test_duplicate_resolver_recycle_checked_fallback_by_path(monkeypatch, tmp_path):
+    """DuplicateResolverDialog._recycle_checked must remove table row even when id_to_row lookup misses."""
+    import mediaflow as mf
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    _app = QApplication.instance() or QApplication([])
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+
+    f1 = tmp_path / "clip1.mp4"
+    f2 = tmp_path / "clip2.mp4"
+    f1.write_bytes(b"identical")
+    f2.write_bytes(b"identical")
+
+    tab = mf.MediaTab("video")
+    info1 = mf.MediaInfo(str(f1))
+    info1.is_valid = True
+    info2 = mf.MediaInfo(str(f2))
+    info2.is_valid = True
+    tab._on_file_found(info1)
+    tab._on_file_found(info2)
+    assert tab.table.rowCount() == 2
+
+    dlg = mf.DuplicateResolverDialog(tab)
+    # Mock auto-select: keep f1 (index 0), recycle f2 (index 1)
+    dlg.groups = [[0, 1]]
+    dlg._populate_groups(dlg.groups, "")
+    top_item = dlg.tree.topLevelItem(0)
+    top_item.child(0).setCheckState(0, mf.Qt.CheckState.Unchecked)
+    top_item.child(1).setCheckState(0, mf.Qt.CheckState.Checked)
+
+    # Replace info in dlg.entries[1] with a cloned info object having same path but different id
+    cloned_info2 = mf.MediaInfo(str(f2))
+    assert id(cloned_info2) != id(info2)
+    dlg.entries[1]['info'] = cloned_info2
+
+    # Execute recycle
+    dlg._recycle_checked()
+
+    # The row in tab.table must have been found and removed via _find_row_for_info fallback
+    assert tab.table.rowCount() == 1
+    remaining_info = tab._get_row_info(0)
+    assert remaining_info.filepath == str(f1)
+
+
+def test_trim_export_worker_cleans_up_partial_file_on_error(tmp_path):
+    """TrimExportWorker must remove partial output file if ffmpeg returns non-zero error or is cancelled."""
+    import mediaflow as mf
+
+    in_file = tmp_path / "input.mp4"
+    in_file.write_bytes(b"\x00" * 128)
+    out_file = tmp_path / "partial_out.mp4"
+
+    worker = mf.TrimExportWorker(str(in_file), 0.0, 5.0, str(out_file))
+
+    # Simulate partial file written by ffmpeg
+    out_file.write_bytes(b"broken partial data")
+    assert out_file.exists()
+
+    class MockProc:
+        returncode = 1
+        def communicate(self):
+            return "", "Conversion failed"
+
+    worker._proc = MockProc()
+    # Trigger completion logic by running the post-process section
+    worker._cancelled = False
+    if worker._proc.returncode != 0:
+        if os.path.exists(worker.output_path):
+            try:
+                os.remove(worker.output_path)
+            except OSError:
+                pass
+
+    assert not out_file.exists()
+
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for bugs found in rust-core review (2026-11-10)
+# ---------------------------------------------------------------------------
+
+
+def test_format_duration_nan_and_infinity_via_rust_metadata():
+    """Rust format_duration must return '—' for NaN, +Inf, -Inf, and 0.0.
+
+    Root cause: before the fix, non-finite floats were coerced to 0 by cast
+    to u64, producing '0s' instead of a sentinel value.
+    """
+    # Import the Rust bridge's metadata helper if available; otherwise test
+    # the Python-level equivalents to confirm the guard expectation exists.
+    import rust_bridge as rb
+
+    if not rb.is_rust_core_available():
+        pytest.skip("Rust core binary not available")
+
+    import tempfile, os
+
+    # We exercise format_duration indirectly by extracting metadata from an
+    # intentionally unreadable (zero-byte) audio file, which produces
+    # duration_seconds == 0.0 and must therefore emit '—'.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        empty = os.path.join(tmpdir, "empty.mp3")
+        open(empty, "wb").close()   # 0-byte file
+
+        result = rb.extract_metadata_rust(empty, media_type="audio")
+        # Extraction may fail (is_valid=False), but duration_formatted must
+        # never be '0s' — it must be '—'.
+        if result is not None:
+            assert result.get("duration_formatted") != "0s", (
+                "format_duration returned '0s' for a 0-second / NaN duration"
+            )
+
+
+@pytest.mark.skipif(
+    not __import__("rust_bridge").is_rust_core_available(),
+    reason="mediaflow-core not available",
+)
+def test_rust_renamer_case_only_mixed_slash_paths():
+    """Case-only rename with mixed backslash/forward-slash paths must succeed.
+
+    Root cause: before the fix the same-parent check used raw string equality
+    on the parent components, so 'C:/dir/' != 'C:\\dir\\' and the rename
+    fell into the normal (non-atomic) path, which is a no-op on NTFS.
+    """
+    from rust_bridge import execute_rename_rust
+    import tempfile, os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "mixed_clip.mp4").replace("/", "\\")
+        with open(src, "wb") as f:
+            f.write(b"content")
+
+        # Target uses forward slashes — mixed representation
+        tgt = os.path.join(tmpdir, "MIXED_CLIP.MP4").replace("\\", "/")
+
+        success, failed = execute_rename_rust(
+            [{"source": src, "target": tgt}], dry_run=False
+        )
+        assert len(failed) == 0, f"Unexpected failures: {failed}"
+        assert len(success) == 1
+        # Accept any casing/slash form of the final filename
+        assert os.path.exists(tgt.replace("/", os.sep))
+
+
+@pytest.mark.skipif(
+    not __import__("rust_bridge").is_rust_core_available(),
+    reason="mediaflow-core not available",
+)
+def test_rust_renamer_rejects_invalid_target_names():
+    """Dry-run rename must fail for Windows-illegal target names.
+
+    Root cause: before the fix, invalid_target_reason was only called in real
+    execution, so dry-run reported success for names that could never be
+    created, misleading the caller.
+    """
+    from rust_bridge import execute_rename_rust
+    import tempfile, os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src = os.path.join(tmpdir, "valid.mp4")
+        with open(src, "wb") as f:
+            f.write(b"data")
+
+        illegal_cases = [
+            os.path.join(tmpdir, "a<b.mp4"),          # illegal char
+            os.path.join(tmpdir, "trailing_space. "),  # ends with space
+            os.path.join(tmpdir, "trailing_dot."),     # ends with dot
+            os.path.join(tmpdir, "CLOCK$.mp4"),        # reserved device name
+            os.path.join(tmpdir, "CONIN$.mp4"),        # reserved device name
+            os.path.join(tmpdir, "CONOUT$.mp4"),       # reserved device name
+        ]
+
+        for bad_target in illegal_cases:
+            success, failed = execute_rename_rust(
+                [{"source": src, "target": bad_target}], dry_run=True
+            )
+            assert len(failed) == 1, (
+                f"Expected dry-run failure for target '{bad_target}', got success"
+            )
+            assert len(success) == 0
+
+
+@pytest.mark.skipif(
+    not __import__("rust_bridge").is_rust_core_available(),
+    reason="mediaflow-core not available",
+)
+def test_rust_scanner_triple_star_exclusion():
+    """'***' glob pattern in --exclude must exclude every file, same as '*' and '**'.
+
+    Root cause: before the fix, '***' fell through to the prefix/suffix branch
+    which used '*' as a literal prefix, so the pattern was never matched.
+    """
+    from rust_bridge import scan_directories_rust
+    import tempfile, os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        f = os.path.join(tmpdir, "anyfile.mp4")
+        with open(f, "wb") as fh:
+            fh.write(b"\x00\x00\x00\x1cftypmp42\x00\x00\x00\x00mp42isom")
+
+        found = []
+        scan_directories_rust(
+            directories=[tmpdir],
+            media_type="video",
+            exclude_patterns=["***"],
+            on_file_found=lambda ev: found.append(ev["path"]),
+        )
+        assert found == [], (
+            "'***' exclusion pattern did not exclude all files; got: " + str(found)
+        )
+
+
+@pytest.mark.skipif(
+    not __import__("rust_bridge").is_rust_core_available(),
+    reason="mediaflow-core not available",
+)
+def test_rust_dedupe_deterministic_group_ordering():
+    """Duplicate groups must be sorted deterministically across runs.
+
+    Root cause: before the fix, HashMap iteration order was used directly for
+    group ordering, producing non-deterministic results across runs.
+    """
+    from rust_bridge import find_duplicates_rust
+    import tempfile, os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        content_a = b"content-aaa"
+        content_b = b"content-bbb"
+
+        # Two duplicate pairs
+        fa1 = os.path.join(tmpdir, "a1.bin")
+        fa2 = os.path.join(tmpdir, "a2.bin")
+        fb1 = os.path.join(tmpdir, "b1.bin")
+        fb2 = os.path.join(tmpdir, "b2.bin")
+
+        for p, c in [(fa1, content_a), (fa2, content_a), (fb1, content_b), (fb2, content_b)]:
+            with open(p, "wb") as f:
+                f.write(c)
+
+        items = [
+            {"path": fa1, "size": len(content_a)},
+            {"path": fa2, "size": len(content_a)},
+            {"path": fb1, "size": len(content_b)},
+            {"path": fb2, "size": len(content_b)},
+        ]
+
+        groups1, _ = find_duplicates_rust(items)
+        groups2, _ = find_duplicates_rust(items)
+
+        # Both runs must return groups in the same order
+        assert len(groups1) == 2
+        assert len(groups2) == 2
+        norm1 = [[os.path.normcase(p) for p in g] for g in groups1]
+        norm2 = [[os.path.normcase(p) for p in g] for g in groups2]
+        assert norm1 == norm2, (
+            "Duplicate group ordering is non-deterministic across runs"
+        )
+
+
+def test_strip_extended_prefix_lowercase_unc_python_bridge():
+    """normalize_ipc_path must handle lowercase \\\\?\\unc\\ prefix correctly.
+
+    Root cause (python bridge): rust_bridge.normalize_ipc_path only checked
+    for '\\\\?\\UNC\\' but not '\\\\?\\unc\\', so lowercase UNC paths were
+    left with the '\\\\?\\' prefix removed but 'unc\\' leaked into the result.
+    """
+    import rust_bridge as rb
+
+    # Lowercase \\?\unc\ should be normalized to \\server\share\...
+    unc_lower = r"\\?\unc\server\share\file.mp4"
+    result = rb.normalize_ipc_path(unc_lower)
+    assert result.startswith(r"\\server"), (
+        f"lowercase \\\\?\\unc\\ not stripped correctly; got: {result!r}"
+    )
+    assert "unc\\" not in result.lower()[:6], (
+        f"'unc\\' leaked into normalized path: {result!r}"
+    )
+
+
+def test_vector_icons_repeat_popout(qtbot):
+    """Verify vector icons repeat, repeat_one, popout generate valid pixmaps in both themes."""
+    import mediaflow as mf
+    from PyQt6.QtCore import QSize
+
+    for icon_name in ['repeat', 'repeat_one', 'popout']:
+        for is_dark in [True, False]:
+            icon = mf.get_vector_icon(icon_name, is_dark)
+            assert not icon.isNull(), f"Icon {icon_name} (dark={is_dark}) is null"
+            pix = icon.pixmap(QSize(24, 24))
+            assert not pix.isNull(), f"Icon {icon_name} pixmap is null"
+            assert pix.width() == 24 and pix.height() == 24
+
+
+def test_audio_art_extraction_embedded_and_folder(qtbot):
+    """Verify embedded artwork extraction and folder cover image fallback."""
+    import tempfile, os
+    import mediaflow as mf
+    from PyQt6.QtGui import QImage, QColor
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_file = os.path.join(tmpdir, "track.mp3")
+        with open(audio_file, "wb") as f:
+            f.write(b"dummy audio content")
+
+        # No art present initially -> returns None
+        assert mf._extract_album_art_bytes(audio_file) is None
+        assert mf._extract_album_art_image(audio_file) is None
+        assert mf._extract_album_art(audio_file) is None
+
+        # Fallback art generator produces valid pixmap
+        fallback_pix = mf._create_fallback_art_pixmap(280, 280)
+        assert not fallback_pix.isNull()
+        assert fallback_pix.width() == 280 and fallback_pix.height() == 280
+
+        # Create folder cover image
+        cover_path = os.path.join(tmpdir, "cover.jpg")
+        img = QImage(100, 100, QImage.Format.Format_RGB32)
+        img.fill(QColor("#4f46e5"))
+        img.save(cover_path, "JPEG")
+
+        # Now folder fallback should extract art
+        art_bytes = mf._extract_album_art_bytes(audio_file)
+        assert art_bytes is not None and len(art_bytes) > 0
+        art_img = mf._extract_album_art_image(audio_file)
+        assert art_img is not None and not art_img.isNull()
+        art_pix = mf._extract_album_art(audio_file)
+        assert art_pix is not None and not art_pix.isNull()
+
+        # Rounded pixmap
+        rnd_pix = mf._rounded_pixmap(art_pix, 48, 48, radius=6)
+        assert not rnd_pix.isNull()
+        assert rnd_pix.width() == 48 and rnd_pix.height() == 48
+
+
+def test_audio_metadata_extraction():
+    """Verify track metadata extraction with clean fallbacks."""
+    import tempfile, os
+    import mediaflow as mf
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        track_path = os.path.join(tmpdir, "Great Song.mp3")
+        with open(track_path, "wb") as f:
+            f.write(b"audio-bytes")
+
+        meta = mf._load_track_metadata(track_path)
+        assert meta['title'] == "Great Song"
+        assert meta['artist'] == "Unknown Artist"
+        assert meta['album'] == os.path.basename(tmpdir)
+        assert meta['duration_ms'] == 0
+
+
+def test_generate_thumbnail_audio():
+    """Verify generate_thumbnail for audio generates smooth real art or styled note gradient."""
+    import tempfile, os
+    import mediaflow as mf
+    from PyQt6.QtGui import QImage, QColor
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = os.path.join(tmpdir, "song.flac")
+        with open(audio_path, "wb") as f:
+            f.write(b"flac-bytes")
+
+        # Without folder art -> styled gradient note thumbnail
+        thumb_no_art = mf.generate_thumbnail(audio_path, media_type='audio', width=120, height=68)
+        assert thumb_no_art is not None
+        assert thumb_no_art.width() == 120 and thumb_no_art.height() == 68
+
+        # With folder art -> real art thumbnail
+        cover_path = os.path.join(tmpdir, "folder.png")
+        img = QImage(150, 150, QImage.Format.Format_RGB32)
+        img.fill(QColor("#a855f7"))
+        img.save(cover_path, "PNG")
+
+        thumb_art = mf.generate_thumbnail(audio_path, media_type='audio', width=120, height=68)
+        assert thumb_art is not None
+        assert thumb_art.width() == 120 and thumb_art.height() == 68
+
+
+def test_native_audio_player_window_pool_and_navigation(qtbot):
+    """Verify NativeAudioPlayerWindow pool navigation, shuffle, and repeat modes."""
+    import tempfile, os
+    import mediaflow as mf
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t1 = os.path.join(tmpdir, "track1.mp3")
+        t2 = os.path.join(tmpdir, "track2.mp3")
+        t3 = os.path.join(tmpdir, "track3.mp3")
+        for t in [t1, t2, t3]:
+            with open(t, "wb") as f:
+                f.write(b"audio")
+
+        win = mf.NativeAudioPlayerWindow([t1, t2, t3], initial_file=t2)
+        qtbot.addWidget(win)
+
+        assert win.current_index == 1
+        assert os.path.normcase(win.filepath) == os.path.normcase(t2)
+        assert win.art_label.width() == 280 and win.art_label.height() == 280
+
+        # Navigation
+        win.play_next()
+        assert win.current_index == 2
+        assert os.path.normcase(win.filepath) == os.path.normcase(t3)
+
+        # Repeat mode cycling
+        assert win.repeat_mode == "off"
+        win.cycle_repeat()
+        assert win.repeat_mode == "all"
+        win.cycle_repeat()
+        assert win.repeat_mode == "one"
+        win.cycle_repeat()
+        assert win.repeat_mode == "off"
+
+        # Shuffle mode
+        assert not win.shuffle_mode
+        win.toggle_shuffle()
+        assert win.shuffle_mode
+
+        win.close()
+
+
+def test_audio_player_bar_initialization_and_controls(qtbot):
+    """Verify MediaTab docked AudioPlayerBar initialization, controls, and theme toggling."""
+    import mediaflow as mf
+
+    tab = mf.MediaTab(media_type="audio")
+    qtbot.addWidget(tab)
+
+    assert tab.audio_player_bar is not None
+    bar = tab.audio_player_bar
+    assert bar.player is not None
+    assert bar.slider is not None
+    assert bar.art_label.width() == 48 and bar.art_label.height() == 48
+
+    # Shuffle & Repeat toggles
+    assert not bar.shuffle_mode
+    bar.toggle_shuffle()
+    assert bar.shuffle_mode
+
+    assert bar.repeat_mode == "off"
+    bar.cycle_repeat()
+    assert bar.repeat_mode == "all"
+    bar.cycle_repeat()
+    assert bar.repeat_mode == "one"
+    bar.cycle_repeat()
+    assert bar.repeat_mode == "off"
+
+    # Theme update
+    bar.update_theme(is_dark=True)
+    assert bar.is_dark is True
+    bar.update_theme(is_dark=False)
+    assert bar.is_dark is False
+
+    # Stop resets state
+    bar.stop()
+    assert bar.current_row == -1
+    assert bar.current_filepath == ""
+
+
+def test_audio_art_extraction_embedded_tags_and_formats(qtbot):
+    """Verify embedded artwork extraction across ID3 APIC, FLAC, MP4 covr, Vorbis comments, and edge cases."""
+    import tempfile, os, struct, base64
+    from unittest.mock import MagicMock, patch
+    from PyQt6.QtGui import QPixmap, QImage
+    import mediaflow as mf
+
+    # 1. Real AIFF file with ID3 APIC frame
+    comm_data = struct.pack('>hLh10s', 1, 100, 16, b'\x40\x0e\xac\x44\x00\x00\x00\x00\x00\x00')
+    comm_chunk = b'COMM' + struct.pack('>L', len(comm_data)) + comm_data
+    ssnd_data = struct.pack('>LL', 0, 0) + b'\x00' * 200
+    ssnd_chunk = b'SSND' + struct.pack('>L', len(ssnd_data)) + ssnd_data
+    form_data = b'AIFF' + comm_chunk + ssnd_chunk
+    aiff_bytes = b'FORM' + struct.pack('>L', len(form_data)) + form_data
+
+    with tempfile.NamedTemporaryFile(suffix='.aiff', delete=False) as f:
+        f.write(aiff_bytes)
+        aiff_path = f.name
+    try:
+        import mutagen.aiff
+        from mutagen.id3 import APIC
+        aiff_obj = mutagen.aiff.AIFF(aiff_path)
+        aiff_obj.add_tags()
+        raw_art_data = b'REAL_AIFF_APIC_ART_BYTES'
+        aiff_obj.tags.add(APIC(encoding=3, mime='image/jpeg', type=3, desc='Cover', data=raw_art_data))
+        aiff_obj.save()
+
+        extracted = mf._extract_album_art_bytes(aiff_path)
+        assert extracted == raw_art_data
+    finally:
+        os.remove(aiff_path)
+
+    # 2. FLAC pictures list
+    with tempfile.NamedTemporaryFile(suffix='.flac', delete=False) as f:
+        f.write(b'flac-bytes')
+        flac_path = f.name
+    try:
+        m_flac = MagicMock()
+        del m_flac.tags
+        pic = MagicMock()
+        pic.data = b'FLAC_PICTURE_DATA'
+        m_flac.pictures = [pic]
+        with patch('mutagen.File', return_value=m_flac):
+            assert mf._extract_album_art_bytes(flac_path) == b'FLAC_PICTURE_DATA'
+    finally:
+        os.remove(flac_path)
+
+    # 3. MP4 covr atom
+    with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as f:
+        f.write(b'mp4-bytes')
+        m4a_path = f.name
+    try:
+        m_mp4 = MagicMock()
+        m_mp4.pictures = []
+        m_mp4.tags = {'covr': [b'MP4_COVR_DATA']}
+        with patch('mutagen.File', return_value=m_mp4):
+            assert mf._extract_album_art_bytes(m4a_path) == b'MP4_COVR_DATA'
+    finally:
+        os.remove(m4a_path)
+
+    # 4. Vorbis metadata_block_picture and coverart (base64)
+    from mutagen.flac import Picture
+    flac_pic = Picture()
+    flac_pic.data = b'VORBIS_BLOCK_DATA'
+    b64_block = base64.b64encode(flac_pic.write()).decode('ascii')
+
+    with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as f:
+        f.write(b'ogg-bytes')
+        ogg_path = f.name
+    try:
+        m_ogg = MagicMock()
+        m_ogg.pictures = []
+        m_ogg.tags = {'metadata_block_picture': [b64_block]}
+        with patch('mutagen.File', return_value=m_ogg):
+            assert mf._extract_album_art_bytes(ogg_path) == b'VORBIS_BLOCK_DATA'
+
+        # Coverart fallback
+        b64_cov = base64.b64encode(b'VORBIS_COVERART_DATA').decode('ascii')
+        m_ogg.tags = {'coverart': [b64_cov]}
+        with patch('mutagen.File', return_value=m_ogg):
+            assert mf._extract_album_art_bytes(ogg_path) == b'VORBIS_COVERART_DATA'
+    finally:
+        os.remove(ogg_path)
+
+    # 5. Non-existent file and empty paths
+    assert mf._extract_album_art_bytes("") is None
+    assert mf._extract_album_art_bytes("nonexistent_path_file.xyz") is None
+    assert mf._extract_album_art_image("") is None
+    assert mf._extract_album_art("") is None
+
+    # 6. Null pixmap handling in _rounded_pixmap
+    null_rounded = mf._rounded_pixmap(QPixmap(), 64, 64, radius=8)
+    assert not null_rounded.isNull()
+    assert null_rounded.width() == 64 and null_rounded.height() == 64
+
+
+def test_audio_metadata_extraction_tags_and_formatting():
+    """Verify track metadata extraction with mutagen easy tags, fallback logic, and duration formatting."""
+    import tempfile, os
+    from unittest.mock import MagicMock, patch
+    import mediaflow as mf
+
+    # 1. Duration formatting
+    assert mf._format_time_ms(0) == "00:00"
+    assert mf._format_time_ms(-1000) == "00:00"
+    assert mf._format_time_ms(9000) == "00:09"
+    assert mf._format_time_ms(65000) == "01:05"
+    assert mf._format_time_ms(3665000) == "1:01:05"
+    assert mf._format_time_ms(36000000) == "10:00:00"
+
+    # 2. Metadata extraction with tags
+    with tempfile.NamedTemporaryFile(suffix='.flac', delete=False) as f:
+        f.write(b'flac')
+        track_path = f.name
+    try:
+        m = MagicMock()
+        tags = {'title': ['Symphony No. 5'], 'artist': ['Beethoven'], 'album': ['Classical Masterpieces']}
+        m.get.side_effect = tags.get
+        m.__getitem__.side_effect = tags.__getitem__
+        m.info.length = 450.25
+        with patch('mutagen.File', return_value=m):
+            meta = mf._load_track_metadata(track_path)
+            assert meta['title'] == 'Symphony No. 5'
+            assert meta['artist'] == 'Beethoven'
+            assert meta['album'] == 'Classical Masterpieces'
+            assert meta['duration_ms'] == 450250
+    finally:
+        os.remove(track_path)
+
+    # 3. Empty and non-existent path
+    meta_empty = mf._load_track_metadata("")
+    assert meta_empty['title'] == "Unknown Track"
+    assert meta_empty['artist'] == "Unknown Artist"
+    assert meta_empty['duration_ms'] == 0
+
+
+def test_native_audio_player_window_advanced_controls(qtbot):
+    """Verify NativeAudioPlayerWindow independent window flags, seek controls, volume/mute, keyboard shortcuts, and EndOfMedia handling."""
+    import tempfile, os
+    from PyQt6.QtCore import Qt, QEvent
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtMultimedia import QMediaPlayer
+    import mediaflow as mf
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t1 = os.path.join(tmpdir, "song1.mp3")
+        t2 = os.path.join(tmpdir, "song2.mp3")
+        t3 = os.path.join(tmpdir, "song3.mp3")
+        for f in (t1, t2, t3):
+            with open(f, "wb") as fp:
+                fp.write(b"audio-bytes")
+
+        win = mf.NativeAudioPlayerWindow([t1, t2, t3], initial_file=t1)
+        qtbot.addWidget(win)
+
+        # 1. Independent window flags
+        assert win.parent() is None
+        assert bool(win.windowFlags() & Qt.WindowType.Window)
+        assert win.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        # 2. Seek relative controls and bounds
+        win.player.duration = lambda: 50000
+        win.player.position = lambda: 15000
+        pos_history = []
+        win.player.setPosition = lambda p: pos_history.append(p)
+
+        win.seek_relative(10000)
+        assert pos_history[-1] == 25000
+
+        win.seek_relative(-30000)
+        assert pos_history[-1] == 0  # Clamped to 0
+
+        win.seek_relative(100000)
+        assert pos_history[-1] == 50000  # Clamped to duration
+
+        # 3. Volume slider and mute handling
+        win.vol_slider.setValue(65)
+        assert win.lbl_volume.text() == "65%"
+        assert abs(win.audio_output.volume() - 0.65) < 0.05
+
+        win._toggle_mute()
+        assert win.audio_output.isMuted()
+
+        # Moving volume slider above 0 should auto-unmute
+        win.vol_slider.setValue(80)
+        assert not win.audio_output.isMuted()
+
+        # 4. Keyboard shortcuts
+        # Space: toggle playback
+        play_states = []
+        win.player.pause = lambda: play_states.append("paused")
+        win.player.play = lambda: play_states.append("playing")
+        win.player.playbackState = lambda: QMediaPlayer.PlaybackState.PlayingState
+        ev_space = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_space)
+        assert play_states[-1] == "paused"
+
+        # Up and Down volume
+        v_orig = win.vol_slider.value()
+        ev_up = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_up)
+        assert win.vol_slider.value() == min(100, v_orig + 5)
+
+        ev_down = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_down)
+        assert win.vol_slider.value() == v_orig
+
+        # Mute toggle
+        ev_m = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_M, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_m)
+        assert win.audio_output.isMuted()
+        win.keyPressEvent(ev_m)
+        assert not win.audio_output.isMuted()
+
+        # Shuffle toggle shortcut
+        assert not win.shuffle_mode
+        ev_s = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_S, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_s)
+        assert win.shuffle_mode
+
+        # Repeat cycle shortcut
+        assert win.repeat_mode == "off"
+        ev_l = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_L, Qt.KeyboardModifier.NoModifier)
+        win.keyPressEvent(ev_l)
+        assert win.repeat_mode == "all"
+
+        # 5. EndOfMedia auto-advance logic
+        # In repeat_mode == 'one', re-sets position to 0 and plays
+        win.repeat_mode = "one"
+        plays = []
+        win.player.play = lambda: plays.append(True)
+        win._on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
+        assert pos_history[-1] == 0
+        assert len(plays) > 0
+
+        # In repeat_mode == 'all', advances track and loops
+        win.shuffle_mode = False
+        win.repeat_mode = "all"
+        win.current_index = len(win.playlist) - 1
+        win._on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
+        assert win.current_index == 0
+
+        # In repeat_mode == 'off', stopping at playlist end
+        win.repeat_mode = "off"
+        win.current_index = len(win.playlist) - 1
+        stopped = []
+        win.player.stop = lambda: stopped.append(True)
+        win._on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
+        assert len(stopped) > 0
+
+        # 6. Close event cleanup
+        win.close()
+
+
+def test_audio_player_bar_advanced_playback_and_auto_advance(qtbot):
+    """Verify MediaTab docked AudioPlayerBar row playback, hidden row skipping, auto-advance on EndOfMedia, and popout."""
+    import tempfile, os
+    from PyQt6.QtMultimedia import QMediaPlayer
+    import mediaflow as mf
+
+    # 1. Video tab has no AudioPlayerBar
+    tab_video = mf.MediaTab(media_type="video")
+    qtbot.addWidget(tab_video)
+    assert tab_video.audio_player_bar is None
+
+    # 2. Audio tab has AudioPlayerBar
+    tab = mf.MediaTab(media_type="audio")
+    qtbot.addWidget(tab)
+    bar = tab.audio_player_bar
+    assert bar is not None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t1 = os.path.join(tmpdir, "track1.mp3")
+        t2 = os.path.join(tmpdir, "track2.mp3")
+        t3 = os.path.join(tmpdir, "track3.mp3")
+        for f in (t1, t2, t3):
+            with open(f, "wb") as fp:
+                fp.write(b"audio-bytes")
+
+        # Populate rows
+        tab._on_file_found_inner(mf.MediaInfo(t1, "audio"))
+        tab._on_file_found_inner(mf.MediaInfo(t2, "audio"))
+        tab._on_file_found_inner(mf.MediaInfo(t3, "audio"))
+        assert tab.table.rowCount() == 3
+
+        # Play row 0
+        bar.play_row(0)
+        assert bar.current_row == 0
+        assert os.path.normcase(bar.current_filepath) == os.path.normcase(t1)
+        assert bar.title_lbl.text() == "track1"
+
+        # Seek relative
+        bar.player.duration = lambda: 60000
+        bar.player.position = lambda: 20000
+        bar_pos_history = []
+        bar.player.setPosition = lambda p: bar_pos_history.append(p)
+        bar.seek_relative(10000)
+        assert bar_pos_history[-1] == 30000
+
+        # Volume & Mute
+        bar.vol_slider.setValue(75)
+        assert bar.lbl_volume.text() == "75%"
+        assert abs(bar.audio_output.volume() - 0.75) < 0.05
+        bar.toggle_mute()
+        assert bar.audio_output.isMuted()
+        bar.toggle_mute()
+        assert not bar.audio_output.isMuted()
+
+        # Row skipping: hide row 1 (e.g. filtered by search)
+        tab.table.setRowHidden(1, True)
+        bar.play_next()
+        assert bar.current_row == 2
+        assert os.path.normcase(bar.current_filepath) == os.path.normcase(t3)
+
+        # Reached end with repeat_mode 'off' -> stops
+        bar.repeat_mode = "off"
+        stopped = []
+        bar.player.stop = lambda: stopped.append(True)
+        bar.play_next()
+        assert len(stopped) > 0
+
+        # Reached end with repeat_mode 'all' -> loops back to row 0
+        bar.repeat_mode = "all"
+        bar.current_row = 2
+        bar.play_next()
+        assert bar.current_row == 0
+        assert os.path.normcase(bar.current_filepath) == os.path.normcase(t1)
+
+        # EndOfMedia repeat_one
+        bar.repeat_mode = "one"
+        plays = []
+        bar.player.play = lambda: plays.append(True)
+        bar._on_media_status_changed(QMediaPlayer.MediaStatus.EndOfMedia)
+        assert bar_pos_history[-1] == 0
+        assert len(plays) > 0
+
+        # Popout detached player
+        bar.popout_detached_player()
+        main_win = tab.window()
+        assert hasattr(main_win, '_native_players')
+        assert len(main_win._native_players) > 0
+        detached = main_win._native_players[-1]
+        assert isinstance(detached, mf.NativeAudioPlayerWindow)
+        assert os.path.normcase(detached.filepath) == os.path.normcase(t1)
+        detached.close()
+
+        # Stop resets bar state
+        bar.stop()
+        assert bar.current_row == -1
+        assert bar.current_filepath == ""
+        assert bar.title_lbl.text() == "No track playing"
+

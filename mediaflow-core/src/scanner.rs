@@ -53,9 +53,13 @@ pub fn matches_exclusion(filename_lower: &str, patterns: &[String]) -> bool {
         if p.is_empty() {
             continue;
         }
-        if p.starts_with('*') && p.ends_with('*') && p.len() > 2 {
+        // "*...*" matches anything containing the inner text. The length guard
+        // must accept two or more asterisks ("**", "***"), whose inner text
+        // is either empty or purely asterisks and therefore matches every
+        // file — the Python fallback scanner treats wildcard asterisks the same way.
+        if p.starts_with('*') && p.ends_with('*') && p.len() >= 2 {
             let inner = &p[1..p.len() - 1];
-            if filename_lower.contains(inner) {
+            if inner.is_empty() || inner.chars().all(|c| c == '*') || filename_lower.contains(inner) {
                 return true;
             }
         } else if let Some(suffix) = p.strip_prefix('*') {
@@ -298,28 +302,8 @@ pub fn run_scan(
 
             // Duplicate key: the canonical path resolves symlinks, so a file
             // reachable through two different links is only reported once.
-            let canonical_path = match path.canonicalize() {
-                Ok(p) => {
-                    let s = p.to_string_lossy();
-                    if let Some(unc_suffix) = s.strip_prefix(r"\\?\UNC\") {
-                        format!(r"\\{}", unc_suffix)
-                    } else if let Some(local_suffix) = s.strip_prefix(r"\\?\") {
-                        local_suffix.to_string()
-                    } else {
-                        s.to_string()
-                    }
-                }
-                Err(_) => path.to_string_lossy().to_string(),
-            };
-
-            // Case-fold only where the filesystem is case-insensitive: on
-            // POSIX "Song.mp3" and "song.mp3" are two different files and
-            // folding them silently dropped one of them from the scan.
-            let norm_key = if cfg!(windows) {
-                canonical_path.to_lowercase()
-            } else {
-                canonical_path.clone()
-            };
+            // Uses standardized path normalization to eliminate extended-length prefixes.
+            let norm_key = crate::path_util::canonical_norm_key(path);
             if !seen_norm_paths.insert(norm_key) {
                 continue;
             }
@@ -341,8 +325,8 @@ pub fn run_scan(
                 // row would show a path outside the scanned folder and a
                 // rename or delete would act on that target instead of the
                 // entry the user sees (breaking the link / moving the
-                // original file). The Python scanner reports the walked path.
-                path: path.to_string_lossy().to_string(),
+                // original file). Clean extended-length prefix if any.
+                path: crate::path_util::clean_path_string(path),
                 filename: file_name.to_string(),
                 ext: ext_with_dot,
                 size,
@@ -399,6 +383,18 @@ mod tests {
         assert!(matches_exclusion("prefix_test.mov", &patterns));
         assert!(matches_exclusion("mysamplefile.mkv", &patterns));
         assert!(!matches_exclusion("other_file.mp4", &patterns));
+    }
+
+    #[test]
+    fn test_matches_exclusion_double_star_excludes_everything() {
+        // "**" and "***" match every file name — wildcard asterisks exclude everything.
+        let patterns = vec!["**".to_string()];
+        assert!(matches_exclusion("video.mp4", &patterns));
+        assert!(matches_exclusion("other_file.mkv", &patterns));
+
+        let triple = vec!["***".to_string()];
+        assert!(matches_exclusion("video.mp4", &triple));
+        assert!(matches_exclusion("other_file.mkv", &triple));
     }
 
     #[test]

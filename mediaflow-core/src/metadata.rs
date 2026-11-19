@@ -20,7 +20,7 @@ pub struct MediaMetadataResult {
 }
 
 pub fn format_duration(seconds: f64) -> String {
-    if seconds <= 0.0 {
+    if !seconds.is_finite() || seconds <= 0.0 {
         return "—".to_string();
     }
     let total = seconds.round() as u64;
@@ -61,7 +61,7 @@ pub fn extract_audio_metadata(path: &Path) -> Result<MediaMetadataResult, String
     };
 
     Ok(MediaMetadataResult {
-        path: path.to_string_lossy().to_string(),
+        path: crate::path_util::clean_path_string(path),
         width: 0,
         height: 0,
         duration_seconds,
@@ -86,7 +86,7 @@ pub fn extract_image_metadata(path: &Path) -> Result<MediaMetadataResult, String
         .map_err(|e| format!("Failed to read dimensions: {}", e))?;
 
     Ok(MediaMetadataResult {
-        path: path.to_string_lossy().to_string(),
+        path: crate::path_util::clean_path_string(path),
         width,
         height,
         duration_seconds: 0.0,
@@ -101,12 +101,13 @@ pub fn extract_image_metadata(path: &Path) -> Result<MediaMetadataResult, String
 }
 
 pub fn extract_metadata(path_str: &str, media_type: &str) -> MediaMetadataResult {
-    let path = Path::new(path_str);
+    let clean_str = crate::path_util::strip_extended_prefix(path_str);
+    let path = Path::new(&clean_str);
     match media_type {
         "audio" => match extract_audio_metadata(path) {
             Ok(res) => res,
             Err(e) => MediaMetadataResult {
-                path: path_str.to_string(),
+                path: clean_str.clone(),
                 width: 0,
                 height: 0,
                 duration_seconds: 0.0,
@@ -122,7 +123,7 @@ pub fn extract_metadata(path_str: &str, media_type: &str) -> MediaMetadataResult
         "image" => match extract_image_metadata(path) {
             Ok(res) => res,
             Err(e) => MediaMetadataResult {
-                path: path_str.to_string(),
+                path: clean_str.clone(),
                 width: 0,
                 height: 0,
                 duration_seconds: 0.0,
@@ -136,7 +137,7 @@ pub fn extract_metadata(path_str: &str, media_type: &str) -> MediaMetadataResult
             },
         },
         _ => MediaMetadataResult {
-            path: path_str.to_string(),
+            path: clean_str,
             width: 0,
             height: 0,
             duration_seconds: 0.0,
@@ -162,5 +163,17 @@ mod tests {
         let res = extract_metadata("video.mp4", "video");
         assert!(!res.is_valid);
         assert!(res.error_message.is_some());
+    }
+
+    #[test]
+    fn test_format_duration_edge_cases() {
+        assert_eq!(format_duration(0.0), "—");
+        assert_eq!(format_duration(-5.0), "—");
+        assert_eq!(format_duration(f64::NAN), "—");
+        assert_eq!(format_duration(f64::INFINITY), "—");
+        assert_eq!(format_duration(f64::NEG_INFINITY), "—");
+        assert_eq!(format_duration(45.0), "45s");
+        assert_eq!(format_duration(65.0), "1m 05s");
+        assert_eq!(format_duration(3665.0), "1h 01m 05s");
     }
 }

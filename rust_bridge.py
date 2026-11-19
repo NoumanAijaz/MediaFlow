@@ -20,6 +20,30 @@ _CACHED_BINARY_PATH: Optional[str] = None
 _CHECKED_BINARY: bool = False
 
 
+def strip_extended_prefix(path: str) -> str:
+    """Strip Win32 extended-length prefixes (\\\\?\\ and \\\\?\\UNC\\)."""
+    if not path:
+        return ""
+    p = path.replace("/", "\\")
+    if p.upper().startswith("\\\\?\\UNC\\"):
+        return "\\\\" + p[8:]
+    elif p.startswith("\\\\?\\"):
+        return p[4:]
+    return path
+
+
+def normalize_ipc_path(path: str) -> str:
+    """Standardize IPC path representation across Python and Rust.
+
+    Resolves absolute path, removes Win32 extended-length prefixes (\\\\?\\ and \\\\?\\UNC\\),
+    normalizes separators, and applies OS case normalization.
+    """
+    if not path:
+        return ""
+    clean = strip_extended_prefix(path)
+    return os.path.normcase(os.path.abspath(clean))
+
+
 def get_rust_core_binary() -> Optional[str]:
     """Find the path to the mediaflow-core executable."""
     global _CACHED_BINARY_PATH, _CHECKED_BINARY
@@ -78,6 +102,10 @@ class RustScanProcess:
         try:
             self.proc.terminate()
             self.proc.kill()
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -100,7 +128,10 @@ def scan_directories_rust(
     if not binary:
         raise RuntimeError("mediaflow-core binary is not available")
 
-    valid_dirs = [os.path.abspath(d) for d in directories if os.path.isdir(d)]
+    if is_interrupted and is_interrupted():
+        return 0, 0.0
+
+    valid_dirs = [os.path.abspath(strip_extended_prefix(d)) for d in directories if os.path.isdir(d)]
     if not valid_dirs:
         return 0, 0.0
 
@@ -143,6 +174,10 @@ def scan_directories_rust(
             if is_interrupted and is_interrupted():
                 proc.terminate()
                 proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
                 break
 
             line = line.strip()
@@ -157,6 +192,8 @@ def scan_directories_rust(
             event_type = event.get("type")
             if event_type == "file":
                 total_found += 1
+                if "path" in event:
+                    event["path"] = os.path.abspath(strip_extended_prefix(event["path"]))
                 if on_file_found:
                     on_file_found(event)
             elif event_type == "progress":
@@ -181,6 +218,10 @@ def scan_directories_rust(
         logger.error("Error during Rust directory scan: %s", e)
         try:
             proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
         raise
@@ -197,12 +238,20 @@ def find_duplicates_rust(
     Find exact duplicates in parallel using mediaflow-core.
     Returns (duplicate_groups, skipped_count).
     """
+    if is_cancelled and is_cancelled():
+        return [], 0
+    if not items:
+        return [], 0
+
     binary = get_rust_core_binary()
     if not binary:
         raise RuntimeError("mediaflow-core binary is not available")
 
-    # Serialize items payload
-    payload = json.dumps([{"path": it["path"], "size": int(it.get("size", 0) or 0)} for it in items])
+    # Serialize items payload with normalized absolute paths
+    payload = json.dumps([
+        {"path": os.path.abspath(strip_extended_prefix(it["path"])), "size": int(it.get("size", 0) or 0)}
+        for it in items
+    ])
 
     creationflags = 0
     if sys.platform == "win32":
@@ -226,6 +275,10 @@ def find_duplicates_rust(
     except Exception as e:
         try:
             proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
         raise RuntimeError(f"Failed to send input payload to mediaflow-core dedupe: {e}")
@@ -239,12 +292,14 @@ def find_duplicates_rust(
                 try:
                     proc.terminate()
                     proc.kill()
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
                 return [], 0
             if time.time() - start_time > 600:
                 try:
                     proc.kill()
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
                 raise RuntimeError("Rust dedupe timed out after 600 seconds")
@@ -262,7 +317,12 @@ def find_duplicates_rust(
                 if on_progress:
                     on_progress(event.get("done", 0), event.get("total", 0), event.get("phase", "Analyzing duplicates…"))
             elif event_type == "groups":
-                groups = event.get("groups", [])
+                raw_groups = event.get("groups", [])
+                cleaned_groups = []
+                for g in raw_groups:
+                    clean_g = [os.path.abspath(strip_extended_prefix(p)) for p in g]
+                    cleaned_groups.append(clean_g)
+                groups = cleaned_groups
                 skipped = event.get("skipped", 0)
             elif event_type == "error":
                 logger.warning("Rust dedupe error: %s", event.get("message"))
@@ -279,6 +339,10 @@ def find_duplicates_rust(
     except Exception as e:
         try:
             proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
         raise
@@ -296,6 +360,9 @@ def execute_rename_rust(
     successful_pairs: [(source, target), ...]
     failed_triples: [(source, target, error_message), ...]
     """
+    if not tasks:
+        return [], []
+
     binary = get_rust_core_binary()
     if not binary:
         raise RuntimeError("mediaflow-core binary is not available")
@@ -325,6 +392,10 @@ def execute_rename_rust(
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
         except Exception:
             pass
         raise RuntimeError("Rust batch rename timed out")
@@ -334,8 +405,14 @@ def execute_rename_rust(
 
     try:
         data = json.loads(stdout_data.strip())
-        successful = [tuple(x) for x in data.get("successful", [])]
-        failed = [tuple(x) for x in data.get("failed", [])]
+        successful = [
+            (os.path.abspath(strip_extended_prefix(x[0])), os.path.abspath(strip_extended_prefix(x[1])))
+            for x in data.get("successful", [])
+        ]
+        failed = [
+            (os.path.abspath(strip_extended_prefix(x[0])), os.path.abspath(strip_extended_prefix(x[1])), x[2])
+            for x in data.get("failed", [])
+        ]
         return successful, failed
     except Exception as e:
         raise RuntimeError(f"Failed to parse rename results from mediaflow-core: {e}")
@@ -348,13 +425,15 @@ def extract_metadata_rust(filepath: str, media_type: str = "audio") -> Optional[
     if not binary:
         return None
 
+    clean_path = os.path.abspath(strip_extended_prefix(filepath))
+
     creationflags = 0
     if sys.platform == "win32":
         creationflags = subprocess.CREATE_NO_WINDOW
 
     try:
         res = subprocess.run(
-            [binary, "metadata", "--path", filepath, "--media-type", media_type],
+            [binary, "metadata", f"--path={clean_path}", f"--media-type={media_type}"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -363,7 +442,10 @@ def extract_metadata_rust(filepath: str, media_type: str = "audio") -> Optional[
             creationflags=creationflags,
         )
         if res.returncode == 0 and res.stdout.strip():
-            return json.loads(res.stdout.strip())
+            data = json.loads(res.stdout.strip())
+            if isinstance(data, dict) and "path" in data:
+                data["path"] = os.path.abspath(strip_extended_prefix(data["path"]))
+            return data
     except Exception as e:
         logger.debug("Rust metadata extraction failed for %s: %s", filepath, e)
 

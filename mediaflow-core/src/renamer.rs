@@ -35,16 +35,20 @@ fn invalid_target_reason(target: &Path) -> Option<String> {
     if name.is_empty() {
         return Some("Target has an empty file name".to_string());
     }
-    if let Some(c) = name.chars().find(|c| "<>:\"|?*".contains(*c)) {
+    if let Some(c) = name.chars().find(|c| "<>:\"|?*".contains(*c) || (*c as u32) < 32) {
         return Some(format!(
             "Target file name contains the illegal character '{}'",
             c
         ));
     }
+    if name.ends_with(' ') || name.ends_with('.') {
+        return Some("Target file name cannot end with a space or period".to_string());
+    }
     let stem = name.split('.').next().unwrap_or("").to_uppercase();
-    const RESERVED: [&str; 22] = [
+    const RESERVED: [&str; 25] = [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
         "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CLOCK$", "CONIN$", "CONOUT$",
     ];
     if RESERVED.contains(&stem.as_str()) {
         return Some(format!(
@@ -72,18 +76,19 @@ pub fn execute_rename_plan(tasks: Vec<RenameTask>, dry_run: bool) -> RenameResul
             continue;
         }
 
+        if let Some(reason) = invalid_target_reason(tgt_path) {
+            failed.push((task.source, task.target, reason));
+            continue;
+        }
+
         if dry_run {
-            // Report the same outcome the real run would produce.
-            match invalid_target_reason(tgt_path) {
-                Some(reason) => failed.push((task.source, task.target, reason)),
-                None => successful.push((task.source, task.target)),
-            }
+            successful.push((task.source, task.target));
             continue;
         }
 
         // Ensure parent directory of target exists
         if let Some(parent) = tgt_path.parent() {
-            if !parent.exists() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
                 if let Err(e) = fs::create_dir_all(parent) {
                     failed.push((
                         task.source,
@@ -100,7 +105,9 @@ pub fn execute_rename_plan(tasks: Vec<RenameTask>, dry_run: bool) -> RenameResul
             let tgt_parent = tgt_path.parent();
             let same_parent = match (src_parent, tgt_parent) {
                 (Some(sp), Some(tp)) => {
-                    sp == tp || sp.to_string_lossy().to_lowercase() == tp.to_string_lossy().to_lowercase()
+                    let sp_eff = if sp.as_os_str().is_empty() { Path::new(".") } else { sp };
+                    let tp_eff = if tp.as_os_str().is_empty() { Path::new(".") } else { tp };
+                    crate::path_util::canonical_norm_key(sp_eff) == crate::path_util::canonical_norm_key(tp_eff)
                 }
                 (None, None) => true,
                 _ => false,
@@ -218,5 +225,44 @@ mod tests {
 
         let _ = fs::remove_file(&tgt_file);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_execute_rename_plan_case_only_mixed_slashes() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "mf_test_rename_slashes_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let src_file = tmp_dir.join("mixed_clip.mp4");
+        fs::write(&src_file, b"sample content").unwrap();
+
+        // One path with backslashes, one with forward slashes
+        let src_str = src_file.to_string_lossy().replace('/', "\\");
+        let tgt_str = tmp_dir.join("MIXED_CLIP.MP4").to_string_lossy().replace('\\', "/");
+
+        let task = RenameTask {
+            source: src_str,
+            target: tgt_str,
+        };
+
+        let res = execute_rename_plan(vec![task], false);
+        assert_eq!(res.successful.len(), 1);
+        assert_eq!(res.failed.len(), 0);
+
+        let final_file = tmp_dir.join("MIXED_CLIP.MP4");
+        assert!(final_file.exists());
+        let _ = fs::remove_file(&final_file);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_invalid_target_trailing_space_or_dot() {
+        assert!(invalid_target_reason(Path::new("test.mp4 ")).is_some());
+        assert!(invalid_target_reason(Path::new("test.mp4.")).is_some());
+        assert!(invalid_target_reason(Path::new("CLOCK$")).is_some());
     }
 }
